@@ -1,12 +1,24 @@
 //! Phase gates: cargo check / cargo test runners that produce structured
 //! diagnostics for the Debug phase.
 
-use crate::tools::CompilerError;
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
+
+/// One structured diagnostic produced by `cargo check`/`cargo test` — either
+/// a compile error, a runtime test failure, or a synthetic "exit non-zero"
+/// catch-all when neither matched. Surfaced both to the model (via the
+/// cargo_* tools) and to the orchestrator (via gate failures).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompilerError {
+    pub id: String,
+    pub file: Option<PathBuf>,
+    pub line: Option<u32>,
+    pub message: String,
+    pub raw: serde_json::Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct GateOutcome {

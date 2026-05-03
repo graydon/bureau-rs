@@ -1,36 +1,29 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use bureau_rs::{
-    checkpoint, config::Config, phase::Phase, scheduler::Orchestrator, state::OrchestratorState,
-    state::StateHandle, web, worktree::Workspace,
+    checkpoint, config::Config, engine::Engine, state::EngineState, state::StateHandle, web,
 };
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "bureau-rs", about = "Hierarchical multi-phase Rust code agent orchestrator")]
+#[command(name = "bureau-rs", about = "Hierarchical decomposition agent for Rust projects")]
 struct Cli {
-    /// Configuration directory containing problem.md, phases.toml, prompts/
+    /// Configuration directory containing problem.md and config.toml.
     config_dir: PathBuf,
-    /// Working directory where the generated crate is built
+    /// Working directory where the generated project is built.
     work_dir: PathBuf,
-    /// Web UI port
+    /// Web UI port.
     #[arg(long, default_value_t = 8765)]
     port: u16,
-    /// Resume from a checkpoint JSON file
+    /// Resume from a JSON checkpoint instead of starting fresh.
     #[arg(long)]
     resume: Option<PathBuf>,
-    /// Start from a specific phase (skip earlier phases)
-    #[arg(long)]
-    phase: Option<String>,
-    /// Decompose and show task graph but don't execute
-    #[arg(long)]
-    dry_run: bool,
-    /// Don't start the web server
+    /// Don't start the web server.
     #[arg(long)]
     no_ui: bool,
-    /// Exit immediately after the pipeline finishes instead of keeping the
-    /// web UI alive for browsing.
+    /// Exit immediately when the pipeline finishes (default: keep UI alive
+    /// until Ctrl+C so you can browse the result).
     #[arg(long)]
     exit_when_done: bool,
 }
@@ -49,49 +42,42 @@ async fn main() -> Result<()> {
         Config::load(&cli.config_dir)
             .with_context(|| format!("loading config from {}", cli.config_dir.display()))?,
     );
-    let workspace = Workspace::init(&cli.work_dir)?;
+    std::fs::create_dir_all(&cli.work_dir).context("creating workdir")?;
 
     let initial_state = if let Some(p) = &cli.resume {
         checkpoint::load(p)?
     } else {
-        OrchestratorState::new(cli.work_dir.clone(), cli.config_dir.clone())
+        EngineState::new(
+            cli.work_dir.clone(),
+            cli.config_dir.clone(),
+            config.toml.project_name.clone(),
+        )
     };
-    let handle = StateHandle::new(initial_state);
+    let state = StateHandle::new(initial_state);
 
-    // Append-only log of every UI event (prompts, tool calls, results, costs,
-    // file changes...) at <workdir>/.bureau/log.jsonl. Survives restarts.
+    // Append-only event log.
     let log_path = cli.work_dir.join(".bureau").join("log.jsonl");
-    let logger_handle = match checkpoint::spawn_event_logger(&handle, log_path.clone()) {
+    let logger_handle = match checkpoint::spawn_event_logger(&state, log_path.clone()) {
         Ok(h) => {
             tracing::info!("event log: {}", log_path.display());
             Some(h)
         }
         Err(e) => {
-            tracing::warn!("could not start event log at {}: {e:#}", log_path.display());
+            tracing::warn!("could not start event log: {e}");
             None
         }
     };
 
-    let start_phase = match &cli.phase {
-        Some(p) => Phase::parse(p).ok_or_else(|| anyhow!("unknown phase '{}'", p))?,
-        None => Phase::Spec,
-    };
-
-    if cli.dry_run {
-        println!("dry-run: would start at phase {start_phase}");
-        return Ok(());
-    }
-
-    let orch = Arc::new(Orchestrator::new(
-        config.clone(),
-        handle.clone(),
-        workspace.clone(),
-    )?);
+    // Construct the engine first so we can share its graph mutex with the
+    // web UI (the web's reset_node mutates the engine's authoritative
+    // graph directly).
+    let engine = Arc::new(Engine::new(config.clone(), state.clone())?);
 
     let ui_handle = if !cli.no_ui {
         let app = web::AppState {
-            state: handle.clone(),
+            state: state.clone(),
             workdir: cli.work_dir.clone(),
+            graph: engine.graph.clone(),
         };
         let port = cli.port;
         Some(tokio::spawn(async move {
@@ -103,31 +89,27 @@ async fn main() -> Result<()> {
         None
     };
 
-    let result = orch.run(start_phase).await;
+    let result = engine.clone().run().await;
 
-    // Final checkpoint regardless of success/failure.
+    // Final checkpoint.
     let ckpt_dir = cli.work_dir.join(".bureau").join("checkpoints");
-    match checkpoint::save(&handle.snapshot(), &ckpt_dir) {
-        Ok(p) => tracing::info!("final checkpoint saved: {}", p.display()),
-        Err(e) => tracing::warn!("final checkpoint failed: {e:#}"),
+    let snap = state.snapshot();
+    if let Ok(p) = checkpoint::save(&snap, &ckpt_dir) {
+        tracing::info!("final checkpoint: {}", p.display());
     }
-    let _ = checkpoint::save_latest(&handle.snapshot(), &ckpt_dir);
+    let _ = checkpoint::save_latest(&snap, &ckpt_dir);
 
     match &result {
-        Ok(_) => tracing::info!("pipeline finished"),
+        Ok(_) => tracing::info!("pipeline complete"),
         Err(e) => tracing::error!("pipeline error: {e:#}"),
     }
 
-    // Keep the UI alive so the user can browse the session state. Exit on
-    // Ctrl+C (or SIGTERM on Unix). This is the default; --exit-when-done
-    // restores the old "exit immediately" behaviour.
-    if !cli.exit_when_done && ui_handle.is_some() && !cli.no_ui {
+    if !cli.exit_when_done && ui_handle.is_some() {
         tracing::info!(
             "pipeline complete — web UI still running at http://0.0.0.0:{}. Press Ctrl+C to exit.",
             cli.port
         );
         wait_for_shutdown().await;
-        tracing::info!("shutdown requested, exiting");
     }
 
     if let Some(h) = ui_handle {
@@ -136,7 +118,6 @@ async fn main() -> Result<()> {
     if let Some(h) = logger_handle {
         h.abort();
     }
-
     result
 }
 
@@ -144,16 +125,13 @@ async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
         }
     }
     #[cfg(not(unix))]

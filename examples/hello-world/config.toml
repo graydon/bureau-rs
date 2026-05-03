@@ -1,0 +1,28 @@
+# bureau-rs config (v2 — node-stage engine).
+#
+# Models are OpenRouter model IDs. Set OPENROUTER_API_KEY in your environment.
+
+project_name = "echo_it"
+layout = "single_crate"  # or "workspace"
+
+[models]
+actor = "openai/gpt-5-mini"
+critic = "openai/gpt-5-mini"
+reviser = "openai/gpt-5-mini"
+judge = "openai/gpt-5-mini"
+max_tokens = 4096
+temperature = 0.0
+max_turns = 30
+
+[limits]
+max_file_lines = 300
+max_spec_section_lines = 400
+max_parallel_tasks = 1     # parallelism is on the roadmap; v2 starts serial
+max_stage_retries = 2
+critique_retries = 1
+max_tasks_total = 256
+# cost_cap_usd = 5.0       # uncomment to halt the pipeline if cost exceeds this
+
+[provider]
+# api_key_env = "OPENROUTER_API_KEY"
+# base_url    = "https://openrouter.ai/api/v1"

@@ -1,168 +1,198 @@
-use bureau_rs::artifact;
-use bureau_rs::merge;
-use bureau_rs::phase::Phase;
+//! End-to-end smoke tests for the new node-stage engine. The legacy
+//! tests/tools_test.rs was deleted along with the old phase-based
+//! orchestrator.
+
+use bureau_rs::graph::{Node, NodeGraph, Stage, StageState};
+use bureau_rs::node_context;
+use bureau_rs::node_validate;
+use bureau_rs::render::{Layout, render_graph};
+use std::path::PathBuf;
 
 #[test]
-fn parse_phase_names() {
-    assert_eq!(Phase::parse("spec"), Some(Phase::Spec));
-    assert_eq!(Phase::parse("Implementation"), Some(Phase::Impl));
-    assert_eq!(Phase::parse("optimization"), Some(Phase::Opt));
-    assert_eq!(Phase::parse("nope"), None);
-}
-
-#[test]
-fn phase_next() {
-    assert_eq!(Phase::Spec.next(), Some(Phase::Interface));
-    assert_eq!(Phase::Opt.next(), None);
-}
-
-#[test]
-fn rust_validation_rejects_garbage() {
-    let bad = "fn foo( {";
-    assert!(artifact::validate_rust(std::path::Path::new("x.rs"), bad).is_err());
-    let good = "pub fn foo() { todo!() }";
-    assert!(artifact::validate_rust(std::path::Path::new("x.rs"), good).is_ok());
-}
-
-#[tokio::test]
-async fn gate_test_surfaces_runtime_test_failures() {
-    use bureau_rs::gate::{GateKind, run_gate};
-
-    // Build a real, tiny crate in a tempdir with one passing test and one
-    // failing test. Run the Test gate. Assert it reports passed=false and
-    // includes a non-empty `errors` list — this is the regression that
-    // caused phase impl to retry forever with "0 errors".
+fn empty_graph_renders_nothing() {
     let tmp = tempfile::tempdir().unwrap();
-    let workdir = tmp.path();
-    std::fs::write(
-        workdir.join("Cargo.toml"),
-        "[package]\nname = \"gatetest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(workdir.join("src")).unwrap();
-    std::fs::write(
-        workdir.join("src").join("lib.rs"),
-        r#"pub fn add(a: i32, b: i32) -> i32 { a + b }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test] fn ok_test() { assert_eq!(add(1, 1), 2); }
-    #[test] fn failing_test() { assert_eq!(add(1, 1), 99); }
-}
-"#,
-    )
-    .unwrap();
-
-    let outcome = run_gate(workdir, GateKind::Test).await.unwrap();
-    assert!(!outcome.passed, "gate should fail when a test fails");
-    assert!(
-        !outcome.errors.is_empty(),
-        "gate must report at least one error when a test fails (was: stdout={:?}, stderr={:?})",
-        outcome.stdout,
-        outcome.stderr
-    );
-    let any_failure_msg = outcome
-        .errors
-        .iter()
-        .any(|e| e.message.contains("failing_test") || e.message.contains("failed"));
-    assert!(
-        any_failure_msg,
-        "expected at least one error mentioning the failing test or 'failed'; got: {:#?}",
-        outcome.errors
-    );
+    let g = NodeGraph::new();
+    let report = render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+    assert!(report.files_written.is_empty());
 }
 
 #[test]
-fn transient_agent_error_classifier() {
-    use bureau_rs::agent::is_transient_agent_error;
-
-    // The exact rig message we saw in production.
-    assert!(is_transient_agent_error(
-        "CompletionError: ResponseError: Response contained no message or tool call (empty)"
-    ));
-    // Other transient flavours.
-    assert!(is_transient_agent_error("connection reset by peer"));
-    assert!(is_transient_agent_error("operation timed out"));
-    assert!(is_transient_agent_error("HTTP 502 Bad Gateway"));
-    assert!(is_transient_agent_error("HTTP 503 Service Unavailable"));
-    assert!(is_transient_agent_error("HTTP 429 Too Many Requests"));
-
-    // Real failures that should NOT be retried.
-    assert!(!is_transient_agent_error("invalid api key"));
-    assert!(!is_transient_agent_error("model not found"));
-    assert!(!is_transient_agent_error("malformed JSON in tool result"));
-    assert!(!is_transient_agent_error(""));
+fn single_node_renders_full_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut g = NodeGraph::new();
+    let _root = g
+        .insert_root(Node::new("app", "the application"))
+        .unwrap();
+    render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+    assert!(tmp.path().join("Cargo.toml").exists());
+    assert!(tmp.path().join("src/mod.rs").exists());
+    assert!(tmp.path().join("src/public.rs").exists());
+    assert!(tmp.path().join("src/private.rs").exists());
+    assert!(tmp.path().join("src/tests.rs").exists());
+    assert!(tmp.path().join("spec/app/spec.md").exists());
 }
 
 #[test]
-fn rust_syntax_errors_include_line_col_and_snippet() {
-    // Multi-line source so we can verify the line is reported correctly.
-    let bad = "pub fn good() { todo!() }\npub fn bad( ;\npub fn other() { todo!() }\n";
-    let err = artifact::validate_rust(std::path::Path::new("x.rs"), bad).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(msg.contains("line 2"), "expected line 2 in error: {msg}");
-    // Snippet should include the offending line
-    assert!(msg.contains("pub fn bad("), "expected snippet in error: {msg}");
-    // And a caret marker
-    assert!(msg.contains("^"), "expected caret in error: {msg}");
+fn workspace_render_with_member_crate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("ws", "workspace root")).unwrap();
+    let mut server = Node::new("server", "the server crate");
+    server.crate_boundary = true;
+    let _server = g.add_child(root, server).unwrap();
+    render_graph(tmp.path(), &g, Layout::Workspace).unwrap();
+    let cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("[workspace]"));
+    assert!(cargo.contains("\"crates/server\""));
+    assert!(tmp.path().join("crates/server/src/mod.rs").exists());
 }
 
 #[test]
-fn stub_function_bodies_replaces_real_bodies() {
-    let src = "pub fn add(x: i32, y: i32) -> i32 { x + y }\n\
-               pub fn already_stub() { todo!() }\n";
-    let (out, warnings) = artifact::stub_function_bodies(src).unwrap();
-    assert!(out.contains("todo!"));
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].contains("add"));
+fn graph_serializes_round_trip() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let a = g.add_child(root, Node::new("a", "")).unwrap();
+    let b = g.add_child(root, Node::new("b", "")).unwrap();
+    g.add_dep(a, b).unwrap();
+    g.get_mut(a).unwrap().stages.spec = StageState::Done;
+    let json = serde_json::to_string(&g).unwrap();
+    let g2: NodeGraph = serde_json::from_str(&json).unwrap();
+    assert_eq!(g2.len(), 3);
+    assert_eq!(g2.get(a).unwrap().deps, vec![b]);
+    assert_eq!(g2.get(a).unwrap().stages.spec, StageState::Done);
 }
 
 #[test]
-fn replace_fn_body_swaps_block() {
-    let src = "pub fn add(x: i32, y: i32) -> i32 { todo!() }\n";
-    let new = artifact::replace_fn_body(src, "add", "x + y").unwrap();
-    assert!(new.contains("x + y"));
-    assert!(!new.contains("todo!"));
+fn dep_cycle_rejected() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let a = g.add_child(root, Node::new("a", "")).unwrap();
+    let b = g.add_child(root, Node::new("b", "")).unwrap();
+    let c = g.add_child(root, Node::new("c", "")).unwrap();
+    g.add_dep(a, b).unwrap();
+    g.add_dep(b, c).unwrap();
+    let err = g.add_dep(c, a).unwrap_err();
+    assert!(matches!(err, bureau_rs::graph::GraphError::WouldCycle { .. }));
 }
 
 #[test]
-fn replace_fn_body_missing_fails() {
-    let src = "pub fn add() { todo!() }\n";
-    assert!(artifact::replace_fn_body(src, "missing", "0").is_err());
+fn public_validator_accepts_well_formed_iface() {
+    let src = r#"
+pub trait Frob {
+    fn shape(&self) -> i32;
+}
+
+pub struct Frobber(super::private::FrobInner);
+
+pub enum Color { Red, Green }
+"#;
+    let s = node_validate::validate_public(src).unwrap();
+    assert_eq!(s.traits, vec!["Frob"]);
+    assert_eq!(s.types, vec!["Frobber", "Color"]);
 }
 
 #[test]
-fn merge_mod_decls_dedups() {
-    let a = "mod alpha;\nmod beta;\n";
-    let b = "mod beta;\nmod gamma;\n";
-    let merged = artifact::merge_mod_declarations(a, b).unwrap();
-    assert_eq!(merged.matches("mod beta").count(), 1);
-    assert!(merged.contains("mod alpha"));
-    assert!(merged.contains("mod gamma"));
+fn public_validator_rejects_impl_block() {
+    let src = "pub struct X; impl X { pub fn n() -> Self { X } }";
+    assert!(node_validate::validate_public(src).is_err());
 }
 
 #[test]
-fn merge_cargo_toml_unions_deps() {
-    let a = "[package]\nname=\"x\"\nversion=\"0.1.0\"\n[dependencies]\nfoo = \"1\"\n";
-    let b = "[package]\nname=\"x\"\nversion=\"0.1.0\"\n[dependencies]\nbar = \"2\"\n";
-    let merged = merge::merge_cargo_toml(a, b).unwrap();
-    assert!(merged.contains("foo"));
-    assert!(merged.contains("bar"));
+fn private_validator_rejects_undeclared_dep() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let a = g.add_child(root, Node::new("a", "")).unwrap();
+    let _b = g.add_child(root, Node::new("b", "")).unwrap();
+    // a doesn't declare a dep on b
+    let src = "use crate::b::Stuff;";
+    let err = node_validate::validate_private(src, g.get(a).unwrap(), &g).unwrap_err();
+    assert!(matches!(err, node_validate::ValidateError::PrivateUndeclaredDep { .. }));
 }
 
 #[test]
-fn merge_cargo_toml_conflicts_on_version_mismatch() {
-    let a = "[dependencies]\nfoo = \"1\"\n";
-    let b = "[dependencies]\nfoo = \"2\"\n";
-    assert!(merge::merge_cargo_toml(a, b).is_err());
+fn context_for_iface_inlines_dep_public_rs() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let mut errs = Node::new("errors", "shared error types");
+    errs.public_rs = Some("pub enum Err { NotFound }\n".into());
+    let errs_id = g.add_child(root, errs).unwrap();
+    let user_id = g.add_child(root, Node::new("user", "uses errors")).unwrap();
+    g.add_dep(user_id, errs_id).unwrap();
+    let bundle = node_context::build_for_iface(&g, user_id);
+    let md = bundle.to_markdown();
+    assert!(md.contains("Dependency `errors`"));
+    assert!(md.contains("pub enum Err"));
 }
 
 #[test]
-fn public_signatures_extract() {
-    let src = "pub fn alpha(x: i32) -> i32 { todo!() }\nfn private() {}\npub struct S;\n";
-    let sigs = artifact::PublicSignatures::from_source(src).unwrap();
-    assert!(sigs.items.iter().any(|s| s.contains("alpha")));
-    assert!(sigs.items.iter().any(|s| s.contains("struct S")));
-    assert!(!sigs.items.iter().any(|s| s.contains("private")));
+fn module_path_for_workspace_node() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let frontend = g.add_child(root, Node::new("frontend", "")).unwrap();
+    let router = g.add_child(frontend, Node::new("router", "")).unwrap();
+    assert_eq!(node_context::module_path(&g, root), "crate");
+    assert_eq!(node_context::module_path(&g, frontend), "crate::frontend");
+    assert_eq!(node_context::module_path(&g, router), "crate::frontend::router");
+}
+
+#[test]
+fn render_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let _ = g.add_child(root, Node::new("a", "")).unwrap();
+    render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+    let r2 = render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+    assert!(r2.files_written.is_empty());
+}
+
+#[test]
+fn topological_order_respects_dep_graph() {
+    let mut g = NodeGraph::new();
+    let root = g.insert_root(Node::new("app", "")).unwrap();
+    let a = g.add_child(root, Node::new("a", "")).unwrap();
+    let b = g.add_child(root, Node::new("b", "")).unwrap();
+    g.add_dep(a, b).unwrap();
+    let order = g.topo_order().unwrap();
+    let pos_a = order.iter().position(|x| *x == a).unwrap();
+    let pos_b = order.iter().position(|x| *x == b).unwrap();
+    assert!(pos_b < pos_a, "b must come before a in topo order");
+}
+
+#[test]
+fn stage_state_round_trip_via_serde() {
+    use bureau_rs::graph::NodeStages;
+    let mut s = NodeStages::default();
+    for st in Stage::ALL {
+        s.set(st, StageState::Done);
+    }
+    let j = serde_json::to_string(&s).unwrap();
+    let s2: NodeStages = serde_json::from_str(&j).unwrap();
+    for st in Stage::ALL {
+        assert_eq!(s2.get(st), StageState::Done);
+    }
+}
+
+#[test]
+fn render_writes_authored_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut g = NodeGraph::new();
+    let mut root = Node::new("app", "");
+    root.public_rs = Some("pub trait App {}\n".into());
+    root.spec_md = Some("# App spec\n\nReal content.\n".into());
+    let _id = g.insert_root(root).unwrap();
+    render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+    let public_rs = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
+    assert!(public_rs.contains("pub trait App"));
+    let spec_md = std::fs::read_to_string(tmp.path().join("spec/app/spec.md")).unwrap();
+    assert!(spec_md.contains("Real content"));
+}
+
+// Marker so reorganization is obvious in test output.
+#[test]
+fn _smoke_module_loads() {
+    // Force usage of a few public APIs to catch link errors early.
+    let mut g = NodeGraph::new();
+    let _ = g.insert_root(Node::new("app", ""));
+    let _: PathBuf = bureau_rs::render::node_spec_dir(&g, g.iter().next().unwrap());
 }

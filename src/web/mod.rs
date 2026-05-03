@@ -1,10 +1,10 @@
-//! Web UI: axum router, SSE state broadcasting, embedded SPA.
+//! Web UI: axum router + SSE event broadcast + embedded SPA.
 
 pub mod ui;
 
 use crate::checkpoint;
-use crate::state::{SchedulerState, StateHandle, UiEvent};
-use crate::task::TaskStatus;
+use crate::graph::NodeId;
+use crate::state::{SchedulerState, StateHandle, TaskStatus, UiEvent};
 use anyhow::Result;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
@@ -16,14 +16,17 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
     pub state: StateHandle,
     pub workdir: PathBuf,
+    /// The engine's authoritative graph. Web mutations (e.g. reset_node)
+    /// must hit this so the running engine sees them immediately.
+    pub graph: std::sync::Arc<parking_lot::Mutex<crate::graph::NodeGraph>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -34,18 +37,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/files", get(api_files))
         .route("/api/file", get(api_file))
         .route("/api/gitlog", get(api_gitlog))
-        .route("/api/gitdiff", get(api_gitdiff))
         .route("/api/task_transcript", get(api_task_transcript))
-        .route("/api/task_files", get(api_task_files))
-        .route("/api/task_file", get(api_task_file))
         .route("/api/issues", get(api_issues))
-        .route("/api/phase_info", get(api_phase_info))
-        .route("/api/skip", post(api_skip))
-        .route("/api/retry", post(api_retry))
+        .route("/api/checkpoint", post(api_checkpoint))
         .route("/api/pause", post(api_pause))
         .route("/api/resume", post(api_resume))
-        .route("/api/checkpoint", post(api_checkpoint))
         .route("/api/stop", post(api_stop))
+        .route("/api/reset_node", post(api_reset_node))
         .with_state(state)
 }
 
@@ -53,7 +51,7 @@ pub async fn serve(state: AppState, port: u16) -> Result<()> {
     let app = router(state);
     let addr = format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("web UI listening on http://{}", addr);
+    tracing::info!("web UI: http://{addr}");
     axum::serve(listener, app.into_make_service()).await?;
     Ok(())
 }
@@ -66,11 +64,13 @@ async fn ui_index() -> impl IntoResponse {
     )
 }
 
-async fn api_state(State(s): State<AppState>) -> Json<crate::state::OrchestratorState> {
+async fn api_state(State(s): State<AppState>) -> Json<crate::state::EngineState> {
     Json(s.state.snapshot())
 }
 
-async fn api_events(State(s): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn api_events(
+    State(s): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = s.state.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| match res {
         Ok(ev) => match serde_json::to_string(&ev) {
@@ -86,7 +86,6 @@ async fn api_events(State(s): State<AppState>) -> Sse<impl Stream<Item = Result<
 struct FileEntry {
     path: String,
     size: u64,
-    is_dir: bool,
 }
 
 async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
@@ -95,6 +94,7 @@ async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
         .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
     {
         let rel = entry
             .path()
@@ -102,23 +102,16 @@ async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
             .ok()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| entry.path().to_path_buf());
-        // Filter on relative path so a workspace whose own path contains
-        // `.bureau` doesn't hide everything.
         if rel.components().any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            s == ".git" || s == "target" || s == ".bureau"
+            let c = c.as_os_str().to_string_lossy();
+            c == ".git" || c == "target" || c == ".bureau"
         }) {
             continue;
         }
-        let size = entry
-            .metadata()
-            .ok()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
         out.push(FileEntry {
             path: rel.to_string_lossy().to_string(),
             size,
-            is_dir: entry.file_type().is_dir(),
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -137,7 +130,7 @@ async fn api_file(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response
     }
     let abs = s.workdir.join(&rel);
     match std::fs::read_to_string(&abs) {
-        Ok(content) => content.into_response(),
+        Ok(c) => c.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, format!("{e}")).into_response(),
     }
 }
@@ -170,193 +163,52 @@ fn read_gitlog(dir: &Path) -> Result<Vec<CommitEntry>> {
 }
 
 #[derive(Deserialize)]
-struct HashQ {
-    hash: String,
-}
-
-async fn api_gitdiff(State(s): State<AppState>, Query(q): Query<HashQ>) -> Response {
-    match git_diff(&s.workdir, &q.hash) {
-        Ok(diff) => diff.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e}")).into_response(),
-    }
-}
-
-fn git_diff(dir: &Path, hash: &str) -> Result<String> {
-    let repo = git2::Repository::open(dir)?;
-    let oid = git2::Oid::from_str(hash)?;
-    let commit = repo.find_commit(oid)?;
-    let tree = commit.tree()?;
-    let parent = commit.parent(0).ok();
-    let parent_tree = parent.as_ref().and_then(|p| p.tree().ok());
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-    let mut buf = String::new();
-    diff.print(git2::DiffFormat::Patch, |_d, _h, line| {
-        let prefix = match line.origin() {
-            '+' | '-' | ' ' => format!("{}", line.origin()),
-            _ => String::new(),
-        };
-        buf.push_str(&prefix);
-        buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
-        true
-    })?;
-    Ok(buf)
-}
-
-#[derive(Deserialize)]
 struct TaskIdQ {
     id: Uuid,
 }
 
 async fn api_task_transcript(State(s): State<AppState>, Query(q): Query<TaskIdQ>) -> Response {
-    match s.state.read(|st| st.graph.get(q.id).cloned()) {
+    match s.state.read(|st| st.tasks.get(&q.id).cloned()) {
         Some(t) => Json(t.transcript).into_response(),
         None => (StatusCode::NOT_FOUND, "task not found").into_response(),
     }
 }
 
 #[derive(Serialize)]
-struct TaskFileEntry {
-    path: String,
-    size: u64,
-    location: &'static str,
-}
-
-#[derive(Serialize)]
-struct TaskFilesResp {
-    worktree_root: Option<String>,
-    files: Vec<TaskFileEntry>,
-}
-
-async fn api_task_files(State(s): State<AppState>, Query(q): Query<TaskIdQ>) -> Response {
-    let task = match s.state.read(|st| st.graph.get(q.id).cloned()) {
-        Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-    };
-    let mut files = Vec::new();
-    if let Some(wt) = &task.worktree {
-        if wt.exists() {
-            for e in walkdir::WalkDir::new(wt)
-                .min_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if !e.file_type().is_file() {
-                    continue;
-                }
-                let rel_path = e.path().strip_prefix(wt).unwrap_or(e.path());
-                // Worktrees themselves live under `.bureau/worktrees/...`, so
-                // filter relative-to-worktree, not absolute path components.
-                if rel_path.components().any(|c| {
-                    let s = c.as_os_str().to_string_lossy();
-                    s == ".git" || s == "target" || s == ".bureau"
-                }) {
-                    continue;
-                }
-                let rel = rel_path.to_string_lossy().to_string();
-                let size = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                files.push(TaskFileEntry {
-                    path: rel,
-                    size,
-                    location: "worktree",
-                });
-            }
-        }
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Json(TaskFilesResp {
-        worktree_root: task.worktree.as_ref().map(|p| p.display().to_string()),
-        files,
-    })
-    .into_response()
-}
-
-#[derive(Deserialize)]
-struct TaskFileQ {
-    id: Uuid,
-    path: String,
-}
-
-async fn api_task_file(State(s): State<AppState>, Query(q): Query<TaskFileQ>) -> Response {
-    let task = match s.state.read(|st| st.graph.get(q.id).cloned()) {
-        Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, "task not found").into_response(),
-    };
-    let wt = match &task.worktree {
-        Some(p) => p.clone(),
-        None => return (StatusCode::NOT_FOUND, "task has no worktree").into_response(),
-    };
-    let rel = PathBuf::from(&q.path);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
-    }
-    let abs = wt.join(&rel);
-    match std::fs::read_to_string(&abs) {
-        Ok(c) => c.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e}")).into_response(),
-    }
-}
-
-#[derive(Serialize)]
 struct Issue {
     task_id: Uuid,
-    task_description: String,
-    phase: crate::phase::Phase,
+    node_id: NodeId,
+    node_name: String,
+    stage: String,
     timestamp: chrono::DateTime<chrono::Utc>,
     kind: &'static str,
     tool: Option<String>,
     message: String,
     args: Option<String>,
-    /// Index of the originating entry within the task's transcript, so the
-    /// UI can scroll directly to it.
     entry_index: usize,
-}
-
-#[derive(Deserialize)]
-struct PhaseQ {
-    phase: String,
-}
-
-#[derive(Serialize)]
-struct PhaseInfoResp {
-    phase: String,
-    tools: Vec<crate::tools::ToolInfo>,
-}
-
-async fn api_phase_info(Query(q): Query<PhaseQ>) -> Response {
-    let phase = match crate::phase::Phase::parse(&q.phase) {
-        Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, "unknown phase").into_response(),
-    };
-    let tools = crate::tools::phase_tools(phase).await;
-    Json(PhaseInfoResp {
-        phase: phase.to_string(),
-        tools,
-    })
-    .into_response()
 }
 
 async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
     let mut out = Vec::new();
     s.state.read(|st| {
-        for (tid, t) in st.graph.tasks.iter() {
-            // Pair tool_call args with the immediately-following tool_result
-            // so we can attribute errors back to the call that triggered them.
+        for (tid, t) in st.tasks.iter() {
             let entries = &t.transcript;
             for (i, e) in entries.iter().enumerate() {
                 match &e.kind {
-                    crate::task::TranscriptKind::ToolResult { tool, ok: false, error, .. } => {
+                    crate::tools::TranscriptKind::ToolResult {
+                        tool, ok: false, error, ..
+                    } => {
                         let args = entries[..i].iter().rev().find_map(|p| match &p.kind {
-                            crate::task::TranscriptKind::ToolCall { tool: t2, args }
-                                if t2 == tool =>
-                            {
-                                Some(args.clone())
+                            crate::tools::TranscriptKind::ToolCall { tool: t2 } if t2 == tool => {
+                                Some(p.content.clone())
                             }
                             _ => None,
                         });
                         out.push(Issue {
                             task_id: *tid,
-                            task_description: t.description.clone(),
-                            phase: t.phase,
+                            node_id: t.node_id,
+                            node_name: t.node_name.clone(),
+                            stage: t.stage.to_string(),
                             timestamp: e.timestamp,
                             kind: "tool_failure",
                             tool: Some(tool.clone()),
@@ -365,11 +217,12 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
                             entry_index: i,
                         });
                     }
-                    crate::task::TranscriptKind::Error => {
+                    crate::tools::TranscriptKind::Error => {
                         out.push(Issue {
                             task_id: *tid,
-                            task_description: t.description.clone(),
-                            phase: t.phase,
+                            node_id: t.node_id,
+                            node_name: t.node_name.clone(),
+                            stage: t.stage.to_string(),
                             timestamp: e.timestamp,
                             kind: "task_error",
                             tool: None,
@@ -387,44 +240,13 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
     Json(out)
 }
 
-#[derive(Deserialize)]
-struct TaskIdBody {
-    task_id: Uuid,
-}
-
-async fn api_skip(State(s): State<AppState>, Json(b): Json<TaskIdBody>) -> Response {
-    s.state.write(|st| {
-        if let Some(t) = st.graph.get_mut(b.task_id) {
-            if !t.status.is_terminal() {
-                t.status = TaskStatus::Skipped;
-                t.finished_at = Some(chrono::Utc::now());
-            }
-        }
-    });
-    s.state.emit(UiEvent::TaskStatusChanged {
-        id: b.task_id,
-        status: TaskStatus::Skipped,
-    });
-    StatusCode::OK.into_response()
-}
-
-async fn api_retry(State(s): State<AppState>, Json(b): Json<TaskIdBody>) -> Response {
-    s.state.write(|st| {
-        if let Some(t) = st.graph.get_mut(b.task_id) {
-            if matches!(t.status, TaskStatus::Failed) {
-                t.status = TaskStatus::Pending;
-                t.started_at = None;
-                t.finished_at = None;
-                t.error = None;
-                t.retries += 1;
-            }
-        }
-    });
-    s.state.emit(UiEvent::TaskStatusChanged {
-        id: b.task_id,
-        status: TaskStatus::Pending,
-    });
-    StatusCode::OK.into_response()
+async fn api_checkpoint(State(s): State<AppState>) -> Response {
+    let dir = s.workdir.join(".bureau").join("checkpoints");
+    let snap = s.state.snapshot();
+    match checkpoint::save(&snap, &dir) {
+        Ok(p) => Json(serde_json::json!({"path": p.display().to_string()})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
 }
 
 async fn api_pause(State(s): State<AppState>) -> Response {
@@ -443,13 +265,64 @@ async fn api_resume(State(s): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
-async fn api_checkpoint(State(s): State<AppState>) -> Response {
-    let dir = s.workdir.join(".bureau").join("checkpoints");
-    let snap = s.state.snapshot();
-    match checkpoint::save(&snap, &dir) {
-        Ok(p) => Json(serde_json::json!({"path": p.display().to_string()})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+#[derive(Deserialize)]
+struct ResetNodeBody {
+    node_id: crate::graph::NodeId,
+    /// If true (default), also reset every node that transitively depends
+    /// on this node — their work is now stale.
+    #[serde(default = "default_true")]
+    cascade: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct ResetNodeOk {
+    reset: Vec<String>,
+}
+
+async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBody>) -> Response {
+    use crate::graph::{Stage, StageState};
+    let mut reset_names: Vec<String> = Vec::new();
+    {
+        let mut g = s.graph.lock();
+        // Collect targets: the named node plus (if cascading) every node
+        // whose transitive deps include the named node.
+        let mut targets: std::collections::HashSet<crate::graph::NodeId> =
+            std::collections::HashSet::new();
+        targets.insert(body.node_id);
+        if body.cascade {
+            let ids: Vec<_> = g.nodes.keys().copied().collect();
+            for id in ids {
+                if id != body.node_id && g.dep_reaches(id, body.node_id) {
+                    targets.insert(id);
+                }
+            }
+        }
+        for id in &targets {
+            if let Some(n) = g.get_mut(*id) {
+                for stage in Stage::ALL {
+                    n.stages.set(stage, StageState::NotStarted);
+                }
+                reset_names.push(n.name.clone());
+            }
+        }
     }
+    // Sync the change into the EngineState so the UI reflects it
+    // immediately rather than waiting for the engine's next sync.
+    let snap = s.graph.lock().clone();
+    let msg = format!(
+        "reset {} node(s) from web UI: {}",
+        reset_names.len(),
+        reset_names.join(", ")
+    );
+    s.state.write(|st| {
+        st.graph = snap;
+        st.note(msg);
+    });
+    Json(ResetNodeOk { reset: reset_names }).into_response()
 }
 
 async fn api_stop(State(s): State<AppState>) -> Response {
@@ -460,3 +333,5 @@ async fn api_stop(State(s): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
+// Suppress unused warning when TaskStatus isn't directly referenced.
+fn _force_taskstatus(_: TaskStatus) {}

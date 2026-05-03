@@ -1,0 +1,61 @@
+# bureau-rs config for the samba-rs example.
+#
+# This example targets a Samba-equivalent server suite. It's the test case
+# for the workspace layout, deep hierarchical decomposition, and parallel
+# scheduling. Expect ~50+ leaf crates, several thousand LLM tasks, and a
+# total cost on the order of tens of dollars depending on model choice —
+# the cost_cap_usd below is the safety rail, not a target.
+
+project_name = "samba-rs"
+layout = "workspace"
+
+[models]
+# A samba reimplementation involves real protocol work — NDR marshalling,
+# ASN.1 Kerberos, SMB framing, ACL evaluation. Use a strong model for the
+# actor and reviser; the judge is just a coherence check, so spend less
+# there.
+#
+# These are OpenRouter model IDs; substitute whatever you have access to.
+# Suggested alternatives:
+#   actor   = "anthropic/claude-opus-4.7"
+#   actor   = "openai/gpt-5"
+#   actor   = "google/gemini-2.5-pro"
+actor   = "anthropic/claude-sonnet-4.6"
+critic  = "anthropic/claude-sonnet-4.6"
+reviser = "anthropic/claude-sonnet-4.6"
+judge   = "openai/gpt-5-mini"
+
+# Larger budget per turn — protocol crates have a lot of mechanical
+# code and the spec context the prompt builder includes can be hefty.
+max_tokens  = 16384
+temperature = 0.0
+max_turns   = 60
+
+[limits]
+# Crate `lib.rs` files for protocol parsers tend to be longer than the
+# default; bump the per-file cap so the actor isn't forced to over-split.
+max_file_lines         = 600
+max_spec_section_lines = 800
+
+# 4 parallel tasks: enough to overlap LLM latency across independent
+# nodes, not so many that the cargo lock thrashes. Bump to 8 if you've
+# got fast SSD + spare cores.
+max_parallel_tasks = 4
+
+# Protocol code occasionally needs more than two retries before the
+# cargo gate is happy — be slightly more generous than the default.
+max_stage_retries = 3
+critique_retries  = 2
+
+# The graph is large: ~50 leaf crates × 6 stages × ≈3 LLM calls per
+# stage, plus retries. Budget generously; cost_cap_usd is the real
+# safety rail.
+max_tasks_total = 8192
+
+# Hard cost cap. The pipeline halts when this is exceeded. Tune to your
+# wallet; raise if you're using a strong model and want it to finish.
+cost_cap_usd = 50.0
+
+[provider]
+# api_key_env = "OPENROUTER_API_KEY"
+# base_url    = "https://openrouter.ai/api/v1"
