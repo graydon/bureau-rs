@@ -40,7 +40,7 @@ fn default_max_turns() -> usize {
 impl ModelConfig {
     pub fn for_role(&self, role: crate::tools::Role) -> &str {
         match role {
-            crate::tools::Role::Actor => &self.actor,
+            crate::tools::Role::Writer => &self.actor,
             crate::tools::Role::Critic => self.critic.as_deref().unwrap_or(&self.actor),
             crate::tools::Role::Reviser => self.reviser.as_deref().unwrap_or(&self.actor),
             crate::tools::Role::Judge => self.judge.as_deref().unwrap_or(&self.actor),
@@ -59,12 +59,38 @@ pub struct Limits {
     /// Per-stage retry budget when the gate fails.
     #[serde(default = "default_max_stage_retries")]
     pub max_stage_retries: u32,
+    /// How many times the engine will re-prompt a role to retry its
+    /// unresolved failed tool calls before giving up. Each retry is a
+    /// fresh `driver.drive()` invocation with a focused preamble that
+    /// lists the failed calls. 0 disables auto-retry (failures still
+    /// surface to the next role's cycle context). Default 2.
+    #[serde(default = "default_tool_retry_budget")]
+    pub tool_retry_budget: u32,
+    /// How many bytes of a failed tool call's args to echo back to the
+    /// model in the focused-retry / cycle-context display. Args are
+    /// truncated past this with a clear `[TRUNCATED, N bytes total]`
+    /// marker. Keep small (default 60): for `submit_*` tools the model
+    /// re-derives content from the spec / dep ifaces in context, so
+    /// only the first few bytes are needed for identification.
+    #[serde(default = "default_args_display_cap")]
+    pub args_display_cap: usize,
     /// Critique cycles per stage. 0 disables critique.
     #[serde(default = "default_critique_retries")]
     pub critique_retries: u32,
     /// Hard cap on total tasks the engine will run before bailing.
     #[serde(default = "default_max_tasks_total")]
     pub max_tasks_total: usize,
+    /// Hard cap on the number of nodes the decomposition graph may
+    /// contain. The `decompose` tool refuses to add children that would
+    /// exceed it. Default 64. Use to stop runaway decomposition where
+    /// every spec stage keeps splitting into more children.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+    /// Hard cap on the depth of the decomposition tree (root has depth
+    /// 0). The `decompose` tool refuses children whose depth would
+    /// exceed it. Default 5. Forces leaves to bottom out.
+    #[serde(default = "default_max_node_depth")]
+    pub max_node_depth: usize,
     #[serde(default)]
     pub cost_cap_usd: Option<f64>,
 }
@@ -81,11 +107,23 @@ fn default_max_parallel_tasks() -> usize {
 fn default_max_stage_retries() -> u32 {
     2
 }
+fn default_tool_retry_budget() -> u32 {
+    2
+}
+fn default_args_display_cap() -> usize {
+    60
+}
 fn default_critique_retries() -> u32 {
     1
 }
 fn default_max_tasks_total() -> usize {
     256
+}
+fn default_max_nodes() -> usize {
+    64
+}
+fn default_max_node_depth() -> usize {
+    5
 }
 
 impl Default for Limits {
@@ -95,8 +133,12 @@ impl Default for Limits {
             max_spec_section_lines: default_max_spec_lines(),
             max_parallel_tasks: default_max_parallel_tasks(),
             max_stage_retries: default_max_stage_retries(),
+            tool_retry_budget: default_tool_retry_budget(),
+            args_display_cap: default_args_display_cap(),
             critique_retries: default_critique_retries(),
             max_tasks_total: default_max_tasks_total(),
+            max_nodes: default_max_nodes(),
+            max_node_depth: default_max_node_depth(),
             cost_cap_usd: None,
         }
     }

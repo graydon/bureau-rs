@@ -29,7 +29,7 @@ fn single_node_renders_full_directory() {
     assert!(tmp.path().join("src/public.rs").exists());
     assert!(tmp.path().join("src/private.rs").exists());
     assert!(tmp.path().join("src/tests.rs").exists());
-    assert!(tmp.path().join("spec/app/spec.md").exists());
+    assert!(tmp.path().join("spec/app/public.md").exists());
 }
 
 #[test]
@@ -179,12 +179,12 @@ fn render_writes_authored_content() {
     let mut g = NodeGraph::new();
     let mut root = Node::new("app", "");
     root.public_rs = Some("pub trait App {}\n".into());
-    root.spec_md = Some("# App spec\n\nReal content.\n".into());
+    root.spec_public_md = Some("# App spec\n\nReal content.\n".into());
     let _id = g.insert_root(root).unwrap();
     render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
     let public_rs = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
     assert!(public_rs.contains("pub trait App"));
-    let spec_md = std::fs::read_to_string(tmp.path().join("spec/app/spec.md")).unwrap();
+    let spec_md = std::fs::read_to_string(tmp.path().join("spec/app/public.md")).unwrap();
     assert!(spec_md.contains("Real content"));
 }
 

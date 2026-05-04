@@ -1,7 +1,7 @@
 //! Runtime state shared between engine and web UI.
 
 use crate::graph::{NodeGraph, NodeId, Stage};
-use crate::tools::{JudgeVerdict, Role, TranscriptEntry};
+use crate::tools::{JudgeVerdict, TranscriptEntry};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -148,7 +148,6 @@ pub enum UiEvent {
     TranscriptAppended {
         task_id: Uuid,
         entry: TranscriptEntry,
-        role: Role,
     },
     TaskCost {
         task_id: Uuid,

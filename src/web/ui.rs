@@ -15,45 +15,102 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
   }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: var(--mono); font-size: 13px; }
-  #app { display: grid; grid-template-rows: 1fr auto; height: 100vh; }
-  #panels { display: grid; grid-template-columns: 360px 1fr 360px; min-height: 0; }
-  .panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
-  .panel:last-child { border-right: none; }
-  .panel-h { padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); font-weight: 600; }
-  .panel-body { overflow: auto; padding: 8px; flex: 1; min-height: 0; }
+  #app { display: grid; grid-template-rows: 1fr auto; height: 100vh; min-height: 0; }
+  /* Resizable columns: a flex row of [panel | splitter | panel | splitter | panel].
+     Splitters drag-resize the adjacent panels via JS. min-width: 0 lets each
+     panel actually shrink below its content's natural width (long paths!). */
+  #panels { display: flex; flex-direction: row; min-height: 0; min-width: 0; }
+  .panel { display: flex; flex-direction: column; min-height: 0; min-width: 0;
+           overflow: hidden; }
+  .panel.col-1 { width: 320px; flex: 0 0 auto; border-right: 1px solid var(--border); }
+  .panel.col-2 { flex: 1 1 auto; border-right: 1px solid var(--border); }
+  .panel.col-3 { width: 360px; flex: 0 0 auto; }
+  .splitter { width: 4px; cursor: col-resize; background: transparent; flex: 0 0 auto; }
+  .splitter:hover, .splitter.dragging { background: var(--accent); }
+  .panel-h { padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); font-weight: 600; flex: 0 0 auto; }
+  /* Panel body lays its sections out in a column. Each open section gets a
+     share of the height; closed sections collapse to their summary. The
+     SCROLL happens inside each section's body, not on the panel. */
+  .panel-body { display: flex; flex-direction: column; padding: 6px; flex: 1 1 auto;
+                min-height: 0; min-width: 0; gap: 6px; overflow: hidden; }
   #status { background: var(--bg2); border-top: 1px solid var(--border); padding: 6px 12px; display: flex; gap: 16px; align-items: center; font-size: 12px; }
-  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
-  .badge.spec { background: #233a55; color: #b9d9ff; }
-  .badge.iface { background: #2a3f2a; color: #aef0ae; }
-  .badge.tests { background: #4a3f1f; color: #f0d59e; }
-  .badge.impl { background: #503355; color: #d4a8e0; }
-  .badge.debug { background: #4a2c2c; color: #f0a8a8; }
-  .badge.opt { background: #2c4a4a; color: #a0e0e0; }
-  .badge.pending, .badge.not_started { background: #2a2f3d; color: #aab2c5; }
-  .badge.running, .badge.in_progress { background: #3a2f55; color: #d4b8ff; animation: pulse 1.2s infinite; }
-  .badge.done { background: #1f3a2a; color: #98e3b3; }
-  .badge.failed { background: #3a1f1f; color: #f0a0a0; }
-  .badge.skipped { background: #2a2a2a; color: #888; }
+  /* Color semantics — ONE meaning per color:
+     - blue  (.entity) = an entity-type label (e.g. "node", "task"). Static.
+     - grey  (.status.queued)   = not started / pending.
+     - purple-throbbing (.status.running) = in progress.
+     - green (.status.ok)       = done / succeeded.
+     - red   (.status.failed)   = errored / unresolved failure.
+     - amber (.status.retrying) = transient, will retry.
+     Phase names (spec/iface/tests/impl/debug/opt) carry NO color of their
+     own — they're plain text. The phase's STATUS gets the color. */
+  .entity { display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 11px; background: #233a55; color: #b9d9ff; }
+  .phase  { display: inline-block; padding: 1px 4px; font-size: 11px;
+            color: var(--muted); }
+  .status { display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 11px; }
+  .status.queued, .status.pending, .status.not_started, .status.skipped {
+    background: #25272f; color: #888;
+  }
+  .status.running, .status.in_progress {
+    background: #3a2f55; color: #d4b8ff; animation: pulse 1.2s infinite;
+  }
+  .status.ok, .status.done, .status.resolved {
+    background: #1f3a2a; color: #98e3b3;
+  }
+  .status.failed, .status.permanent, .status.error {
+    background: #3a1f1f; color: #f0a0a0;
+  }
+  .status.retrying {
+    background: #4a3f1f; color: #f0d59e; animation: pulse 1.6s infinite;
+  }
+  .status.resolved { opacity: 0.65; }
+  /* A combined phase+status pill: phase name in muted text, background
+     tinted by status. Used for per-stage badges in the node + task UI. */
+  .phase-pill { display: inline-block; padding: 1px 6px; border-radius: 3px;
+                font-size: 11px; }
+  .phase-pill.queued, .phase-pill.pending, .phase-pill.not_started,
+  .phase-pill.skipped { background: #25272f; color: #888; }
+  .phase-pill.running, .phase-pill.in_progress {
+    background: #3a2f55; color: #d4b8ff; animation: pulse 1.2s infinite;
+  }
+  .phase-pill.ok, .phase-pill.done { background: #1f3a2a; color: #98e3b3; }
+  .phase-pill.failed { background: #3a1f1f; color: #f0a0a0; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
-  .node { padding: 6px 8px; border-radius: 4px; cursor: pointer; margin-bottom: 4px; }
+  .node { padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; }
   .node:hover { background: var(--bg2); }
   .node.selected { background: var(--bg3); }
-  .node .name { font-weight: 600; }
+  .node .name { font-weight: 600; display: flex; align-items: center; gap: 4px; }
   .node .stages { display: flex; gap: 3px; margin-top: 4px; flex-wrap: wrap; }
+  .tree-chevron { display: inline-block; width: 12px; text-align: center;
+                  cursor: pointer; color: var(--muted); user-select: none; }
+  .tree-chevron:hover { color: var(--accent); }
+  .tree-chevron-spacer { display: inline-block; width: 12px; text-align: center;
+                         color: var(--border); user-select: none; }
+  .phase-pill.clickable { cursor: pointer; }
+  .phase-pill.clickable:hover { outline: 1px solid var(--accent); }
   .children { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 4px; }
   .task { padding: 4px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; }
   .task:hover { background: var(--bg2); }
   .task.selected { background: var(--bg3); }
   .transcript .entry { border-bottom: 1px dashed var(--border); padding: 6px 4px; }
-  .transcript .entry.role-actor { border-left: 2px solid #5aa9e6; padding-left: 6px; }
-  .transcript .entry.role-critic { border-left: 2px solid #d6a14a; padding-left: 6px; }
-  .transcript .entry.role-reviser { border-left: 2px solid #5eb988; padding-left: 6px; }
-  .transcript .entry.role-judge { border-left: 2px solid #a36ae6; padding-left: 6px; }
-  .role-badge { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 10px; margin-right: 4px; }
-  .role-badge.actor { background: #233a55; color: #b9d9ff; }
-  .role-badge.critic { background: #4a3f1f; color: #f0d59e; }
-  .role-badge.reviser { background: #1f3a2a; color: #98e3b3; }
-  .role-badge.judge { background: #503355; color: #d4a8e0; }
+  /* Border-left distinguishes who is speaking: model entries get a
+     stronger accent stripe; bureau entries get a muted one. No
+     per-cycle-role color anywhere. */
+  .transcript .entry.speaker-model  { border-left: 2px solid var(--accent); padding-left: 6px; }
+  .transcript .entry.speaker-bureau { border-left: 2px solid #3a4055; padding-left: 6px; }
+  /* Speaker pill (model | bureau) — the only colored badge in the
+     transcript header. Blue = "this is a label", same family as the
+     entity badges in the left panel. */
+  .speaker { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 10px;
+             font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+  .speaker.model  { background: #233a55; color: #b9d9ff; }
+  .speaker.bureau { background: #2a2f3d; color: #aab2c5; }
+  /* Cycle role (writer/critic/reviser/judge) is plain text. */
+  .role { display: inline-block; padding: 0 4px; font-size: 10px; color: var(--muted);
+          letter-spacing: 0.04em; text-transform: uppercase; }
+  code.tool-name { background: var(--bg2); padding: 0 4px; border-radius: 3px;
+                   font-size: 11px; color: var(--fg); }
   .transcript .entry .h { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); cursor: pointer; }
   .transcript .entry pre { white-space: pre-wrap; font-size: 11px; margin: 4px 0 0; word-break: break-all; }
   .transcript .entry.system pre { color: #c8b89e; }
@@ -61,16 +118,43 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   .transcript .entry.tool_call pre { color: #a0c8a0; }
   .transcript .entry.tool_result pre { color: #c8a8e0; }
   .transcript .entry.tool_result.failed pre { color: var(--bad); }
+  .transcript .entry.tool_definitions .defs { display: block; }
+  .transcript .entry.tool_definitions.collapsed .defs { display: none; }
+  .transcript .entry.tool_definitions .tool-def { margin: 4px 0; padding: 4px 6px; background: var(--bg2); border-radius: 3px; }
+  .transcript .entry.tool_definitions .tool-def .tool-name { font-weight: 600; color: #b0d4e8; }
+  .transcript .entry.tool_definitions .tool-def .tool-desc { white-space: pre-wrap; font-size: 11px; color: #a8b8c8; margin-top: 2px; }
   .collapsed pre { display: none; }
-  pre.preview { background: var(--bg2); padding: 8px; border-radius: 4px; white-space: pre-wrap; font-size: 12px; max-height: 50vh; overflow: auto; word-break: break-all; }
-  details.section { margin-bottom: 8px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--bg); }
-  details.section > summary { font-weight: 600; padding: 4px 0; cursor: pointer; }
+  pre.preview { background: var(--bg2); padding: 8px; border-radius: 4px; white-space: pre-wrap; font-size: 12px; word-break: break-all; margin: 0; }
+  /* Each section is a flex container itself: a sticky-ish summary plus a
+     scrollable body. When .open it gets `flex: 1` and shares the panel
+     vertically with its open siblings; when not .open it collapses to
+     just the summary line. We do NOT use <details>/<summary> for this —
+     the native disclosure widget has unreliable interaction with flex
+     layout (summary doesn't always behave as a flex item, breaking the
+     height chain to .sec-body). Plain divs + a toggled `open` class are
+     predictable. */
+  .section { border: 1px solid var(--border); border-radius: 4px;
+             background: var(--bg); display: flex; flex-direction: column;
+             min-height: 0; flex: 0 0 auto; overflow: hidden; }
+  .section.open { flex: 1 1 0; min-height: 80px; }
+  .sec-summary { font-weight: 600; padding: 6px 8px; cursor: pointer;
+                 flex: 0 0 auto; user-select: none;
+                 display: flex; align-items: center; gap: 6px; }
+  .sec-summary::before { content: "▸"; color: var(--muted); display: inline-block;
+                         transition: transform 0.1s; }
+  .section.open > .sec-summary::before { transform: rotate(90deg); }
+  .sec-body { padding: 4px 8px; overflow: auto; flex: 1 1 auto; min-height: 0; }
+  .section:not(.open) .sec-body { display: none; }
   .file-tree li { list-style: none; padding: 1px 0; }
   .file-tree a { color: var(--fg); cursor: pointer; }
   .file-tree a:hover { color: var(--accent); }
   .issue { padding: 6px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
   .issue:hover { background: var(--bg2); }
-  .issue .imsg { color: var(--bad); font-size: 12px; margin-top: 2px; }
+  .issue .imsg { font-size: 12px; margin-top: 2px; }
+  .issue.permanent .imsg { color: var(--bad); }
+  .issue.retrying  .imsg { color: var(--warn); }
+  .issue.resolved  .imsg { color: var(--muted); text-decoration: line-through; }
+  .issue.resolved  { opacity: 0.65; }
   button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); padding: 3px 8px; border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px; }
   button:hover { background: var(--bg2); }
   button.reset-btn { padding: 0 6px; margin-left: 4px; font-size: 10px; }
@@ -81,44 +165,51 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <body>
 <div id="app">
 <div id="panels">
-  <div class="panel">
+  <div class="panel col-1">
     <div class="panel-h">Graph + Tasks <span class="muted" id="counts"></span></div>
     <div class="panel-body">
-      <details class="section" open>
-        <summary>Node graph</summary>
-        <div id="graph-tree"></div>
-      </details>
-      <details class="section" open>
-        <summary>Recent tasks</summary>
-        <div id="task-list"></div>
-      </details>
-      <details class="section">
-        <summary>Issues <span class="muted" id="issues-count"></span></summary>
-        <div id="issues-list"></div>
-      </details>
+      <div class="section open">
+        <div class="sec-summary">Node graph</div>
+        <div class="sec-body" id="graph-tree"></div>
+      </div>
+      <div class="section open">
+        <div class="sec-summary">Recent tasks</div>
+        <div class="sec-body" id="task-list"></div>
+      </div>
+      <div class="section">
+        <div class="sec-summary">Issues <span class="muted" id="issues-count"></span></div>
+        <div class="sec-body" id="issues-list"></div>
+      </div>
     </div>
   </div>
-  <div class="panel">
+  <div class="splitter" data-resize="col-1" data-edge="right"></div>
+  <div class="panel col-2">
     <div class="panel-h">Transcript <span class="muted" id="task-title"></span></div>
-    <div class="panel-body transcript" id="transcript">
-      <div class="muted">Select a task on the left to view its transcript.</div>
+    <div class="panel-body">
+      <div class="section open">
+        <div class="sec-summary">Turn-by-turn transcript</div>
+        <div class="sec-body transcript" id="transcript">
+          <div class="muted">Select a task on the left to view its transcript.</div>
+        </div>
+      </div>
     </div>
   </div>
-  <div class="panel">
+  <div class="splitter" data-resize="col-3" data-edge="left"></div>
+  <div class="panel col-3">
     <div class="panel-h">Files</div>
     <div class="panel-body">
-      <details class="section" open>
-        <summary>Workdir <span class="muted" id="files-count"></span></summary>
-        <ul class="file-tree" id="file-tree"></ul>
-      </details>
-      <details class="section" open>
-        <summary>Git log <span class="muted" id="git-count"></span></summary>
-        <div id="git-log" style="font-size: 11px;"></div>
-      </details>
-      <details class="section" open>
-        <summary>Preview <span class="muted" id="preview-h"></span></summary>
-        <pre class="preview" id="preview"></pre>
-      </details>
+      <div class="section open">
+        <div class="sec-summary">Workdir <span class="muted" id="files-count"></span></div>
+        <div class="sec-body"><ul class="file-tree" id="file-tree"></ul></div>
+      </div>
+      <div class="section">
+        <div class="sec-summary">Git log <span class="muted" id="git-count"></span></div>
+        <div class="sec-body" id="git-log" style="font-size: 11px;"></div>
+      </div>
+      <div class="section">
+        <div class="sec-summary">Preview <span class="muted" id="preview-h"></span></div>
+        <div class="sec-body"><pre class="preview" id="preview"></pre></div>
+      </div>
     </div>
   </div>
 </div>
@@ -138,6 +229,75 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 </div>
 <script>
 let state = null, issues = [], selectedTaskId = null, collapsed = {};
+// Per-node-id: are this node's children hidden in the tree view? Default
+// false (children shown). Persists across re-renders within a session.
+let nodeCollapsed = {};
+
+// ---- Section open/close ----
+// Each .section toggles its `open` class when its summary is clicked.
+// When open, the section participates in the panel-body's flex layout
+// and shares vertical space with its open siblings; when closed, it
+// collapses to just the summary line. State persists per-section to
+// localStorage (the `id` of the .sec-body inside is the persistence
+// key — every section already has a unique inner id).
+function initSections() {
+  for (const sec of document.querySelectorAll('.section')) {
+    const body = sec.querySelector('.sec-body');
+    const key = body && body.id ? 'sec-open-' + body.id : null;
+    if (key) {
+      const stored = localStorage.getItem(key);
+      if (stored === '1') sec.classList.add('open');
+      else if (stored === '0') sec.classList.remove('open');
+    }
+    const summary = sec.querySelector('.sec-summary');
+    if (summary) {
+      summary.addEventListener('click', () => {
+        sec.classList.toggle('open');
+        if (key) localStorage.setItem(key, sec.classList.contains('open') ? '1' : '0');
+      });
+    }
+  }
+}
+
+// ---- Resizable columns ----
+// Each .splitter resizes ONE adjacent panel — the one with a fixed width
+// (col-1 and col-3); the middle col-2 has flex: 1 and just reflows. The
+// `data-resize` attribute names the panel; `data-edge` says which edge of
+// that panel the splitter sits on, which controls the drag direction:
+//   - edge=right  (col-1's right edge): drag right → panel grows.
+//   - edge=left   (col-3's left edge):  drag right → panel shrinks.
+// Width persists to localStorage so user preferences stick across reloads.
+function initSplitters() {
+  for (const sp of document.querySelectorAll('.splitter')) {
+    const target = sp.dataset.resize;
+    const edge = sp.dataset.edge || 'right';
+    const panel = target ? document.querySelector('.panel.' + target) : null;
+    if (!panel) continue;
+    const stored = localStorage.getItem('panel-w-' + target);
+    if (stored) panel.style.width = stored;
+    sp.addEventListener('mousedown', e => {
+      e.preventDefault();
+      sp.classList.add('dragging');
+      const startX = e.clientX;
+      const startW = panel.getBoundingClientRect().width;
+      function onMove(ev) {
+        const dx = ev.clientX - startX;
+        const w = edge === 'right'
+          ? Math.max(120, startW + dx) // splitter on panel's right; right-drag grows panel
+          : Math.max(120, startW - dx); // splitter on panel's left; right-drag shrinks panel
+        panel.style.width = w + 'px';
+      }
+      function onUp() {
+        sp.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        localStorage.setItem('panel-w-' + target, panel.style.width);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  }
+}
 
 async function api(path, method='GET', body=null) {
   const r = await fetch(path, {
@@ -185,19 +345,46 @@ function renderGraph() {
   renderNodeRecursive(tree, state.graph.root);
 }
 
+// Find the task that ran for (node_id, stage). If none yet, returns null.
+// Picks the most recently-started one (later attempts override earlier).
+function findTaskFor(nodeId, stage) {
+  let best = null;
+  for (const t of Object.values(state.tasks || {})) {
+    if (t.node_id === nodeId && t.stage === stage) {
+      if (!best || (t.started_at || '') > (best.started_at || '')) best = t;
+    }
+  }
+  return best;
+}
+
 function renderNodeRecursive(parent, nodeId) {
   const n = state.graph.nodes[nodeId];
   if (!n) return;
+  const children = Object.values(state.graph.nodes).filter(c => c.parent === nodeId);
+  const isCollapsed = !!nodeCollapsed[nodeId];
   const div = document.createElement('div');
   div.className = 'node';
   const stages = ['spec','iface','tests','impl','debug','opt'];
+  // Each stage is shown as a phase-pill: the phase NAME is plain text;
+  // its background color is driven by the stage's STATUS (grey / purple
+  // throbbing / green / red). No per-phase color. Click jumps to that
+  // stage's task transcript when one exists.
   const stageBadges = stages.map(s => {
     const st = n.stages[s] || 'not_started';
-    return `<span class="badge ${st}" title="${s}: ${st}">${s}</span>`;
-  }).join('');
+    const clickable = (st === 'in_progress' || st === 'done' || st === 'failed');
+    return `<span class="phase-pill ${st}${clickable ? ' clickable' : ''}" `
+         + `data-node-id="${n.id}" data-stage="${s}" `
+         + `title="${s}: ${st}${clickable ? ' (click to view transcript)' : ''}">${s}</span>`;
+  }).join(' ');
+  // Chevron is a clickable disclosure widget for the children subtree.
+  // Only shown when there ARE children.
+  const chevron = children.length
+    ? `<span class="tree-chevron" data-node-id="${n.id}" title="${isCollapsed ? 'Expand' : 'Collapse'} subtree">${isCollapsed ? '▸' : '▾'}</span>`
+    : `<span class="tree-chevron-spacer">·</span>`;
   div.innerHTML = `
     <div class="name">
-      <span class="badge spec">node</span> ${escapeHtml(n.name)}${n.crate_boundary ? ' <span class="muted">(crate)</span>' : ''}
+      ${chevron}
+      <span class="entity">node</span> ${escapeHtml(n.name)}${n.crate_boundary ? ' <span class="muted">(crate)</span>' : ''}
       <button class="reset-btn" data-node-id="${n.id}" title="Reset all stages of this node and re-run">↻</button>
     </div>
     <div class="muted" style="font-size:10px;">${escapeHtml(n.description.slice(0, 100))}</div>
@@ -212,10 +399,26 @@ function renderNodeRecursive(parent, nodeId) {
       })
       .catch(err => alert('reset failed: ' + err));
   };
+  // Click chevron → toggle subtree collapse.
+  const chev = div.querySelector('.tree-chevron');
+  if (chev) {
+    chev.onclick = (e) => {
+      e.stopPropagation();
+      nodeCollapsed[nodeId] = !nodeCollapsed[nodeId];
+      render();
+    };
+  }
+  // Click a phase-pill in a runnable state → jump to that task's transcript.
+  for (const pill of div.querySelectorAll('.phase-pill.clickable')) {
+    pill.onclick = (e) => {
+      e.stopPropagation();
+      const t = findTaskFor(pill.dataset.nodeId, pill.dataset.stage);
+      if (t) { selectedTaskId = t.id; render(); }
+    };
+  }
   parent.appendChild(div);
-  // Children
-  const children = Object.values(state.graph.nodes).filter(c => c.parent === nodeId);
-  if (children.length) {
+  // Children (unless collapsed by user).
+  if (children.length && !isCollapsed) {
     const ch = document.createElement('div');
     ch.className = 'children';
     parent.appendChild(ch);
@@ -230,13 +433,38 @@ function renderTasks() {
   for (const t of tasks.slice(0, 30)) {
     const div = document.createElement('div');
     div.className = 'task' + (t.id === selectedTaskId ? ' selected' : '');
+    // Color comes ONLY from status. The entity ("task"), the phase
+    // ("iface"), and the node name are uncolored labels.
     div.innerHTML = `
-      <span class="badge ${t.stage}">${t.stage}</span>
-      <span class="badge ${t.status}">${t.status}</span>
+      <span class="entity">task</span>
       <strong>${escapeHtml(t.node_name)}</strong>
+      <span class="phase">${t.stage}</span>
+      <span class="status ${t.status}">${t.status}</span>
       <span class="muted">${(t.cost?.input_tokens||0)+(t.cost?.output_tokens||0)} tok</span>`;
     div.onclick = () => { selectedTaskId = t.id; render(); };
     el.appendChild(div);
+  }
+}
+
+// Which side of the framework/model boundary an entry came from.
+// Mirror of TranscriptEntry::speaker() in src/tools.rs.
+function speakerFor(kind) {
+  const t = kind?.type;
+  return (t === 'assistant_text' || t === 'tool_call') ? 'model' : 'bureau';
+}
+
+// Friendly entry-kind label for the header.
+function kindLabel(kind) {
+  switch (kind?.type) {
+    case 'system':           return 'system prompt';
+    case 'user_prompt':      return 'user prompt';
+    case 'assistant_text':   return 'assistant text';
+    case 'tool_definitions': return 'tool definitions';
+    case 'tool_call':        return 'tool call';
+    case 'tool_result':      return 'tool result';
+    case 'note':             return 'note';
+    case 'error':            return 'error';
+    default:                 return kind?.type || 'note';
   }
 }
 
@@ -251,32 +479,54 @@ function renderTranscript() {
   el.innerHTML = '';
   (t.transcript || []).forEach((e, i) => {
     const cls = (e.kind && e.kind.type) || 'note';
-    const role = e.role || 'actor';
+    const speaker = speakerFor(e.kind);    // 'bureau' or 'model'
+    const role = e.role || null;           // 'writer' / 'critic' / ... or null
     const failed = e.kind?.type === 'tool_result' && e.kind?.ok === false;
     const div = document.createElement('div');
-    div.className = 'entry ' + cls + ' role-' + role + (failed ? ' failed' : '');
-    let header = cls;
-    let okBadge = '';
-    if (e.kind?.type === 'tool_call') header += ` · ${e.kind.tool}`;
+    div.className = 'entry ' + cls + ' speaker-' + speaker + (failed ? ' failed' : '');
+    // Header: [speaker] [role] · entry-kind · tool-name? · ✓/✗?
+    let header = `<span class="speaker ${speaker}">${speaker}</span>`;
+    if (role) header += ` <span class="role">${role}</span>`;
+    header += ` <span class="muted">${kindLabel(e.kind)}</span>`;
+    if (e.kind?.type === 'tool_call' || e.kind?.type === 'tool_result') {
+      header += ` <code class="tool-name">${escapeHtml(e.kind.tool)}</code>`;
+    }
     if (e.kind?.type === 'tool_result') {
-      header += ` · ${e.kind.tool}`;
-      okBadge = e.kind.ok ? '✓' : '✗';
+      header += e.kind.ok
+        ? ' <span class="status ok">ok</span>'
+        : ' <span class="status failed">failed</span>';
+    }
+    if (e.kind?.type === 'tool_definitions') {
+      const n = (e.kind.tools || []).length;
+      header += ` <span class="muted">(${n} tool${n === 1 ? '' : 's'})</span>`;
     }
     let body = '';
+    let bodyHtml = '';
     if (e.kind?.type === 'tool_call') body = formatJsonish(e.content);
     else if (e.kind?.type === 'tool_result') {
       if (!e.kind.ok && e.kind.error) body = e.kind.error;
       else if (e.kind.output) body = formatJsonish(e.kind.output);
+    } else if (e.kind?.type === 'tool_definitions') {
+      bodyHtml = (e.kind.tools || []).map(td => `
+        <div class="tool-def">
+          <div class="tool-name">${escapeHtml(td.name)}</div>
+          <div class="tool-desc">${escapeHtml(td.description)}</div>
+        </div>`).join('');
     } else if (typeof e.content === 'string') body = e.content;
     const key = selectedTaskId + '-' + i;
-    const isCollapsed = collapsed[key] === undefined ? (cls === 'system') : collapsed[key];
+    const isCollapsed = collapsed[key] === undefined
+      ? (cls === 'system' || cls === 'tool_definitions')
+      : collapsed[key];
     div.className += isCollapsed ? ' collapsed' : '';
+    const inner = bodyHtml
+      ? `<div class="defs">${bodyHtml}</div>`
+      : (body ? `<pre>${escapeHtml(body)}</pre>` : '');
     div.innerHTML = `
       <div class="h" data-entry-key="${key}">
-        <span><span class="role-badge ${role}">${role}</span>${header} ${okBadge}</span>
+        <span>${header}</span>
         <span>${e.timestamp.replace('T',' ').replace('Z','')}</span>
       </div>
-      ${body ? `<pre>${escapeHtml(body)}</pre>` : ''}`;
+      ${inner}`;
     div.querySelector('.h').onclick = () => {
       collapsed[key] = !isCollapsed;
       renderTranscript();
@@ -314,12 +564,23 @@ async function refreshIssues() {
   issues = await api('/api/issues') || [];
   const el = document.getElementById('issues-list');
   el.innerHTML = '';
+  // Order: permanent (red) first, then retrying (amber), then resolved
+  // (faded/struck-through). Within each group, newest first.
+  const order = { permanent: 0, retrying: 1, resolved: 2 };
+  issues.sort((a, b) =>
+    (order[a.status] ?? 3) - (order[b.status] ?? 3)
+    || b.timestamp.localeCompare(a.timestamp)
+  );
   for (const it of issues) {
     const div = document.createElement('div');
-    div.className = 'issue';
+    div.className = 'issue ' + (it.status || 'permanent');
     div.innerHTML = `
-      <div><span class="badge ${it.stage}">${it.stage}</span> <strong>${escapeHtml(it.node_name)}</strong>
-           ${it.tool ? `<span class="muted">${it.tool}</span>` : ''}</div>
+      <div>
+        <span class="status ${it.status}">${it.status || 'permanent'}</span>
+        <span class="phase">${it.stage}</span>
+        <strong>${escapeHtml(it.node_name)}</strong>
+        ${it.tool ? `<span class="muted">${escapeHtml(it.tool)}</span>` : ''}
+      </div>
       <div class="imsg">${escapeHtml(it.message)}</div>`;
     div.onclick = () => {
       selectedTaskId = it.task_id;
@@ -331,8 +592,14 @@ async function refreshIssues() {
     };
     el.appendChild(div);
   }
-  document.getElementById('issues-count').textContent = issues.length ? `(${issues.length})` : '';
-  document.getElementById('status-issues').textContent = issues.length ? `Issues: ${issues.length}` : '';
+  // Count visible (= unresolved) issues for the panel/status counters;
+  // resolved issues are noise.
+  const open = issues.filter(it => it.status !== 'resolved').length;
+  const total = issues.length;
+  document.getElementById('issues-count').textContent =
+    total ? `(${open} open${total > open ? `, ${total - open} resolved` : ''})` : '';
+  document.getElementById('status-issues').textContent =
+    open ? `Issues: ${open}` : '';
 }
 
 async function openFile(path) {
@@ -355,8 +622,9 @@ function applyEvent(ev) {
       state.tasks[ev.task.id] = ev.task;
       break;
     case 'transcript_appended':
+      // role lives on the entry now, not the event.
       const t = state.tasks?.[ev.task_id];
-      if (t) { t.transcript = t.transcript || []; ev.entry.role = ev.role; t.transcript.push(ev.entry); }
+      if (t) { t.transcript = t.transcript || []; t.transcript.push(ev.entry); }
       break;
     case 'task_cost':
       const tc = state.tasks?.[ev.task_id];
@@ -389,7 +657,7 @@ function connectSse() {
   es.onerror = () => { setTimeout(connectSse, 2000); es.close(); };
 }
 
-load(); connectSse();
+initSections(); initSplitters(); load(); connectSse();
 setInterval(refreshFiles, 4000);
 setInterval(refreshGit, 5000);
 setInterval(refreshIssues, 4000);

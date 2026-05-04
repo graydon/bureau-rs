@@ -118,25 +118,35 @@ pub fn import_path(graph: &NodeGraph, from: NodeId, to: NodeId) -> String {
 /// thread of "why we're decomposing this way" is visible), siblings'
 /// specs (for consistency with parallel decompositions), the current graph
 /// overview (for decompose reuse), and the node's existing spec if any.
-pub fn build_for_spec(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
+pub fn build_for_spec(
+    graph: &NodeGraph,
+    node_id: NodeId,
+    max_nodes: usize,
+    max_node_depth: usize,
+) -> ContextBundle {
     let mut bundle = ContextBundle::new();
     let Some(node) = graph.get(node_id) else {
         return bundle;
     };
+    let depth = graph.ancestors(node_id, true).len().saturating_sub(1);
     bundle.push(
         "Node",
         format!(
-            "**name**: `{}`\n**module path**: `{}`\n**description**: {}\n",
+            "**name**: `{}`\n**module path**: `{}`\n**depth**: {} (cap {})\n**description**: {}\n",
             node.name,
             module_path(graph, node_id),
+            depth,
+            max_node_depth,
             node.description
         ),
     );
+    bundle.push(
+        "Decomposition budget",
+        decomposition_budget_text(graph.len(), max_nodes, depth, max_node_depth),
+    );
     push_ancestor_specs(&mut bundle, graph, node_id);
     push_sibling_specs(&mut bundle, graph, node_id);
-    if let Some(own) = &node.spec_md {
-        bundle.push("Existing spec for this node", own.clone());
-    }
+    push_own_spec(&mut bundle, node, "Existing spec for this node");
     bundle.push("Existing graph", render_graph_overview(graph));
     bundle
 }
@@ -149,9 +159,7 @@ pub fn build_for_iface(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
         return bundle;
     };
     bundle.push("Node", node_header(graph, node));
-    if let Some(spec) = &node.spec_md {
-        bundle.push("Spec for this node", spec.clone());
-    }
+    push_own_spec(&mut bundle, node, "Spec for this node");
     push_ancestor_specs(&mut bundle, graph, node_id);
     push_parent_iface(&mut bundle, graph, node_id);
     push_dep_ifaces(&mut bundle, graph, node);
@@ -167,9 +175,7 @@ pub fn build_for_tests(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
         return bundle;
     };
     bundle.push("Node", node_header(graph, node));
-    if let Some(spec) = &node.spec_md {
-        bundle.push("Spec for this node", spec.clone());
-    }
+    push_own_spec(&mut bundle, node, "Spec for this node");
     if let Some(public_rs) = &node.public_rs {
         bundle.push(
             "Public interface to test (this node's `public.rs`)",
@@ -189,9 +195,7 @@ pub fn build_for_impl(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
         return bundle;
     };
     bundle.push("Node", node_header(graph, node));
-    if let Some(spec) = &node.spec_md {
-        bundle.push("Spec for this node", spec.clone());
-    }
+    push_own_spec(&mut bundle, node, "Spec for this node");
     if let Some(public_rs) = &node.public_rs {
         bundle.push(
             "Public interface (this node's `public.rs`)",
@@ -214,6 +218,80 @@ pub fn build_for_impl(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
     bundle
 }
 
+/// Render the spec stage's "Decomposition budget" section. The tone
+/// escalates as the cap fills — the model needs to feel the pressure to
+/// stop splitting EARLY, not just when it tries to push past the wall.
+fn decomposition_budget_text(
+    used: usize,
+    max_nodes: usize,
+    depth: usize,
+    max_node_depth: usize,
+) -> String {
+    let remaining = max_nodes.saturating_sub(used);
+    let pct = if max_nodes == 0 { 100 } else { (used * 100) / max_nodes };
+    let depth_remaining = max_node_depth.saturating_sub(depth);
+
+    // Posture statement: ranges from "ample room" through "treat this as a
+    // leaf" to "decompose is forbidden right now". The model reads this
+    // BEFORE deciding whether to call `decompose`.
+    let posture = if remaining == 0 {
+        "**HARD STOP — the node-count cap is fully exhausted. \
+         You MUST NOT call `decompose`. Write this node as a leaf: author \
+         its public spec describing what it does, optionally a private spec \
+         with implementation notes, and end your turn. If `decompose` is \
+         called anyway it will fail; do not retry it.**"
+            .to_string()
+    } else if depth_remaining == 0 {
+        "**HARD STOP — children of this node would exceed the depth cap. \
+         You MUST NOT call `decompose` here. Treat this node as a leaf: \
+         author its public/private spec and end your turn.**"
+            .to_string()
+    } else if pct >= 85 {
+        format!(
+            "**Cap nearly exhausted ({remaining} slot(s) left). The default \
+             is now: SKIP `decompose` and write this node as a leaf. Only \
+             decompose if this node truly has multiple separate \
+             sub-responsibilities AND each fits in remaining capacity. If \
+             you do decompose, name AT MOST {remaining} children in one call.**"
+        )
+    } else if pct >= 65 {
+        format!(
+            "**Cap is approaching ({remaining} slot(s) left of {max_nodes}). \
+             Be conservative — most nodes from here should be leaves. Only \
+             decompose if the split is genuinely necessary, and budget the \
+             siblings that still need to be created.**"
+        )
+    } else {
+        format!(
+            "Cap usage at {pct}% ({used} / {max_nodes} used; {remaining} remaining). \
+             The default for any node is `leaf` (no `decompose` call). Only \
+             decompose if this node has multiple separate sub-responsibilities \
+             that genuinely cannot fit in one Rust file."
+        )
+    };
+
+    format!(
+        "Node-count: **{used} / {max_nodes} used** · **{remaining} remaining**.\n\
+         Depth: this node is at **{depth} / {max_node_depth}**; children would \
+         be at depth **{}**.\n\n\
+         {posture}\n",
+        depth + 1,
+    )
+}
+
+/// Push this node's OWN spec — both public and private parts. The writer
+/// is the audience for both: the public part is the contract they're
+/// honoring, the private part is their own implementation notes from
+/// earlier stages.
+fn push_own_spec(bundle: &mut ContextBundle, node: &Node, base_title: &str) {
+    if let Some(pub_md) = &node.spec_public_md {
+        bundle.push(format!("{base_title} (public)"), pub_md.clone());
+    }
+    if let Some(priv_md) = &node.spec_private_md {
+        bundle.push(format!("{base_title} (private notes)"), priv_md.clone());
+    }
+}
+
 /// Build the context for the **debug** stage: identical to `impl` plus the
 /// caller is responsible for appending the failing-test list / cargo errors.
 pub fn build_for_debug(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
@@ -231,10 +309,18 @@ pub fn build_for_debug(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
     bundle
 }
 
-/// Convenience entry point: pick the right builder by stage.
-pub fn build_for_stage(graph: &NodeGraph, node_id: NodeId, stage: Stage) -> ContextBundle {
+/// Convenience entry point: pick the right builder by stage. Spec needs
+/// the decomposition limits to render its budget section; other stages
+/// ignore them.
+pub fn build_for_stage(
+    graph: &NodeGraph,
+    node_id: NodeId,
+    stage: Stage,
+    max_nodes: usize,
+    max_node_depth: usize,
+) -> ContextBundle {
     match stage {
-        Stage::Spec => build_for_spec(graph, node_id),
+        Stage::Spec => build_for_spec(graph, node_id, max_nodes, max_node_depth),
         Stage::Iface => build_for_iface(graph, node_id),
         Stage::Tests => build_for_tests(graph, node_id),
         Stage::Impl => build_for_impl(graph, node_id),
@@ -254,30 +340,47 @@ fn node_header(graph: &NodeGraph, node: &Node) -> String {
     )
 }
 
-/// Insert ancestor specs from immediate parent up to root. Each ancestor
-/// gets its own section with the spec body.
+/// Insert ancestor context. The IMMEDIATE parent gets its full public
+/// spec inlined (since it's the abstraction this node fits into and the
+/// API it must respect). All farther ancestors collapse to a single
+/// brief list — name + one-line summary — so the prompt stays focused
+/// on context this node actually needs to act on. The private parts of
+/// ancestors' specs are NEVER included; that's implementation chatter
+/// for the ancestor's own writer.
 fn push_ancestor_specs(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
     let ancestors = graph.ancestors(node_id, false);
     if ancestors.is_empty() {
         return;
     }
-    // Render parent → root order so the closest context is first.
-    for anc_id in ancestors {
-        let Some(anc) = graph.get(anc_id) else {
-            continue;
-        };
-        let Some(spec) = &anc.spec_md else {
-            continue;
-        };
-        bundle.push(
-            format!("Ancestor spec: `{}`", anc.name),
-            spec.clone(),
-        );
+    // First: full public spec of the immediate parent (closest first).
+    let parent_id = ancestors[0];
+    if let Some(parent) = graph.get(parent_id) {
+        if let Some(pub_md) = &parent.spec_public_md {
+            bundle.push(
+                format!("Parent spec (public): `{}`", parent.name),
+                pub_md.clone(),
+            );
+        }
+    }
+    // Then: brief one-liner for each farther ancestor.
+    if ancestors.len() > 1 {
+        let mut s = String::new();
+        for anc_id in &ancestors[1..] {
+            let Some(anc) = graph.get(*anc_id) else {
+                continue;
+            };
+            let summary = ancestor_summary(anc);
+            s.push_str(&format!("- **`{}`**: {}\n", anc.name, summary));
+        }
+        if !s.is_empty() {
+            bundle.push("Farther ancestors (brief)", s);
+        }
     }
 }
 
-/// Brief variant: only the headings of ancestor specs (saves tokens when
-/// the model doesn't need full design rationale).
+/// Brief variant: just one-liners for every ancestor (no full parent
+/// spec inlined). Used in stages where the model already has the full
+/// own-spec + own-iface and doesn't need parent context too.
 fn push_ancestor_specs_brief(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
     let ancestors = graph.ancestors(node_id, false);
     if ancestors.is_empty() {
@@ -288,13 +391,24 @@ fn push_ancestor_specs_brief(bundle: &mut ContextBundle, graph: &NodeGraph, node
         let Some(anc) = graph.get(anc_id) else {
             continue;
         };
-        let summary = match &anc.spec_md {
-            Some(spec) => first_paragraph(spec),
-            None => anc.description.clone(),
-        };
+        let summary = ancestor_summary(anc);
         s.push_str(&format!("- **`{}`**: {}\n", anc.name, summary));
     }
     bundle.push("Ancestor context (brief)", s);
+}
+
+/// One-line summary of a node for the brief-ancestor / sibling list.
+/// Prefers the first paragraph of the public spec (skipping leading
+/// markdown headings); falls back to the node's `description` field if
+/// the spec hasn't been authored yet.
+fn ancestor_summary(node: &Node) -> String {
+    match &node.spec_public_md {
+        Some(spec) => {
+            let p = first_paragraph(spec);
+            if p.is_empty() { node.description.clone() } else { p }
+        }
+        None => node.description.clone(),
+    }
 }
 
 fn push_sibling_specs(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
@@ -309,12 +423,7 @@ fn push_sibling_specs(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: No
         if sib.id == node_id {
             continue;
         }
-        let summary = sib
-            .spec_md
-            .as_ref()
-            .map(|md| first_paragraph(md))
-            .unwrap_or_else(|| sib.description.clone());
-        s.push_str(&format!("- **`{}`**: {}\n", sib.name, summary));
+        s.push_str(&format!("- **`{}`**: {}\n", sib.name, ancestor_summary(sib)));
     }
     if !s.is_empty() {
         bundle.push("Sibling specs (already decided)", s);
@@ -363,7 +472,7 @@ fn push_dep_ifaces(bundle: &mut ContextBundle, graph: &NodeGraph, node: &Node) {
         );
         let mut body = String::new();
         body.push_str(&format!("**description**: {}\n\n", dep.description));
-        if let Some(spec) = &dep.spec_md {
+        if let Some(spec) = &dep.spec_public_md {
             body.push_str("**spec excerpt**:\n");
             body.push_str(&first_paragraph(spec));
             body.push_str("\n\n");
@@ -442,7 +551,7 @@ mod tests {
     fn fresh() -> (NodeGraph, NodeId) {
         let mut g = NodeGraph::new();
         let mut root = Node::new("app", "the application root");
-        root.spec_md = Some("# App\n\nThe top-level application.\n".to_string());
+        root.spec_public_md = Some("# App\n\nThe top-level application.\n".to_string());
         let id = g.insert_root(root).unwrap();
         (g, id)
     }
@@ -450,11 +559,49 @@ mod tests {
     #[test]
     fn spec_context_includes_node_header_and_existing_graph() {
         let (g, root) = fresh();
-        let bundle = build_for_spec(&g, root);
+        let bundle = build_for_spec(&g, root, 64, 5);
         let md = bundle.to_markdown();
         assert!(md.contains("**name**: `app`"));
         assert!(md.contains("**module path**: `crate`"));
         assert!(md.contains("Existing graph"));
+    }
+
+    #[test]
+    fn spec_context_includes_decomposition_budget() {
+        let (g, root) = fresh();
+        let bundle = build_for_spec(&g, root, 32, 4);
+        let md = bundle.to_markdown();
+        assert!(md.contains("Decomposition budget"));
+        assert!(md.contains("32"), "should mention max_nodes: {md}");
+        assert!(md.contains("/ 4"), "should mention max_node_depth: {md}");
+    }
+
+    #[test]
+    fn decomposition_budget_escalates_tone_as_cap_fills() {
+        // Plenty of room: neutral language.
+        let s = decomposition_budget_text(/*used*/ 5, /*max*/ 100, 1, 5);
+        assert!(s.contains("Cap usage"), "neutral phrasing for low usage: {s}");
+        assert!(!s.contains("HARD STOP"));
+
+        // Approaching: lean against splitting.
+        let s = decomposition_budget_text(70, 100, 1, 5);
+        assert!(s.contains("approaching") || s.contains("Approaching") || s.contains("Cap is approaching"));
+        assert!(!s.contains("HARD STOP"));
+
+        // Nearly full: strong default-skip language.
+        let s = decomposition_budget_text(90, 100, 1, 5);
+        assert!(s.contains("nearly exhausted") || s.contains("nearly full"));
+        assert!(s.contains("SKIP"));
+
+        // At cap: HARD STOP, model must abandon.
+        let s = decomposition_budget_text(100, 100, 1, 5);
+        assert!(s.contains("HARD STOP"));
+        assert!(s.contains("MUST NOT"));
+
+        // At depth cap: also HARD STOP, even with node-count room.
+        let s = decomposition_budget_text(5, 100, 5, 5);
+        assert!(s.contains("HARD STOP"));
+        assert!(s.contains("depth"));
     }
 
     #[test]
@@ -478,7 +625,7 @@ mod tests {
         let root = g.insert_root(Node::new("app", "")).unwrap();
         let mut errs = Node::new("errors", "shared error types");
         errs.public_rs = Some("pub enum Err { NotFound, Bad }\n".into());
-        errs.spec_md = Some("# Errors\n\nShared error enum used everywhere.\n".into());
+        errs.spec_public_md = Some("# Errors\n\nShared error enum used everywhere.\n".into());
         let errs_id = g.add_child(root, errs).unwrap();
         let widget_id = g.add_child(root, Node::new("widget", "")).unwrap();
         g.add_dep(widget_id, errs_id).unwrap();
@@ -533,21 +680,42 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_specs_render_in_order() {
+    fn ancestor_context_inlines_parent_only_and_flattens_grandparents() {
         let mut g = NodeGraph::new();
         let mut root = Node::new("app", "");
-        root.spec_md = Some("# App\n\nThe whole thing.\n".into());
+        root.spec_public_md = Some(
+            "# App\n\n\
+             A short summary line.\n\n\
+             ## Big section grandchildren should not see\n\n\
+             Lots of details that would bloat a grandchild's prompt — \
+             paragraphs about the API surface, invariants, lifecycle, etc.\n"
+                .into(),
+        );
         let root_id = g.insert_root(root).unwrap();
         let mut frontend = Node::new("frontend", "");
-        frontend.spec_md = Some("# Frontend\n\nThe frontend layer.\n".into());
+        frontend.spec_public_md = Some("# Frontend\n\nThe frontend layer.\n".into());
         let f = g.add_child(root_id, frontend).unwrap();
         let r = g.add_child(f, Node::new("router", "")).unwrap();
         let bundle = build_for_iface(&g, r);
         let md = bundle.to_markdown();
-        let frontend_pos = md.find("Ancestor spec: `frontend`").unwrap();
-        let app_pos = md.find("Ancestor spec: `app`").unwrap();
-        // Closest first: frontend should appear before app.
-        assert!(frontend_pos < app_pos);
+        // Immediate parent (frontend) gets its full public spec.
+        assert!(
+            md.contains("Parent spec (public): `frontend`"),
+            "should inline parent's full public spec: {md}"
+        );
+        assert!(md.contains("The frontend layer."));
+        // Grandparent (app) collapses to a one-liner under "Farther ancestors".
+        assert!(
+            md.contains("Farther ancestors (brief)"),
+            "should have a brief section for grandparents: {md}"
+        );
+        assert!(md.contains("**`app`**"));
+        // The grandparent's secondary sections must NOT be inlined.
+        assert!(
+            !md.contains("Big section grandchildren should not see")
+                && !md.contains("Lots of details that would bloat"),
+            "grandparent's full spec should NOT be inlined: {md}"
+        );
     }
 
     #[test]
@@ -555,10 +723,10 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         let mut a = Node::new("a", "node A");
-        a.spec_md = Some("# A\n\nThe A subsystem.\n".into());
+        a.spec_public_md = Some("# A\n\nThe A subsystem.\n".into());
         g.add_child(root, a).unwrap();
         let b = g.add_child(root, Node::new("b", "node B")).unwrap();
-        let bundle = build_for_spec(&g, b);
+        let bundle = build_for_spec(&g, b, 64, 5);
         let md = bundle.to_markdown();
         assert!(md.contains("Sibling specs"));
         assert!(md.contains("**`a`**"));
@@ -676,7 +844,7 @@ mod tests {
     fn build_for_stage_dispatches_correctly() {
         let (g, root) = fresh();
         for stage in Stage::ALL {
-            let bundle = build_for_stage(&g, root, stage);
+            let bundle = build_for_stage(&g, root, stage, 64, 5);
             assert!(!bundle.sections.is_empty(), "stage {stage} produced empty bundle");
         }
     }

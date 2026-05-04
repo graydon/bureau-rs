@@ -186,6 +186,12 @@ struct Issue {
     message: String,
     args: Option<String>,
     entry_index: usize,
+    /// Lifecycle of this failure:
+    /// - `"resolved"`: a later same-tool call succeeded after this one.
+    /// - `"retrying"`: still unresolved, but the owning task is in
+    ///   progress so the engine may yet retry.
+    /// - `"permanent"`: still unresolved and the owning task has finished.
+    status: &'static str,
 }
 
 async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
@@ -193,11 +199,37 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
     s.state.read(|st| {
         for (tid, t) in st.tasks.iter() {
             let entries = &t.transcript;
+            // Pre-compute, per tool name, the index of the latest
+            // SUCCESSFUL result. A failure is "resolved" iff a later
+            // success exists for the same tool.
+            let mut latest_success: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (i, e) in entries.iter().enumerate() {
+                if let crate::tools::TranscriptKind::ToolResult {
+                    tool, ok: true, ..
+                } = &e.kind
+                {
+                    latest_success.insert(tool.clone(), i);
+                }
+            }
+            let task_in_progress = matches!(t.status, TaskStatus::Pending | TaskStatus::Running);
+
             for (i, e) in entries.iter().enumerate() {
                 match &e.kind {
                     crate::tools::TranscriptKind::ToolResult {
                         tool, ok: false, error, ..
                     } => {
+                        let resolved = latest_success
+                            .get(tool)
+                            .map(|s| *s > i)
+                            .unwrap_or(false);
+                        let status = if resolved {
+                            "resolved"
+                        } else if task_in_progress {
+                            "retrying"
+                        } else {
+                            "permanent"
+                        };
                         let args = entries[..i].iter().rev().find_map(|p| match &p.kind {
                             crate::tools::TranscriptKind::ToolCall { tool: t2 } if t2 == tool => {
                                 Some(p.content.clone())
@@ -215,9 +247,11 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
                             message: error.clone().unwrap_or_default(),
                             args,
                             entry_index: i,
+                            status,
                         });
                     }
                     crate::tools::TranscriptKind::Error => {
+                        let status = if task_in_progress { "retrying" } else { "permanent" };
                         out.push(Issue {
                             task_id: *tid,
                             node_id: t.node_id,
@@ -229,6 +263,7 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
                             message: e.content.clone(),
                             args: None,
                             entry_index: i,
+                            status,
                         });
                     }
                     _ => {}

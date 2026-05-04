@@ -79,9 +79,11 @@ pub struct JudgeVerdict {
 /// after the call returns.
 pub struct TaskCtx {
     pub task_id: Uuid,
-    /// The node and stage this task is advancing.
+    /// The node, stage, and cycle role this task is advancing. The role
+    /// is stamped onto every transcript entry the ctx records.
     pub node_id: NodeId,
     pub stage: Stage,
+    pub role: Role,
     /// Live shared graph (per-task tools mutate this directly via the
     /// orchestrator's lock; we go through the shared Arc to avoid copying
     /// the whole graph each call).
@@ -91,6 +93,11 @@ pub struct TaskCtx {
     pub layout: Layout,
     pub max_file_lines: usize,
     pub max_spec_section_lines: usize,
+    /// Hard cap on the total number of nodes the graph may hold. The
+    /// decompose tool refuses to exceed it.
+    pub max_nodes: usize,
+    /// Hard cap on the depth of the node tree (root is depth 0).
+    pub max_node_depth: usize,
     /// Loop detection — same args three times in a row triggers an error.
     pub recent_calls: Mutex<VecDeque<(String, u64)>>,
     /// Filled by `submit_verdict` (judge stage only).
@@ -109,6 +116,34 @@ pub struct TranscriptEntry {
     pub timestamp: DateTime<Utc>,
     pub kind: TranscriptKind,
     pub content: String,
+    /// The cycle role active when this entry was produced
+    /// (writer/critic/reviser/judge). Stored on the entry itself so it
+    /// survives serialization to disk / over `/api/state` — the UI can
+    /// no longer rely on a separate SSE-only channel.
+    #[serde(default)]
+    pub role: Option<Role>,
+}
+
+impl TranscriptEntry {
+    /// Who is "speaking" in this entry — the bureau (engine, framework,
+    /// tool result) or the model. Useful for transcript UI.
+    pub fn speaker(&self) -> Speaker {
+        match &self.kind {
+            TranscriptKind::AssistantText | TranscriptKind::ToolCall { .. } => Speaker::Model,
+            _ => Speaker::Bureau,
+        }
+    }
+}
+
+/// Which side of the actor/framework boundary an entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speaker {
+    /// The framework — system prompt, user prompt, tool definitions, tool
+    /// results, notes, errors.
+    Bureau,
+    /// The LLM — its assistant text and its tool calls.
+    Model,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +152,12 @@ pub enum TranscriptKind {
     System,
     UserPrompt,
     AssistantText,
+    /// Snapshot of the tool definitions sent to the model alongside the
+    /// system prompt. Recorded once per (stage, role) invocation so the UI
+    /// can show exactly what the model was told the tools do.
+    ToolDefinitions {
+        tools: Vec<ToolDefSnapshot>,
+    },
     ToolCall {
         tool: String,
     },
@@ -132,30 +173,49 @@ pub enum TranscriptKind {
     Error,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefSnapshot {
+    pub name: String,
+    pub description: String,
+}
+
 const LOOP_BREAK_THRESHOLD: usize = 3;
 const LOOP_WINDOW: usize = 8;
 
 impl TaskCtx {
+    pub fn prompt_limits(&self) -> PromptLimits {
+        PromptLimits {
+            max_file_lines: self.max_file_lines,
+            max_spec_section_lines: self.max_spec_section_lines,
+        }
+    }
+
     pub fn new(
         task_id: Uuid,
         node_id: NodeId,
         stage: Stage,
+        role: Role,
         graph: Arc<Mutex<NodeGraph>>,
         workdir: PathBuf,
         layout: Layout,
         max_file_lines: usize,
         max_spec_section_lines: usize,
+        max_nodes: usize,
+        max_node_depth: usize,
         cargo_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             task_id,
             node_id,
             stage,
+            role,
             graph,
             workdir,
             layout,
             max_file_lines,
             max_spec_section_lines,
+            max_nodes,
+            max_node_depth,
             recent_calls: Mutex::new(VecDeque::new()),
             verdict: Mutex::new(None),
             transcript: Mutex::new(Vec::new()),
@@ -176,6 +236,7 @@ impl TaskCtx {
                 tool: name.to_string(),
             },
             content: s.clone(),
+            role: Some(self.role),
         };
         self.transcript.lock().push(entry);
         let mut hasher = DefaultHasher::new();
@@ -216,6 +277,7 @@ impl TaskCtx {
                     output: serde_json::to_string(v).ok(),
                 },
                 content: String::new(),
+                role: Some(self.role),
             },
             Err(e) => TranscriptEntry {
                 timestamp: Utc::now(),
@@ -226,6 +288,7 @@ impl TaskCtx {
                     output: None,
                 },
                 content: String::new(),
+                role: Some(self.role),
             },
         };
         self.transcript.lock().push(entry);
@@ -253,22 +316,66 @@ impl TaskCtx {
 }
 
 // --------------------------------------------------------------------------
-// submit_spec
+// submit_spec  (one composite tool — the spec stage's whole submission)
 // --------------------------------------------------------------------------
+//
+// The spec stage doesn't iterate on cargo errors, so there's no value in
+// breaking the writer's output across multiple tool calls (each one would
+// be a separate API roundtrip shipping the full transcript). Instead the
+// writer makes ONE `submit_spec` call carrying the whole submission:
+// public spec content, optional private notes, optional children to
+// create, optional dep edges to add. The schema dynamically hides the
+// `children` field when the decomposition cap is exhausted, which gives
+// the same enforcement-by-absence as filtering tools out of the catalog.
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SubmitSpecArgs {
-    pub content: String,
+    /// Public spec markdown — REQUIRED. What dependents and downstream
+    /// stages see.
+    pub public: String,
+    /// Private spec markdown — OPTIONAL. Implementation notes / design
+    /// rationale only this node's later writers will see.
+    #[serde(default)]
+    pub private: Option<String>,
+    /// New child nodes to create under THIS node. Omit (or empty) for
+    /// a leaf. The schema hides this field entirely when the framework
+    /// has no room for more children.
+    #[serde(default)]
+    pub children: Vec<ChildDecl>,
+    /// Existing node names that THIS node should depend on. Adds dep
+    /// edges from the current node; does not create nodes.
+    #[serde(default)]
+    pub deps: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
 pub struct SubmitSpecOk {
-    pub bytes: u64,
-    pub lines: usize,
+    pub public_bytes: u64,
+    pub public_lines: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+    pub children_created: Vec<NodeIdRef>,
+    pub deps_added: Vec<NodeIdRef>,
 }
 
 pub struct SubmitSpecTool {
     pub ctx: Arc<TaskCtx>,
+}
+
+impl SubmitSpecTool {
+    /// Whether this stage may decompose right now. False once the graph
+    /// has hit the node-count cap or this node is at the depth cap.
+    fn decomposition_allowed(&self) -> bool {
+        let g = self.ctx.graph.lock();
+        if g.len() >= self.ctx.max_nodes {
+            return false;
+        }
+        let depth = g.ancestors(self.ctx.node_id, true).len().saturating_sub(1);
+        if depth + 1 > self.ctx.max_node_depth {
+            return false;
+        }
+        true
+    }
 }
 
 impl Tool for SubmitSpecTool {
@@ -278,17 +385,72 @@ impl Tool for SubmitSpecTool {
     type Output = SubmitSpecOk;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Build the schema with `children` only when decomposition is
+        // allowed. Model can't add children it can't see in the schema.
+        let mut props = serde_json::Map::new();
+        props.insert("public".into(), json!({
+            "type": "string",
+            "description": format!(
+                "Public spec markdown — REQUIRED. Cap {} lines. Audience: \
+                 dependents and downstream stages.",
+                self.ctx.max_spec_section_lines
+            ),
+        }));
+        props.insert("private".into(), json!({
+            "type": "string",
+            "description": format!(
+                "Private spec markdown — OPTIONAL. Cap {} lines. Audience: \
+                 only this node's own iface/impl writers. Implementation \
+                 notes, design rationale, alternatives considered.",
+                self.ctx.max_spec_section_lines
+            ),
+        }));
+        if self.decomposition_allowed() {
+            props.insert("children".into(), json!({
+                "type": "array",
+                "description": "OPTIONAL. New child nodes to create under THIS \
+                                node. Omit or [] for a leaf. Most nodes are leaves.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "snake_case Rust ident"},
+                        "description": {"type": "string"},
+                        "deps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Names this child depends on (existing nodes or earlier siblings in this call)."
+                        },
+                        "crate_boundary": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "true ONLY at major subsystem boundaries that need their own Cargo crate. Default false."
+                        }
+                    },
+                    "required": ["name", "description"]
+                }
+            }));
+        }
+        props.insert("deps".into(), json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "OPTIONAL. Names of existing graph nodes that THIS node should depend on."
+        }));
+        // Description: switch the children-related blurb based on whether
+        // the schema even includes the field. Don't tell the model about
+        // a knob it doesn't have.
+        let limits = self.ctx.prompt_limits();
+        let description = if self.decomposition_allowed() {
+            tool_description(Self::NAME, limits)
+        } else {
+            submit_spec_description_leaf_only(limits)
+        };
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Author the markdown spec for this node. The framework persists it as \
-                 spec/<node-path>/spec.md. Only available in the spec stage. Replaces any \
-                 prior content."
-                    .into(),
+            description,
             parameters: json!({
                 "type": "object",
-                "properties": {"content": {"type": "string"}},
-                "required": ["content"]
+                "properties": props,
+                "required": ["public"]
             }),
         }
     }
@@ -297,29 +459,236 @@ impl Tool for SubmitSpecTool {
         if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
             return self.ctx.finish(Self::NAME, Err::<SubmitSpecOk, _>(e));
         }
-        let r: Result<SubmitSpecOk, ToolFailure> = (|| {
-            self.ctx.require_stage(Self::NAME, &[Stage::Spec])?;
-            let lines = args.content.lines().count();
-            if lines > self.ctx.max_spec_section_lines {
-                return Err(ToolFailure::FileTooLarge(
-                    lines,
-                    self.ctx.max_spec_section_lines,
-                ));
-            }
-            let bytes = args.content.len() as u64;
-            {
-                let mut g = self.ctx.graph.lock();
-                let n = g.get_mut(self.ctx.node_id).ok_or_else(|| {
-                    ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-                })?;
-                n.spec_md = Some(args.content);
-                n.updated_at = Utc::now();
-            }
-            self.ctx.render_after_write()?;
-            Ok(SubmitSpecOk { bytes, lines })
-        })();
+        let r = submit_spec_apply(&self.ctx, args);
         self.ctx.finish(Self::NAME, r)
     }
+}
+
+/// `submit_spec` description used when the decomposition cap is exhausted
+/// — the schema for this turn does NOT include `children`, so the prose
+/// shouldn't mention it as an option either. The model is told plainly
+/// that this node will be a leaf.
+fn submit_spec_description_leaf_only(limits: PromptLimits) -> String {
+    let max_spec = limits.max_spec_section_lines;
+    let max_file = limits.max_file_lines;
+    format!(
+        "Submit THIS node's spec — the spec stage's whole writer output in ONE call. \
+        The decomposition cap is exhausted for this turn (either the node-count cap \
+        or the depth cap), so this node MUST be a LEAF — no children. The schema \
+        accordingly does not offer a `children` field.\n\
+        \n\
+        Fields:\n\
+        - `public` (REQUIRED, ≤{max_spec} lines) — markdown describing what this \
+          node DOES, exposes, and guarantees. Audience: dependents and downstream \
+          stages. Suggested sections: `## Goal`, `## API`, `## Invariants`, \
+          `## Out of scope`.\n\
+        - `private` (optional, ≤{max_spec} lines) — implementation notes / \
+          rationale for this node's own future iface/impl writers. Skip if there's \
+          nothing worth recording.\n\
+        - `deps` (optional) — names of existing graph nodes that THIS node should \
+          depend on. Cycle-checked at submit time.\n\
+        \n\
+        (Per-file cap for code is {max_file} lines — describe an API the iface \
+        stage can fit in that.)"
+    )
+}
+
+/// Apply the composite `submit_spec` submission. Validates fully before
+/// mutating so a failure mid-way doesn't leave the graph half-changed.
+fn submit_spec_apply(
+    ctx: &Arc<TaskCtx>,
+    args: SubmitSpecArgs,
+) -> Result<SubmitSpecOk, ToolFailure> {
+    ctx.require_stage(SubmitSpecTool::NAME, &[Stage::Spec])?;
+
+    // ---- 1. Validate sizes (public required, private optional) ----
+    let public_lines = args.public.lines().count();
+    if public_lines > ctx.max_spec_section_lines {
+        return Err(ToolFailure::FileTooLarge(
+            public_lines,
+            ctx.max_spec_section_lines,
+        ));
+    }
+    if args.public.trim().is_empty() {
+        return Err(ToolFailure::Subtask(
+            "submit_spec: `public` must be non-empty markdown describing what \
+             this node does".into(),
+        ));
+    }
+    let priv_lines = args.private.as_deref().map(|s| s.lines().count());
+    if let Some(pl) = priv_lines {
+        if pl > ctx.max_spec_section_lines {
+            return Err(ToolFailure::FileTooLarge(pl, ctx.max_spec_section_lines));
+        }
+    }
+
+    let mut g = ctx.graph.lock();
+    let parent_id = ctx.node_id;
+    let parent_name = g
+        .get(parent_id)
+        .map(|n| n.name.clone())
+        .unwrap_or_default();
+
+    // ---- 2. Validate decomposition cap (only matters if children present) ----
+    let cur_nodes = g.len();
+    let new_count = args.children.len();
+    let remaining = ctx.max_nodes.saturating_sub(cur_nodes);
+    if new_count > remaining {
+        let msg = if remaining == 0 {
+            format!(
+                "ABANDON CHILDREN — DO NOT RETRY with children. The node-count \
+                 cap ({}) is fully exhausted; this graph cannot accept ANY new \
+                 children. Resubmit `submit_spec` WITHOUT the `children` field, \
+                 keeping `public` and the rest. Treat this node as a leaf.",
+                ctx.max_nodes
+            )
+        } else {
+            format!(
+                "submit_spec rejected — you asked for {new_count} children but \
+                 only {remaining} slot(s) remain (cap {}). Either resubmit with \
+                 AT MOST {remaining} children (drop the less-essential ones), \
+                 OR resubmit without `children` and treat this node as a leaf.",
+                ctx.max_nodes
+            )
+        };
+        return Err(ToolFailure::Subtask(msg));
+    }
+    let parent_depth = g.ancestors(parent_id, true).len().saturating_sub(1);
+    let child_depth = parent_depth + 1;
+    if !args.children.is_empty() && child_depth > ctx.max_node_depth {
+        return Err(ToolFailure::Subtask(format!(
+            "ABANDON CHILDREN — DO NOT RETRY with children. Children of this \
+             node would land at depth {child_depth}, past the depth cap of {}. \
+             Resubmit `submit_spec` WITHOUT `children` — this node must be a \
+             leaf.",
+            ctx.max_node_depth
+        )));
+    }
+
+    // ---- 3. Validate `deps` (current-node-to-existing edges) ----
+    let mut deps_resolved: Vec<NodeId> = Vec::new();
+    for name in &args.deps {
+        if name == &parent_name {
+            return Err(ToolFailure::Subtask(format!(
+                "deps: '{name}' is THIS node — a node cannot depend on itself"
+            )));
+        }
+        let id = g.find_by_name(name).map(|n| n.id).ok_or_else(|| {
+            ToolFailure::Subtask(format!("deps: no existing node named '{name}'"))
+        })?;
+        deps_resolved.push(id);
+    }
+
+    // ---- 4. Validate children + classify their per-child deps ----
+    #[derive(Clone)]
+    enum DepRef {
+        Existing(NodeId),
+        Sibling(String),
+    }
+    let new_names: HashSet<&str> = args.children.iter().map(|c| c.name.as_str()).collect();
+    if new_names.len() != args.children.len() {
+        return Err(ToolFailure::Subtask(
+            "duplicate child names in this submit_spec call".into(),
+        ));
+    }
+    let mut planned: Vec<(ChildDecl, Vec<DepRef>)> = Vec::new();
+    let mut created_so_far: HashSet<String> = HashSet::new();
+    for child in &args.children {
+        if !is_valid_ident(&child.name) {
+            return Err(ToolFailure::Subtask(format!(
+                "child name '{}' is not a valid Rust identifier",
+                child.name
+            )));
+        }
+        let mut deps: Vec<DepRef> = Vec::new();
+        for dep_name in &child.deps {
+            if dep_name == &child.name {
+                return Err(ToolFailure::Subtask(format!(
+                    "child '{name}' lists itself in its own `deps` — that's a \
+                     self-loop. To declare an edge FROM the current parent node \
+                     TO this child or any other existing node, use the top-level \
+                     `deps` field of submit_spec instead.",
+                    name = child.name
+                )));
+            }
+            if created_so_far.contains(dep_name) {
+                deps.push(DepRef::Sibling(dep_name.clone()));
+            } else if new_names.contains(dep_name.as_str()) {
+                return Err(ToolFailure::Subtask(format!(
+                    "child '{}' references later sibling '{}'; reorder so the \
+                     dep comes first",
+                    child.name, dep_name
+                )));
+            } else {
+                let id = g.find_by_name(dep_name).map(|n| n.id).ok_or_else(|| {
+                    ToolFailure::Subtask(format!(
+                        "child '{}': no existing node named '{}'",
+                        child.name, dep_name
+                    ))
+                })?;
+                deps.push(DepRef::Existing(id));
+            }
+        }
+        planned.push((child.clone(), deps));
+        created_so_far.insert(child.name.clone());
+    }
+
+    // ---- 5. Apply (validation passed; mutate) ----
+    let public_bytes = args.public.len() as u64;
+    let private_bytes = args.private.as_ref().map(|p| p.len() as u64);
+    {
+        let n = g.get_mut(parent_id).ok_or_else(|| {
+            ToolFailure::Other(format!("node {} missing", parent_id))
+        })?;
+        n.spec_public_md = Some(args.public);
+        if let Some(p) = args.private {
+            n.spec_private_md = Some(p);
+        }
+        n.updated_at = Utc::now();
+    }
+    let mut deps_added = Vec::new();
+    for to in deps_resolved {
+        g.add_dep(parent_id, to)?;
+        let n = g.get(to).unwrap();
+        deps_added.push(NodeIdRef {
+            id: n.id.to_string(),
+            name: n.name.clone(),
+        });
+    }
+    let mut name_to_id: std::collections::HashMap<String, NodeId> =
+        std::collections::HashMap::new();
+    let mut children_created = Vec::new();
+    for (child, dep_refs) in planned {
+        let mut node = Node::new(&child.name, &child.description);
+        node.crate_boundary = child.crate_boundary;
+        let new_id = g.add_child(parent_id, node)?;
+        name_to_id.insert(child.name.clone(), new_id);
+        for dep_ref in dep_refs {
+            let dep_id = match dep_ref {
+                DepRef::Existing(id) => id,
+                DepRef::Sibling(name) => *name_to_id.get(&name).ok_or_else(|| {
+                    ToolFailure::Subtask(format!(
+                        "internal: sibling '{name}' should have been created already"
+                    ))
+                })?,
+            };
+            g.add_dep(new_id, dep_id)?;
+        }
+        children_created.push(NodeIdRef {
+            id: new_id.to_string(),
+            name: child.name,
+        });
+    }
+
+    drop(g);
+    ctx.render_after_write()?;
+    Ok(SubmitSpecOk {
+        public_bytes,
+        public_lines,
+        private_bytes,
+        children_created,
+        deps_added,
+    })
 }
 
 // --------------------------------------------------------------------------
@@ -353,13 +722,7 @@ impl Tool for SubmitPublicTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Author the public surface (`public.rs`) for this node. Allowed: `pub trait` \
-                 declarations (signatures only — no default bodies), `pub struct/enum/type` \
-                 declarations, `pub const/static`, `use super::private::...` imports, doc \
-                 comments. Forbidden: `impl` blocks, free functions, inline `mod`, \
-                 `pub use crate::*` cross-node re-exports. Available only in the iface stage."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
@@ -419,13 +782,7 @@ impl Tool for SubmitPrivateTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Author the private internals (`private.rs`) for this node. Anything is \
-                 allowed that compiles, except: `use crate::<X>::...` paths must reference \
-                 a declared dep / ancestor / own child / self of this node. The framework \
-                 catches this at submit time before invoking cargo. Available in iface \
-                 (initial scaffold), impl, and debug stages."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
@@ -495,12 +852,7 @@ impl Tool for SubmitTestsTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Author the tests (`tests.rs`) for this node. Lives inside `#[cfg(test)]` so \
-                 its imports are unrestricted relative to private — but `use crate::<X>::...` \
-                 paths must still reference declared deps / ancestors. Available in tests \
-                 (initial author) and debug stages."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {"content": {"type": "string"}},
@@ -553,14 +905,15 @@ impl Tool for SubmitTestsTool {
 }
 
 // --------------------------------------------------------------------------
-// decompose
+// Shared types used by submit_spec's child-creation field.
 // --------------------------------------------------------------------------
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ChildDecl {
     pub name: String,
     pub description: String,
-    /// References to existing node names that this child will depend on.
+    /// References to existing node names (or earlier siblings in the same
+    /// `submit_spec` call) that this child will depend on.
     #[serde(default)]
     pub deps: Vec<String>,
     /// If true, this child is a separate Cargo crate (workspace mode only).
@@ -568,198 +921,10 @@ pub struct ChildDecl {
     pub crate_boundary: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct DecomposeArgs {
-    /// New child nodes to create under the current node.
-    #[serde(default)]
-    pub children: Vec<ChildDecl>,
-    /// Add dep edges from the current node to these existing nodes.
-    #[serde(default)]
-    pub add_self_deps: Vec<String>,
-}
-
-#[derive(Serialize, Debug)]
-pub struct DecomposeOk {
-    pub created: Vec<NodeIdRef>,
-    pub self_deps_added: Vec<NodeIdRef>,
-}
-
 #[derive(Serialize, Debug, Clone)]
 pub struct NodeIdRef {
     pub id: String,
     pub name: String,
-}
-
-pub struct DecomposeTool {
-    pub ctx: Arc<TaskCtx>,
-}
-
-impl Tool for DecomposeTool {
-    const NAME: &'static str = "decompose";
-    type Error = ToolFailure;
-    type Args = DecomposeArgs;
-    type Output = DecomposeOk;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Decompose this node into children and/or declare dep edges to existing \
-                 nodes. Each child has a `name` (snake_case Rust ident), a `description`, \
-                 and an optional `deps` list referencing existing nodes by name. Use \
-                 `add_self_deps` to add edges from the CURRENT node to existing nodes \
-                 without creating children. Cycle-checked. Available only in the spec \
-                 stage."
-                    .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "children": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "description": {"type": "string"},
-                                "deps": {"type": "array", "items": {"type": "string"}},
-                                "crate_boundary": {"type": "boolean"}
-                            },
-                            "required": ["name", "description"]
-                        }
-                    },
-                    "add_self_deps": {"type": "array", "items": {"type": "string"}}
-                }
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
-            return self.ctx.finish(Self::NAME, Err::<DecomposeOk, _>(e));
-        }
-        let r: Result<DecomposeOk, ToolFailure> = (|| {
-            self.ctx.require_stage(Self::NAME, &[Stage::Spec])?;
-            let mut g = self.ctx.graph.lock();
-            let parent_id = self.ctx.node_id;
-
-            // Plan first, mutate second — so any error in planning aborts
-            // before we touch the graph.
-            // Step 1a: resolve add_self_deps against the EXISTING graph.
-            let self_deps_resolved: Vec<NodeId> = args
-                .add_self_deps
-                .iter()
-                .map(|name| {
-                    g.find_by_name(name).map(|n| n.id).ok_or_else(|| {
-                        ToolFailure::Subtask(format!(
-                            "add_self_deps: no existing node named '{name}'"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Step 1b: validate children + classify each child-dep as either
-            // an existing-graph reference (resolved now) or a forward
-            // reference to a yet-to-be-created sibling (resolved at apply
-            // time). Names of children to be created can only be referenced
-            // by LATER siblings in the same call (no forward refs).
-            #[derive(Clone)]
-            enum DepRef {
-                Existing(NodeId),
-                Sibling(String),
-            }
-            let new_names: HashSet<&str> =
-                args.children.iter().map(|c| c.name.as_str()).collect();
-            if new_names.len() != args.children.len() {
-                return Err(ToolFailure::Subtask(
-                    "duplicate child names in this decompose call".into(),
-                ));
-            }
-            let mut planned: Vec<(ChildDecl, Vec<DepRef>)> = Vec::new();
-            let mut created_so_far: HashSet<String> = HashSet::new();
-            for child in &args.children {
-                if !is_valid_ident(&child.name) {
-                    return Err(ToolFailure::Subtask(format!(
-                        "child name '{}' is not a valid Rust identifier",
-                        child.name
-                    )));
-                }
-                let mut deps: Vec<DepRef> = Vec::new();
-                for dep_name in &child.deps {
-                    if dep_name == &child.name {
-                        return Err(ToolFailure::Subtask(format!(
-                            "child '{}' cannot depend on itself",
-                            child.name
-                        )));
-                    }
-                    if created_so_far.contains(dep_name) {
-                        // Earlier sibling in this same call.
-                        deps.push(DepRef::Sibling(dep_name.clone()));
-                    } else if new_names.contains(dep_name.as_str()) {
-                        // Sibling that comes LATER in this call — forward
-                        // reference, which the apply order can't satisfy.
-                        return Err(ToolFailure::Subtask(format!(
-                            "child '{}' references later sibling '{}'; reorder so the dep comes first",
-                            child.name, dep_name
-                        )));
-                    } else {
-                        // Must already exist in the graph.
-                        let id = g.find_by_name(dep_name).map(|n| n.id).ok_or_else(|| {
-                            ToolFailure::Subtask(format!(
-                                "child '{}': no existing node named '{}'",
-                                child.name, dep_name
-                            ))
-                        })?;
-                        deps.push(DepRef::Existing(id));
-                    }
-                }
-                planned.push((child.clone(), deps));
-                created_so_far.insert(child.name.clone());
-            }
-
-            // Step 2: apply.
-            let mut self_deps_added = Vec::new();
-            for to in self_deps_resolved {
-                g.add_dep(parent_id, to)?;
-                let n = g.get(to).unwrap();
-                self_deps_added.push(NodeIdRef {
-                    id: n.id.to_string(),
-                    name: n.name.clone(),
-                });
-            }
-            let mut name_to_id: std::collections::HashMap<String, NodeId> =
-                std::collections::HashMap::new();
-            let mut created = Vec::new();
-            for (child, dep_refs) in planned {
-                let mut node = Node::new(&child.name, &child.description);
-                node.crate_boundary = child.crate_boundary;
-                let new_id = g.add_child(parent_id, node)?;
-                name_to_id.insert(child.name.clone(), new_id);
-                for dep_ref in dep_refs {
-                    let dep_id = match dep_ref {
-                        DepRef::Existing(id) => id,
-                        DepRef::Sibling(name) => *name_to_id.get(&name).ok_or_else(|| {
-                            ToolFailure::Subtask(format!(
-                                "internal: sibling '{name}' should have been created already"
-                            ))
-                        })?,
-                    };
-                    g.add_dep(new_id, dep_id)?;
-                }
-                created.push(NodeIdRef {
-                    id: new_id.to_string(),
-                    name: child.name,
-                });
-            }
-
-            drop(g);
-            self.ctx.render_after_write()?;
-            Ok(DecomposeOk {
-                created,
-                self_deps_added,
-            })
-        })();
-        self.ctx.finish(Self::NAME, r)
-    }
 }
 
 fn is_valid_ident(s: &str) -> bool {
@@ -803,10 +968,7 @@ impl Tool for SubmitVerdictTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Record judge verdict. Pass satisfactory=true if the reviser addressed the \
-                 critique; satisfactory=false with a concrete reason otherwise."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -972,10 +1134,7 @@ impl Tool for CargoCheckTool {
     async fn definition(&self, _: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Run `cargo check` and get structured diagnostics. Use mid-task to verify what \
-                 you wrote compiles. Capped at 8 errors + 2KB stderr."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {"package": {"type": "string"}}
@@ -1005,10 +1164,7 @@ impl Tool for CargoTestTool {
     async fn definition(&self, _: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Run `cargo test --no-fail-fast`. Returns compile errors AND runtime test \
-                 failures. `test_filter` / `test_filters` narrow to substring-matched tests."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1048,10 +1204,7 @@ impl Tool for CargoTestNoRunTool {
     async fn definition(&self, _: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Run `cargo test --no-run` to verify tests COMPILE without running them. \
-                 Useful in the tests stage where bodies are still stubs."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1091,9 +1244,7 @@ impl Tool for CargoClippyTool {
     async fn definition(&self, _: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description:
-                "Run `cargo clippy -- -D warnings` and get structured lint diagnostics."
-                    .into(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
                 "properties": {"package": {"type": "string"}}
@@ -1185,7 +1336,7 @@ fn collect_filters(args: &CargoTestArgs) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    Actor,
+    Writer,
     Critic,
     Reviser,
     Judge,
@@ -1194,7 +1345,7 @@ pub enum Role {
 impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
-            Role::Actor => "actor",
+            Role::Writer => "writer",
             Role::Critic => "critic",
             Role::Reviser => "reviser",
             Role::Judge => "judge",
@@ -1210,17 +1361,156 @@ impl std::fmt::Display for Role {
 
 /// Tool name catalog for a given (stage, role). Used by the engine to
 /// register the right tools and by the UI to render "tools available".
+/// Knobs the prompt builder needs from `Limits` (just the line caps, so
+/// callers don't need to plumb the whole struct around).
+#[derive(Debug, Clone, Copy)]
+pub struct PromptLimits {
+    pub max_file_lines: usize,
+    pub max_spec_section_lines: usize,
+}
+
+/// Description string sent to the model for each tool. Single source of
+/// truth — every `Tool::definition()` impl pulls from here, and
+/// `tool_definitions_for` exposes the same strings to the engine for
+/// transcript recording. Limits are interpolated from the runtime config
+/// so the model is told the actual hard caps, not a guess.
+pub fn tool_description(name: &str, limits: PromptLimits) -> String {
+    let max_file = limits.max_file_lines;
+    let max_spec = limits.max_spec_section_lines;
+    match name {
+        "submit_spec" => format!(
+            "Submit THIS node's spec — the spec stage's whole writer output in ONE call. \
+            Required: `public`. Optional: `private`, `children`, `deps`. Call once per \
+            spec stage.\n\
+            \n\
+            The spec is a SPECIFICATION DOCUMENT describing the software, NOT a literate \
+            Rust file. Specs talk about data shapes, ownership, concurrency, error model, \
+            invariants, I/O surfaces — at the level of REQUIREMENTS and ARCHITECTURE. \
+            The iface stage is what writes Rust traits and signatures; do not preempt \
+            that here.\n\
+            \n\
+            Fields:\n\
+            - `public` (REQUIRED, ≤{max_spec} lines) — the INTERFACE specification: \
+              what dependents observe and rely on. Suggested headings: `## What it \
+              does`, `## Public surface`, `## Invariants and guarantees`, `## Out of \
+              scope`. Avoid the word `Goal` — describe behaviour, not aspiration. Only \
+              externally-observable concepts go here; internal types/backends/helpers \
+              go in `private`.\n\
+            - `private` (optional, ≤{max_spec} lines) — the IMPLEMENTATION \
+              specification: HOW the node is built internally — backends, internal \
+              data structures, concurrency, algorithmic notes, tradeoffs considered. \
+              Audience: this node's own future iface/impl writers. Other nodes never \
+              see this. NOT a changelog of your edits — describe the software's \
+              internals, not the document's history.\n\
+            - `children` (optional; schema only includes this field when the \
+              decomposition cap allows) — list of child nodes to create under THIS \
+              node. Most nodes should be LEAVES. Each child:\n\
+                · `name` — snake_case Rust ident (not CamelCase — that's a type).\n\
+                · `description` — one short sentence.\n\
+                · `deps` — names this child depends on (existing graph nodes or \
+                  earlier siblings in this same call).\n\
+                · `crate_boundary` (default false) — set true ONLY at major top-level \
+                  subsystem boundaries. Most children leave this false; they become \
+                  modules within the parent's crate.\n\
+            - `deps` (optional) — names of existing graph nodes that THIS node depends \
+              on. Cycle-checked at submit time at BOTH the node and crate level.\n\
+            \n\
+            (Per-file cap for code is {max_file} lines, for context.)"
+        ),
+
+        "submit_public" => format!(
+            "Author `public.rs` — the node's public API surface. \
+            ALLOWED items: `pub trait Foo {{ fn bar(...) -> ...; }}` (signatures only, \
+            NO method bodies, NO default impls); `pub struct/enum/type/const/static` \
+            declarations; `use super::private::ConcreteType` re-aliases; doc comments. \
+            FORBIDDEN: `mod` (the framework auto-generates the module scaffolding — do \
+            not write your own `mod` blocks); `impl` blocks of any kind; `fn` outside \
+            trait declarations; `extern crate`; macro invocations; `pub use crate::*` \
+            cross-node re-exports. Hard cap: {max_file} lines."
+        ),
+
+        "submit_private" => format!(
+            "Author `private.rs` — the node's hidden implementation. \
+            Module-path rules: \
+            - `use super::public::*;` to reference your OWN public types (NEVER \
+              `use crate::TypeName`). \
+            - `use crate::<dep_name>::...` for declared deps in single-crate mode; \
+              `use <dep_crate>::...` for cross-crate deps in workspace mode. The \
+              `import as` line in each Dependency context section is authoritative. \
+            - The first segment after `crate::` MUST resolve to a declared dep, an \
+              ancestor, an own child, or this node itself; otherwise the framework \
+              rejects the submission before invoking cargo. \
+            Hard cap: {max_file} lines."
+        ),
+
+        "submit_tests" => format!(
+            "Author `tests.rs` — `#[test]` functions exercising this node's public \
+            surface. Use `use super::public::*;` to import the surface (NOT \
+            `use crate::TypeName`). Same `use crate::<X>::...` rule as `submit_private`: \
+            X must be a declared dep / ancestor / own child. Hard cap: {max_file} lines."
+        ),
+
+        "submit_verdict" => "Record the judge's verdict. Pass `satisfactory: true` if the reviser \
+addressed every critic point (or there were no points), or \
+`satisfactory: false` with a concrete `reason` quoting the unaddressed \
+point(s). When in doubt: `satisfactory: true`. Call exactly once."
+            .to_string(),
+
+        "cargo_check" => "Run `cargo check` on the workspace and return structured diagnostics \
+(file:line + message). Use mid-task to verify what you wrote compiles \
+before finishing. Capped at ~8 errors + 2KB stderr per call. Optional \
+`package` narrows to a single crate."
+            .to_string(),
+
+        "cargo_test" => "Run `cargo test --no-fail-fast` and return compile errors plus runtime \
+test failures. `test_filter` / `test_filters` narrow to substring-matched \
+tests. Optional `package` narrows to a single crate. Cheap relative to \
+LLM tokens — use it freely."
+            .to_string(),
+
+        "cargo_test_no_run" => "Run `cargo test --no-run` to verify tests COMPILE without running \
+them. `test_filter` / `test_filters` narrow scope; optional `package` \
+narrows to one crate."
+            .to_string(),
+
+        "cargo_clippy" => "Run `cargo clippy` and return lint warnings. Optional `package` narrows \
+to one crate. Returns warnings up to a small cap."
+            .to_string(),
+
+        _ => "(no description registered)".to_string(),
+    }
+}
+
+/// (name, description) pairs for every tool registered for the given
+/// (stage, role). Used by the engine to record what the model was told
+/// the tools do, so the UI can show it.
+pub fn tool_definitions_for(
+    stage: Stage,
+    role: Role,
+    limits: PromptLimits,
+) -> Vec<ToolDefSnapshot> {
+    tool_names_for(stage, role)
+        .into_iter()
+        .map(|name| ToolDefSnapshot {
+            name: name.to_string(),
+            description: tool_description(name, limits),
+        })
+        .collect()
+}
+
 pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
     use Role::*;
     use Stage::*;
     match (stage, role) {
-        (Spec, Actor) | (Spec, Reviser) => {
-            vec![SubmitSpecTool::NAME, DecomposeTool::NAME]
+        (Spec, Writer) | (Spec, Reviser) => {
+            vec![
+                SubmitSpecTool::NAME,
+            ]
         }
         (Spec, Critic) => vec![],
         (Spec, Judge) => vec![SubmitVerdictTool::NAME],
 
-        (Iface, Actor) | (Iface, Reviser) => vec![
+        (Iface, Writer) | (Iface, Reviser) => vec![
             SubmitPublicTool::NAME,
             SubmitPrivateTool::NAME, // initial scaffold; impl stage will refine
             CargoCheckTool::NAME,
@@ -1228,7 +1518,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
         (Iface, Critic) => vec![CargoCheckTool::NAME],
         (Iface, Judge) => vec![CargoCheckTool::NAME, SubmitVerdictTool::NAME],
 
-        (Tests, Actor) | (Tests, Reviser) => vec![
+        (Tests, Writer) | (Tests, Reviser) => vec![
             SubmitTestsTool::NAME,
             CargoCheckTool::NAME,
             CargoTestNoRunTool::NAME,
@@ -1240,7 +1530,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             SubmitVerdictTool::NAME,
         ],
 
-        (Impl, Actor) | (Impl, Reviser) => vec![
+        (Impl, Writer) | (Impl, Reviser) => vec![
             SubmitPrivateTool::NAME,
             CargoCheckTool::NAME,
             CargoTestTool::NAME,
@@ -1253,7 +1543,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             SubmitVerdictTool::NAME,
         ],
 
-        (Debug, Actor) | (Debug, Reviser) => vec![
+        (Debug, Writer) | (Debug, Reviser) => vec![
             SubmitPrivateTool::NAME,
             SubmitTestsTool::NAME,
             CargoCheckTool::NAME,
@@ -1263,7 +1553,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
         (Debug, Critic) => vec![CargoCheckTool::NAME, CargoTestTool::NAME],
         (Debug, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
 
-        (Opt, Actor) | (Opt, Reviser) => vec![
+        (Opt, Writer) | (Opt, Reviser) => vec![
             SubmitPrivateTool::NAME,
             CargoTestTool::NAME,
             CargoClippyTool::NAME,
@@ -1292,33 +1582,59 @@ mod tests {
             Uuid::new_v4(),
             root,
             stage,
+            Role::Writer,
             graph.clone(),
             workdir,
             Layout::SingleCrate,
             300,
             500,
+            64,
+            5,
             Arc::new(tokio::sync::Mutex::new(())),
         ));
         (tmp, graph, root, ctx)
     }
 
     #[tokio::test]
-    async fn submit_spec_persists_to_node_and_disk() {
+    async fn submit_spec_public_persists_to_node_and_disk() {
         let (tmp, graph, root, ctx) = fixture(Stage::Spec);
         let tool = SubmitSpecTool { ctx };
         let r = tool
             .call(SubmitSpecArgs {
-                content: "# Spec\n\nDoes the thing.".into(),
+                public: "# Spec\n\nDoes the thing.".into(),
+                private: None,
+                children: vec![],
+                deps: vec![],
             })
             .await
             .unwrap();
-        assert!(r.lines >= 2);
+        assert!(r.public_lines >= 2);
         assert_eq!(
-            graph.lock().get(root).unwrap().spec_md.as_deref(),
+            graph.lock().get(root).unwrap().spec_public_md.as_deref(),
             Some("# Spec\n\nDoes the thing.")
         );
-        let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/spec.md")).unwrap();
+        let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/public.md")).unwrap();
         assert!(on_disk.contains("Does the thing"));
+    }
+
+    #[tokio::test]
+    async fn submit_spec_private_writes_to_separate_slot_and_file() {
+        let (tmp, graph, root, ctx) = fixture(Stage::Spec);
+        let tool = SubmitSpecTool { ctx };
+        tool.call(SubmitSpecArgs {
+            public: "# Spec\n\nDoes the thing.".into(),
+            private: Some("# Notes\n\nWhy I chose option B.".into()),
+            children: vec![],
+            deps: vec![],
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            graph.lock().get(root).unwrap().spec_private_md.as_deref(),
+            Some("# Notes\n\nWhy I chose option B.")
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/private.md")).unwrap();
+        assert!(on_disk.contains("option B"));
     }
 
     #[tokio::test]
@@ -1326,10 +1642,91 @@ mod tests {
         let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
         let tool = SubmitSpecTool { ctx };
         let err = tool
-            .call(SubmitSpecArgs { content: "x".into() })
+            .call(SubmitSpecArgs {
+                public: "x".into(),
+                private: None,
+                children: vec![],
+                deps: vec![],
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, ToolFailure::WrongStage { .. }));
+    }
+
+    #[tokio::test]
+    async fn submit_spec_creates_children_in_one_call() {
+        // The whole point of the composite tool: spec, private, children,
+        // deps all in ONE roundtrip.
+        let (_tmp, graph, _root, ctx) = fixture(Stage::Spec);
+        let tool = SubmitSpecTool { ctx };
+        let r = tool
+            .call(SubmitSpecArgs {
+                public: "# umbrella\n\ncoordinates two children".into(),
+                private: None,
+                children: vec![
+                    ChildDecl {
+                        name: "alpha".into(),
+                        description: "first".into(),
+                        deps: vec![],
+                        crate_boundary: false,
+                    },
+                    ChildDecl {
+                        name: "beta".into(),
+                        description: "second; depends on alpha".into(),
+                        deps: vec!["alpha".into()],
+                        crate_boundary: false,
+                    },
+                ],
+                deps: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.children_created.len(), 2);
+        let g = graph.lock();
+        assert_eq!(g.len(), 3); // root + alpha + beta
+        let beta = g.find_by_name("beta").unwrap();
+        let alpha = g.find_by_name("alpha").unwrap();
+        assert_eq!(beta.deps, vec![alpha.id]);
+    }
+
+    #[tokio::test]
+    async fn submit_spec_schema_hides_children_when_at_cap() {
+        // When the cap is exhausted, the schema must not contain the
+        // `children` field — the model literally can't ask for one.
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            root,
+            Stage::Spec,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300,
+            500,
+            1, // max_nodes — already at cap (1 root)
+            5,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let tool = SubmitSpecTool { ctx };
+        let def = tool.definition(String::new()).await;
+        let props = def
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(props.contains_key("public"), "public is required, must always appear");
+        assert!(props.contains_key("private"), "private is always optional");
+        assert!(props.contains_key("deps"), "deps doesn't add nodes, always allowed");
+        assert!(
+            !props.contains_key("children"),
+            "children must be HIDDEN at cap — got: {props:?}"
+        );
     }
 
     #[tokio::test]
@@ -1376,27 +1773,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decompose_creates_children_with_deps() {
+    async fn submit_spec_creates_children_with_deps() {
         let (_tmp, graph, root, ctx) = fixture(Stage::Spec);
         // Pre-existing utility node so a child can declare dep on it.
         graph
             .lock()
             .add_child(root, Node::new("util", "shared"))
             .unwrap();
-        let tool = DecomposeTool { ctx };
+        let tool = SubmitSpecTool { ctx };
         let r = tool
-            .call(DecomposeArgs {
+            .call(SubmitSpecArgs {
+                public: "# umbrella\n\nFrobs widgets via util".into(),
+                private: None,
                 children: vec![ChildDecl {
                     name: "frob".into(),
                     description: "frobs widgets".into(),
                     deps: vec!["util".into()],
                     crate_boundary: false,
                 }],
-                add_self_deps: vec![],
+                deps: vec![],
             })
             .await
             .unwrap();
-        assert_eq!(r.created.len(), 1);
+        assert_eq!(r.children_created.len(), 1);
         let g = graph.lock();
         let frob = g.find_by_name("frob").unwrap();
         assert_eq!(frob.deps.len(), 1);
@@ -1404,39 +1803,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decompose_unknown_dep_fails_atomically() {
+    async fn submit_spec_unknown_child_dep_fails_atomically() {
         let (_tmp, graph, _root, ctx) = fixture(Stage::Spec);
-        let tool = DecomposeTool { ctx };
+        let tool = SubmitSpecTool { ctx };
         let err = tool
-            .call(DecomposeArgs {
+            .call(SubmitSpecArgs {
+                public: "# x".into(),
+                private: None,
                 children: vec![ChildDecl {
                     name: "x".into(),
                     description: "".into(),
                     deps: vec!["nonexistent".into()],
                     crate_boundary: false,
                 }],
-                add_self_deps: vec![],
+                deps: vec![],
             })
             .await
             .unwrap_err();
         assert!(matches!(err, ToolFailure::Subtask(_)));
-        // Ensure no node was created.
+        // Atomic: no node created, public spec NOT written.
         assert_eq!(graph.lock().len(), 1);
+        assert_eq!(graph.lock().iter().next().unwrap().spec_public_md, None);
     }
 
     #[tokio::test]
-    async fn decompose_invalid_child_name_rejected() {
+    async fn submit_spec_invalid_child_name_rejected() {
         let (_tmp, _g, _root, ctx) = fixture(Stage::Spec);
-        let tool = DecomposeTool { ctx };
+        let tool = SubmitSpecTool { ctx };
         let err = tool
-            .call(DecomposeArgs {
+            .call(SubmitSpecArgs {
+                public: "# x".into(),
+                private: None,
                 children: vec![ChildDecl {
                     name: "1bad".into(),
                     description: "".into(),
                     deps: vec![],
                     crate_boundary: false,
                 }],
-                add_self_deps: vec![],
+                deps: vec![],
             })
             .await
             .unwrap_err();
@@ -1444,12 +1848,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decompose_two_children_can_dep_on_each_other_in_order() {
-        // child 'a' is created first; child 'b' (created after) can dep on 'a'.
-        let (_tmp, graph, _root, ctx) = fixture(Stage::Spec);
-        let tool = DecomposeTool { ctx };
+    async fn submit_spec_rejects_when_max_nodes_would_be_exceeded() {
+        // fixture() seeds 1 root node. Build a ctx with max_nodes=2: one
+        // child is OK, two children at once is rejected atomically.
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "the app")).unwrap();
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            root,
+            Stage::Spec,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300,
+            500,
+            2, // max_nodes — only one more child fits
+            5,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let tool = SubmitSpecTool { ctx };
         let r = tool
-            .call(DecomposeArgs {
+            .call(SubmitSpecArgs {
+                public: "# x".into(),
+                private: None,
                 children: vec![
                     ChildDecl {
                         name: "a".into(),
@@ -1460,18 +1886,62 @@ mod tests {
                     ChildDecl {
                         name: "b".into(),
                         description: "".into(),
-                        deps: vec!["a".into()],
+                        deps: vec![],
                         crate_boundary: false,
                     },
                 ],
-                add_self_deps: vec![],
+                deps: vec![],
             })
-            .await
-            .unwrap();
-        assert_eq!(r.created.len(), 2);
-        let g = graph.lock();
-        let b = g.find_by_name("b").unwrap();
-        assert_eq!(g.get(b.deps[0]).unwrap().name, "a");
+            .await;
+        let err = r.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ABANDON") || msg.contains("Either"), "got: {msg}");
+        assert!(msg.contains("cap"), "should mention the cap: {msg}");
+        assert_eq!(graph.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_spec_rejects_when_max_node_depth_would_be_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        let mid = g.add_child(root, Node::new("mid", "")).unwrap();
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            mid,
+            Stage::Spec,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300,
+            500,
+            64,
+            1, // max_node_depth
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let tool = SubmitSpecTool { ctx };
+        let r = tool
+            .call(SubmitSpecArgs {
+                public: "# mid".into(),
+                private: None,
+                children: vec![ChildDecl {
+                    name: "deep".into(),
+                    description: "".into(),
+                    deps: vec![],
+                    crate_boundary: false,
+                }],
+                deps: vec![],
+            })
+            .await;
+        let err = r.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ABANDON"), "should tell model to abandon: {msg}");
+        assert!(msg.contains("depth cap"), "should mention depth cap: {msg}");
+        assert_eq!(graph.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1513,15 +1983,149 @@ mod tests {
     #[test]
     fn tool_catalogs_per_stage_role() {
         // Spot-check
-        assert!(tool_names_for(Stage::Spec, Role::Actor).contains(&"submit_spec"));
-        assert!(tool_names_for(Stage::Spec, Role::Actor).contains(&"decompose"));
-        assert!(tool_names_for(Stage::Iface, Role::Actor).contains(&"submit_public"));
-        assert!(tool_names_for(Stage::Tests, Role::Actor).contains(&"submit_tests"));
-        assert!(tool_names_for(Stage::Impl, Role::Actor).contains(&"submit_private"));
+        assert!(tool_names_for(Stage::Spec, Role::Writer).contains(&"submit_spec"));
+        // The composite tool replaces the separate public/private/decompose
+        // trio — those names should NOT appear anywhere.
+        for stage in Stage::ALL {
+            for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge] {
+                let names = tool_names_for(stage, role);
+                assert!(!names.contains(&"submit_spec_public"));
+                assert!(!names.contains(&"submit_spec_private"));
+                assert!(!names.contains(&"decompose"));
+            }
+        }
+        assert!(tool_names_for(Stage::Iface, Role::Writer).contains(&"submit_public"));
+        assert!(tool_names_for(Stage::Tests, Role::Writer).contains(&"submit_tests"));
+        assert!(tool_names_for(Stage::Impl, Role::Writer).contains(&"submit_private"));
         assert!(tool_names_for(Stage::Impl, Role::Judge).contains(&"submit_verdict"));
         // Critic gets diagnostics in coding stages but no verdict tool.
         assert!(!tool_names_for(Stage::Impl, Role::Critic).contains(&"submit_verdict"));
         // Spec critic has no tools (it just reads the inlined context).
         assert!(tool_names_for(Stage::Spec, Role::Critic).is_empty());
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_real_description() {
+        let limits = PromptLimits {
+            max_file_lines: 300,
+            max_spec_section_lines: 400,
+        };
+        for stage in Stage::ALL {
+            for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge] {
+                for name in tool_names_for(stage, role) {
+                    let d = tool_description(name, limits);
+                    assert_ne!(
+                        d, "(no description registered)",
+                        "tool '{name}' has no description registered (stage={stage}, role={role:?})"
+                    );
+                    assert!(d.len() > 30, "tool '{name}' description is suspiciously short");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_descriptions_interpolate_limits_from_config() {
+        let limits = PromptLimits {
+            max_file_lines: 1234,
+            max_spec_section_lines: 5678,
+        };
+        let pub_d = tool_description("submit_public", limits);
+        assert!(pub_d.contains("1234"), "submit_public should mention max_file_lines: {pub_d}");
+        let spec_d = tool_description("submit_spec", limits);
+        assert!(spec_d.contains("5678"), "submit_spec should mention max_spec_section_lines: {spec_d}");
+        // cargo_check is size-independent — should not contain a stale hardcoded number.
+        let chk_d = tool_description("cargo_check", limits);
+        assert!(!chk_d.contains("1234") && !chk_d.contains("5678"));
+    }
+
+    #[test]
+    fn tool_definitions_for_returns_name_description_pairs() {
+        let limits = PromptLimits {
+            max_file_lines: 300,
+            max_spec_section_lines: 400,
+        };
+        let defs = tool_definitions_for(Stage::Iface, Role::Writer, limits);
+        assert!(!defs.is_empty());
+        let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"submit_public"));
+        assert!(names.contains(&"submit_private"));
+        let pub_def = defs.iter().find(|d| d.name == "submit_public").unwrap();
+        // The description should explicitly forbid `mod` so the model knows.
+        assert!(
+            pub_def.description.contains("FORBIDDEN") && pub_def.description.contains("mod"),
+            "submit_public description should explicitly forbid `mod`: {}",
+            pub_def.description
+        );
+    }
+
+    #[test]
+    fn tool_definitions_serialize_via_transcript_kind() {
+        // The whole point of the new variant: roundtrip through serde so the
+        // UI sees the tool list.
+        let kind = TranscriptKind::ToolDefinitions {
+            tools: vec![ToolDefSnapshot {
+                name: "submit_public".into(),
+                description: "...".into(),
+            }],
+        };
+        let s = serde_json::to_string(&kind).unwrap();
+        assert!(s.contains("\"type\":\"tool_definitions\""));
+        let _back: TranscriptKind = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn transcript_entry_role_round_trips_via_serde() {
+        // The "all entries look like ACTOR" UI bug was caused by role
+        // living only on the SSE event, not on the entry — so initial
+        // /api/state load lost it. Pin that role survives serialization.
+        let e = TranscriptEntry {
+            timestamp: Utc::now(),
+            kind: TranscriptKind::AssistantText,
+            content: "hi".into(),
+            role: Some(Role::Critic),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: TranscriptEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.role, Some(Role::Critic));
+        // Backward compat: an entry serialized without `role` deserializes
+        // with role = None (existing checkpoints don't lose data).
+        let legacy = r#"{"timestamp":"2026-05-04T00:00:00Z","kind":{"type":"system"},"content":"x"}"#;
+        let parsed: TranscriptEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.role, None);
+    }
+
+    #[test]
+    fn speaker_classifies_model_vs_bureau_correctly() {
+        let cases = [
+            (TranscriptKind::System, Speaker::Bureau),
+            (TranscriptKind::UserPrompt, Speaker::Bureau),
+            (
+                TranscriptKind::ToolDefinitions { tools: vec![] },
+                Speaker::Bureau,
+            ),
+            (
+                TranscriptKind::ToolResult {
+                    tool: "x".into(),
+                    ok: true,
+                    error: None,
+                    output: None,
+                },
+                Speaker::Bureau,
+            ),
+            (TranscriptKind::Note, Speaker::Bureau),
+            (TranscriptKind::Error, Speaker::Bureau),
+            (TranscriptKind::AssistantText, Speaker::Model),
+            (TranscriptKind::ToolCall { tool: "x".into() }, Speaker::Model),
+        ];
+        for (kind, expected) in cases {
+            let e = TranscriptEntry {
+                timestamp: Utc::now(),
+                kind,
+                content: String::new(),
+                role: None,
+            };
+            assert_eq!(e.speaker(), expected, "wrong speaker for {:?}", e.kind);
+        }
     }
 }

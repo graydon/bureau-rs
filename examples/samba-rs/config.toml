@@ -6,7 +6,7 @@
 # total cost on the order of tens of dollars depending on model choice —
 # the cost_cap_usd below is the safety rail, not a target.
 
-project_name = "samba-rs"
+project_name = "samba_rs"
 layout = "workspace"
 
 [models]
@@ -20,9 +20,9 @@ layout = "workspace"
 #   actor   = "anthropic/claude-opus-4.7"
 #   actor   = "openai/gpt-5"
 #   actor   = "google/gemini-2.5-pro"
-actor   = "anthropic/claude-sonnet-4.6"
-critic  = "anthropic/claude-sonnet-4.6"
-reviser = "anthropic/claude-sonnet-4.6"
+actor   = "openai/gpt-5-mini"
+critic  = "openai/gpt-5-mini"
+reviser = "openai/gpt-5-mini"
 judge   = "openai/gpt-5-mini"
 
 # Larger budget per turn — protocol crates have a lot of mechanical
@@ -40,12 +40,35 @@ max_spec_section_lines = 800
 # 4 parallel tasks: enough to overlap LLM latency across independent
 # nodes, not so many that the cargo lock thrashes. Bump to 8 if you've
 # got fast SSD + spare cores.
-max_parallel_tasks = 4
+max_parallel_tasks = 8
 
 # Protocol code occasionally needs more than two retries before the
 # cargo gate is happy — be slightly more generous than the default.
 max_stage_retries = 3
 critique_retries  = 2
+
+# How many times the framework will re-prompt a role to fix unresolved
+# failed tool calls before giving up. 0 = never auto-retry (failures
+# still surface to the next role's cycle context). Default 2 is fine for
+# most projects; a few extra retries are cheap insurance against a small
+# model fumbling tool args on the first try.
+tool_retry_budget = 3
+
+# Bytes of failed-tool-call args echoed back to the model in the focused
+# retry preamble. Default 60 is fine — the model has the spec / dep
+# ifaces in context and re-derives full content; only enough bytes to
+# identify the call are needed. Bump only if you want larger args
+# excerpts in the transcript.
+args_display_cap = 60
+
+# Hard caps on the decomposition graph. Without these the spec stage can
+# loop indefinitely — every child's spec stage decomposes into more
+# children, and you wake up with hundreds of nodes and no iface stage
+# ever runs. For a samba-scale project a tree of ~50 nodes ≤ 4 deep is
+# plenty: ~5 top-level subsystems × ~5 leaves each, with one extra
+# level for a handful of heavy subsystems.
+max_nodes = 60
+max_node_depth = 4
 
 # The graph is large: ~50 leaf crates × 6 stages × ≈3 LLM calls per
 # stage, plus retries. Budget generously; cost_cap_usd is the real
@@ -57,5 +80,5 @@ max_tasks_total = 8192
 cost_cap_usd = 50.0
 
 [provider]
-# api_key_env = "OPENROUTER_API_KEY"
-# base_url    = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+base_url    = "https://openrouter.ai/api/v1"

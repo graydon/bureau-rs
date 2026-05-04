@@ -163,7 +163,12 @@ pub struct Node {
     pub description: String,
 
     /// Authored content. `None` until the corresponding stage produces it.
-    pub spec_md: Option<String>,
+    /// The spec is split into a public part (read by dependents and
+    /// children — describes what the node does and exposes) and a
+    /// private part (the writer's own implementation notes / rationale,
+    /// not surfaced to other nodes).
+    pub spec_public_md: Option<String>,
+    pub spec_private_md: Option<String>,
     pub public_rs: Option<String>,
     pub private_rs: Option<String>,
     pub tests_rs: Option<String>,
@@ -184,7 +189,8 @@ impl Node {
             deps: Vec::new(),
             crate_boundary: false,
             description: description.into(),
-            spec_md: None,
+            spec_public_md: None,
+            spec_private_md: None,
             public_rs: None,
             private_rs: None,
             tests_rs: None,
@@ -289,7 +295,11 @@ impl NodeGraph {
         Ok(id)
     }
 
-    /// Add a dep edge `from → to`. Both must exist; cycles are rejected.
+    /// Add a dep edge `from → to`. Both must exist; cycles are rejected
+    /// at BOTH the node level and the crate level. (A workspace where
+    /// crate-A's nodes depend on crate-B's nodes and vice versa is a
+    /// cargo-rejected crate cycle, even if the underlying node-level
+    /// graph is acyclic — so we check both.)
     pub fn add_dep(&mut self, from: NodeId, to: NodeId) -> Result<(), GraphError> {
         if !self.nodes.contains_key(&from) {
             return Err(GraphError::NodeNotFound(from));
@@ -300,9 +310,19 @@ impl NodeGraph {
         if from == to {
             return Err(GraphError::SelfDep(from));
         }
-        // Cycle check: would adding from → to create a cycle? A cycle exists
-        // iff `to` already reaches `from` via existing dep edges.
+        // Node-level cycle check.
         if self.dep_reaches(to, from) {
+            return Err(GraphError::WouldCycle { from, to });
+        }
+        // Crate-level cycle check. If `from` and `to` are in different
+        // crates, adding from→to creates a crate-level edge
+        // crate(from)→crate(to). That's a cycle iff crate(to) already
+        // reaches crate(from) via existing crate-level edges.
+        let from_crate = self.containing_crate(from);
+        let to_crate = self.containing_crate(to);
+        if from_crate != to_crate
+            && self.crate_reaches(to_crate, from_crate, Some((from, to)))
+        {
             return Err(GraphError::WouldCycle { from, to });
         }
         let n = self.nodes.get_mut(&from).expect("checked");
@@ -311,6 +331,75 @@ impl NodeGraph {
             n.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    /// The nearest crate-boundary ancestor of `node`, inclusive of the
+    /// node itself. The root is always a crate boundary, so this always
+    /// returns Some when the graph has a root.
+    pub fn containing_crate(&self, node_id: NodeId) -> NodeId {
+        let mut cur = Some(node_id);
+        while let Some(id) = cur {
+            let n = match self.nodes.get(&id) {
+                Some(n) => n,
+                None => break,
+            };
+            if n.crate_boundary {
+                return id;
+            }
+            cur = n.parent;
+        }
+        // Fallback: the node itself, even though it didn't hit a
+        // boundary. Shouldn't happen on a well-formed graph (root is
+        // always a boundary).
+        node_id
+    }
+
+    /// Does `start_crate` reach `target_crate` in the crate-level dep
+    /// graph? `extra` optionally adds a hypothetical (from, to) dep edge
+    /// to the search — used by `add_dep` to test "would this proposed
+    /// edge create a cycle?".
+    fn crate_reaches(
+        &self,
+        start_crate: NodeId,
+        target_crate: NodeId,
+        extra: Option<(NodeId, NodeId)>,
+    ) -> bool {
+        if start_crate == target_crate {
+            return true;
+        }
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = vec![start_crate];
+        while let Some(c) = stack.pop() {
+            if !visited.insert(c) {
+                continue;
+            }
+            if c == target_crate {
+                return true;
+            }
+            // Collect crate-level edges out of `c`: for every node in c,
+            // every dep that points outside c is a crate-level edge.
+            for n in self.nodes.values() {
+                if self.containing_crate(n.id) != c {
+                    continue;
+                }
+                for d in &n.deps {
+                    let dc = self.containing_crate(*d);
+                    if dc != c {
+                        stack.push(dc);
+                    }
+                }
+            }
+            // Hypothetical extra edge.
+            if let Some((from, to)) = extra {
+                if self.containing_crate(from) == c {
+                    let to_c = self.containing_crate(to);
+                    if to_c != c {
+                        stack.push(to_c);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Does `start` reach `target` via dep edges (transitive closure)?
@@ -676,6 +765,50 @@ mod tests {
     }
 
     #[test]
+    fn add_dep_rejects_cross_crate_cycle() {
+        // Three sibling crates X, Y, Z. Children x1 ∈ X, y1 ∈ Y, z1 ∈ Z.
+        // Build x1→y1 and y1→z1 — fine. Now z1→x1 should be rejected:
+        // crate-level cycle X→Y→Z→X even though node-level deps are
+        // acyclic.
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(node("ws")).unwrap();
+        let mk_crate = |g: &mut NodeGraph, name: &str| {
+            let mut n = node(name);
+            n.crate_boundary = true;
+            g.add_child(root, n).unwrap()
+        };
+        let cx = mk_crate(&mut g, "X");
+        let cy = mk_crate(&mut g, "Y");
+        let cz = mk_crate(&mut g, "Z");
+        let x1 = g.add_child(cx, node("x1")).unwrap();
+        let y1 = g.add_child(cy, node("y1")).unwrap();
+        let z1 = g.add_child(cz, node("z1")).unwrap();
+        g.add_dep(x1, y1).unwrap(); // X → Y
+        g.add_dep(y1, z1).unwrap(); // Y → Z
+        // Z → X would close the cycle.
+        let err = g.add_dep(z1, x1).unwrap_err();
+        assert!(matches!(err, GraphError::WouldCycle { .. }));
+        // Verify the rejected edge wasn't applied.
+        assert!(!g.get(z1).unwrap().deps.contains(&x1));
+    }
+
+    #[test]
+    fn add_dep_allows_intra_crate_dep_that_would_be_cross_crate_cycle() {
+        // Within ONE crate, dep_reaches handles cycles already (existing
+        // test); adding a sibling dep where both nodes share a crate
+        // doesn't trigger the crate-level check.
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(node("ws")).unwrap();
+        let a = g.add_child(root, node("a")).unwrap();
+        let b = g.add_child(root, node("b")).unwrap();
+        // Both inside root's crate (root is the only crate boundary).
+        g.add_dep(a, b).unwrap();
+        // Cycle would be at node level, caught by dep_reaches.
+        let err = g.add_dep(b, a).unwrap_err();
+        assert!(matches!(err, GraphError::WouldCycle { .. }));
+    }
+
+    #[test]
     fn name_path_simple() {
         let mut g = NodeGraph::new();
         let root = g.insert_root(node("app")).unwrap();
@@ -788,11 +921,11 @@ mod tests {
         let a = g.add_child(root, node("a")).unwrap();
         let b = g.add_child(root, node("b")).unwrap();
         g.add_dep(a, b).unwrap();
-        g.get_mut(root).unwrap().spec_md = Some("# spec".to_string());
+        g.get_mut(root).unwrap().spec_public_md = Some("# spec".to_string());
         let json = serde_json::to_string(&g).unwrap();
         let g2: NodeGraph = serde_json::from_str(&json).unwrap();
         assert_eq!(g2.len(), 3);
-        assert_eq!(g2.get(root).unwrap().spec_md.as_deref(), Some("# spec"));
+        assert_eq!(g2.get(root).unwrap().spec_public_md.as_deref(), Some("# spec"));
         assert_eq!(g2.get(a).unwrap().deps, vec![b]);
     }
 }

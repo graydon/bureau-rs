@@ -6,7 +6,7 @@
 //! - `<workdir>/src/<path>/private.rs`  — hidden internals (model-authored)
 //! - `<workdir>/src/<path>/tests.rs`    — tests (model-authored)
 //! - `<workdir>/src/<path>/mod.rs`      — framework-rendered glue
-//! - `<workdir>/spec/<path>/spec.md`    — markdown spec (model-authored)
+//! - `<workdir>/spec/<path>/public.md`    — markdown spec (model-authored)
 //!
 //! For nodes marked `crate_boundary = true`, additionally:
 //!
@@ -255,14 +255,23 @@ fn render_node(
     let mod_content = render_mod_rs(graph, node);
     write_if_changed(&mod_path, &mod_content, report)?;
 
-    // Spec markdown lives under <workdir>/spec/<name-path>/spec.md.
+    // Spec markdown lives under <workdir>/spec/<name-path>/, split into
+    // public.md (audience: dependents and downstream stages) and
+    // private.md (audience: this node's own writer/reviser, for design
+    // notes and rationale).
     let spec_dir = workdir.join(node_spec_dir(graph, node));
-    let spec_path = spec_dir.join("spec.md");
-    let spec_content = node
-        .spec_md
-        .clone()
-        .unwrap_or_else(|| format!("# {}\n\n{}\n\n*spec not yet authored*\n", node.name, node.description));
-    write_if_changed(&spec_path, &spec_content, report)?;
+    let public_md_path = spec_dir.join("public.md");
+    let public_md_content = node.spec_public_md.clone().unwrap_or_else(|| {
+        format!(
+            "# {}\n\n{}\n\n*public spec not yet authored*\n",
+            node.name, node.description
+        )
+    });
+    write_if_changed(&public_md_path, &public_md_content, report)?;
+    if let Some(priv_md) = &node.spec_private_md {
+        let private_md_path = spec_dir.join("private.md");
+        write_if_changed(&private_md_path, priv_md, report)?;
+    }
 
     Ok(())
 }
@@ -434,9 +443,9 @@ mod tests {
         assert!(tmp.path().join("src/a/public.rs").exists());
         assert!(tmp.path().join("src/b/mod.rs").exists());
         // Specs in the parallel tree
-        assert!(tmp.path().join("spec/app/spec.md").exists());
-        assert!(tmp.path().join("spec/app/a/spec.md").exists());
-        assert!(tmp.path().join("spec/app/b/spec.md").exists());
+        assert!(tmp.path().join("spec/app/public.md").exists());
+        assert!(tmp.path().join("spec/app/a/public.md").exists());
+        assert!(tmp.path().join("spec/app/b/public.md").exists());
         assert!(!report.files_written.is_empty());
         // Root mod.rs lists children as pub mods
         let root_mod = std::fs::read_to_string(tmp.path().join("src/mod.rs")).unwrap();
@@ -509,12 +518,12 @@ mod tests {
         root.public_rs = Some("pub trait App {}\n".to_string());
         root.private_rs = Some("// nothing yet\n".to_string());
         root.tests_rs = Some("#[test] fn ok() {}\n".to_string());
-        root.spec_md = Some("# App spec\n\nThe app does things.\n".to_string());
+        root.spec_public_md = Some("# App spec\n\nThe app does things.\n".to_string());
         let _root_id = g.insert_root(root).unwrap();
         render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
         let pub_ = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
         assert!(pub_.contains("pub trait App"));
-        let spec = std::fs::read_to_string(tmp.path().join("spec/app/spec.md")).unwrap();
+        let spec = std::fs::read_to_string(tmp.path().join("spec/app/public.md")).unwrap();
         assert!(spec.contains("App spec"));
     }
 
@@ -546,7 +555,7 @@ mod tests {
         let _c = g.add_child(b, Node::new("c", "")).unwrap();
         render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
         assert!(tmp.path().join("src/a/b/c/mod.rs").exists());
-        assert!(tmp.path().join("spec/app/a/b/c/spec.md").exists());
+        assert!(tmp.path().join("spec/app/a/b/c/public.md").exists());
     }
 
     #[test]
@@ -618,7 +627,7 @@ mod tests {
             .path()
             .join("crates/server/src/handler/route/mod.rs")
             .exists());
-        assert!(tmp.path().join("spec/ws/server/handler/route/spec.md").exists());
+        assert!(tmp.path().join("spec/ws/server/handler/route/public.md").exists());
     }
 
     #[test]

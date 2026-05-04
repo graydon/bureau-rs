@@ -8,10 +8,10 @@
 //! use bureau_rs::mock_driver::{MockLlmDriver, ScriptedCall};
 //!
 //! let driver = MockLlmDriver::new();
-//! driver.script_for(Stage::Spec, Role::Actor, vec![
+//! driver.script_for(Stage::Spec, Role::Writer, vec![
 //!     ScriptedCall::submit_spec("# Spec\n\nThe app does X.\n"),
 //! ]);
-//! driver.script_for(Stage::Iface, Role::Actor, vec![
+//! driver.script_for(Stage::Iface, Role::Writer, vec![
 //!     ScriptedCall::submit_public("pub trait App {}\n"),
 //! ]);
 //! ```
@@ -27,8 +27,7 @@ use crate::engine::{DriveParams, DriveResponse, LlmDriver};
 use crate::graph::Stage;
 use crate::state::TokenUsage;
 use crate::tools::{
-    self, ChildDecl, DecomposeArgs, Role, SubmitRustArgs, SubmitSpecArgs, SubmitVerdictArgs,
-    TaskCtx,
+    self, ChildDecl, Role, SubmitRustArgs, SubmitSpecArgs, SubmitVerdictArgs, TaskCtx,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -39,17 +38,52 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum ScriptedCall {
-    SubmitSpec(String),
+    /// The composite spec-stage submission. Mirrors `SubmitSpecArgs`.
+    SubmitSpec {
+        public: String,
+        private: Option<String>,
+        children: Vec<ChildDecl>,
+        deps: Vec<String>,
+    },
     SubmitPublic(String),
     SubmitPrivate(String),
     SubmitTests(String),
-    Decompose(DecomposeArgs),
     SubmitVerdict { satisfactory: bool, reason: String },
 }
 
 impl ScriptedCall {
+    /// Convenience: a minimal public-only spec submission. Most tests
+    /// only care about the public spec slot.
     pub fn submit_spec(s: impl Into<String>) -> Self {
-        Self::SubmitSpec(s.into())
+        Self::SubmitSpec {
+            public: s.into(),
+            private: None,
+            children: vec![],
+            deps: vec![],
+        }
+    }
+    /// Submit a spec WITH children — replaces the old separate
+    /// `decompose` call. Tests that decomposed in two steps now combine
+    /// into one composite submission.
+    pub fn submit_spec_with_children(
+        public: impl Into<String>,
+        children: Vec<ChildDecl>,
+    ) -> Self {
+        Self::SubmitSpec {
+            public: public.into(),
+            private: None,
+            children,
+            deps: vec![],
+        }
+    }
+    /// Convenience for tests that previously called `ScriptedCall::decompose`
+    /// separately. Folded into a public-spec submission with the given
+    /// children. The public string is a generic placeholder.
+    pub fn decompose(children: Vec<ChildDecl>) -> Self {
+        Self::submit_spec_with_children(
+            "# umbrella\n\nDecomposed into the listed children.",
+            children,
+        )
     }
     pub fn submit_public(s: impl Into<String>) -> Self {
         Self::SubmitPublic(s.into())
@@ -59,12 +93,6 @@ impl ScriptedCall {
     }
     pub fn submit_tests(s: impl Into<String>) -> Self {
         Self::SubmitTests(s.into())
-    }
-    pub fn decompose(children: Vec<ChildDecl>) -> Self {
-        Self::Decompose(DecomposeArgs {
-            children,
-            add_self_deps: vec![],
-        })
     }
     pub fn verdict_ok() -> Self {
         Self::SubmitVerdict {
@@ -94,6 +122,9 @@ pub struct MockLlmDriver {
     /// reply. If the queue is empty, the driver returns an empty response
     /// (which for an actor stage is typically a failure).
     scripts: Mutex<HashMap<(Stage, Role), Vec<ScriptedReply>>>,
+    /// Every (stage, role, preamble) seen by `drive`, in order. Lets tests
+    /// assert on what the engine sent to the model.
+    pub received: Mutex<Vec<(Stage, Role, String)>>,
 }
 
 impl MockLlmDriver {
@@ -158,6 +189,9 @@ impl LlmDriver for MockLlmDriver {
         params: DriveParams,
         ctx: Arc<TaskCtx>,
     ) -> Result<DriveResponse> {
+        self.received
+            .lock()
+            .push((params.stage, params.role, params.preamble.clone()));
         let reply = {
             let mut scripts = self.scripts.lock();
             let queue = scripts.get_mut(&(params.stage, params.role));
@@ -166,8 +200,13 @@ impl LlmDriver for MockLlmDriver {
                 _ => ScriptedReply::default(),
             }
         };
+        // Mirror rig's production behavior: a tool error is RECORDED in
+        // the ctx transcript (each tool's `finish()` does that already)
+        // and reported back to the model in its next turn — it does NOT
+        // abort the agent loop. The engine relies on this to surface
+        // failed tool calls into the next critique-cycle role's prompt.
         for call in reply.calls {
-            invoke(&call, &ctx).await?;
+            let _ = invoke(&call, &ctx).await;
         }
         Ok(DriveResponse {
             output: reply.assistant_text,
@@ -179,11 +218,21 @@ impl LlmDriver for MockLlmDriver {
 async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
     use ScriptedCall::*;
     match call {
-        SubmitSpec(s) => {
+        SubmitSpec {
+            public,
+            private,
+            children,
+            deps,
+        } => {
             let tool = tools::SubmitSpecTool { ctx: ctx.clone() };
-            tool.call(SubmitSpecArgs { content: s.clone() })
-                .await
-                .map_err(|e| anyhow!("submit_spec: {e}"))?;
+            tool.call(SubmitSpecArgs {
+                public: public.clone(),
+                private: private.clone(),
+                children: children.clone(),
+                deps: deps.clone(),
+            })
+            .await
+            .map_err(|e| anyhow!("submit_spec: {e}"))?;
         }
         SubmitPublic(s) => {
             let tool = tools::SubmitPublicTool { ctx: ctx.clone() };
@@ -202,15 +251,6 @@ async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
             tool.call(SubmitRustArgs { content: s.clone() })
                 .await
                 .map_err(|e| anyhow!("submit_tests: {e}"))?;
-        }
-        Decompose(args) => {
-            let tool = tools::DecomposeTool { ctx: ctx.clone() };
-            tool.call(DecomposeArgs {
-                children: args.children.clone(),
-                add_self_deps: args.add_self_deps.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("decompose: {e}"))?;
         }
         SubmitVerdict {
             satisfactory,

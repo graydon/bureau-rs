@@ -11,7 +11,7 @@
 //! This module is responsible for:
 //!
 //! 1. Picking the next ready (node, stage) to advance.
-//! 2. Running that pair through the actor → critic → reviser → judge cycle.
+//! 2. Running that pair through the writer → critic → reviser → judge cycle.
 //! 3. Re-rendering the on-disk source tree after substantive writes.
 //! 4. Running cargo gates after iface / tests / impl stages.
 //! 5. Re-attempting on gate failure (within `max_stage_retries`).
@@ -26,7 +26,7 @@ use crate::state::{
     UiEvent,
 };
 use crate::tools::{
-    CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool, DecomposeTool,
+    CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool,
     JudgeVerdict, Role, SubmitPrivateTool, SubmitPublicTool, SubmitSpecTool, SubmitTestsTool,
     SubmitVerdictTool, TaskCtx, TranscriptEntry, TranscriptKind,
 };
@@ -289,14 +289,86 @@ impl Engine {
         if g.root.is_some() {
             return Ok(());
         }
-        let mut root = Node::new(
-            self.config.toml.project_name.as_str(),
-            "Project root.",
-        );
+        // Seed the root description from the first non-empty paragraph of
+        // problem.md so the model has an immediate anchor of what it's
+        // building. The full problem statement is also injected as a
+        // "Project mission" section into every prompt context — see
+        // `run_role`.
+        let desc = problem_first_paragraph(&self.config.problem);
+        let mut root = Node::new(self.config.toml.project_name.as_str(), desc);
         root.crate_boundary = true;
         let _ = g.insert_root(root)?;
-        // Initial render so the workdir exists with a buildable scaffold.
         render::render_graph(&self.workdir, &g, self.layout)?;
+        drop(g);
+        // Initialize the git repo + initial scaffold commit so subsequent
+        // stage commits have somewhere to land. If the repo already
+        // exists (resumed run), this is a no-op.
+        if let Err(e) = self.git_init_if_needed() {
+            tracing::warn!("git init: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Initialize the workdir as a git repo and make an initial commit
+    /// of the scaffolded files. No-op if the repo already exists.
+    fn git_init_if_needed(&self) -> Result<()> {
+        let dotgit = self.workdir.join(".git");
+        if dotgit.exists() {
+            return Ok(());
+        }
+        let repo = git2::Repository::init(&self.workdir)?;
+        // Configure a local user so commits work even if the global git
+        // config doesn't have one.
+        let mut cfg = repo.config()?;
+        if cfg.get_string("user.name").is_err() {
+            cfg.set_str("user.name", "bureau-rs")?;
+        }
+        if cfg.get_string("user.email").is_err() {
+            cfg.set_str("user.email", "bureau-rs@localhost")?;
+        }
+        // Stage everything currently rendered and make the seed commit.
+        let mut index = repo.index()?;
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+        let sig = repo.signature()?;
+        repo.commit(Some("HEAD"), &sig, &sig, "scaffold", &tree, &[])?;
+        Ok(())
+    }
+
+    /// Commit the workdir state after a stage completes. Each commit is
+    /// keyed by node + stage so the gitlog panel shows a per-stage trail
+    /// of progress. Non-fatal: if git fails (e.g. no .git dir, or
+    /// nothing to commit), we just log and move on.
+    fn commit_stage_done(
+        &self,
+        _node_id: NodeId,
+        stage: Stage,
+        node_name: &str,
+    ) -> Result<()> {
+        let repo = git2::Repository::open(&self.workdir)?;
+        let mut index = repo.index()?;
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+        // If the tree matches HEAD's tree, nothing changed — skip.
+        let parent = match repo.head().and_then(|h| h.peel_to_commit()) {
+            Ok(c) => Some(c),
+            Err(_) => None, // unborn HEAD — first commit
+        };
+        if let Some(p) = &parent {
+            if p.tree_id() == tree_id {
+                return Ok(()); // no changes to record
+            }
+        }
+        let sig = repo.signature().or_else(|_| {
+            git2::Signature::now("bureau-rs", "bureau-rs@localhost")
+        })?;
+        let msg = format!("{stage}: {node_name}");
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parents)?;
         Ok(())
     }
 
@@ -372,13 +444,22 @@ impl Engine {
         for attempt in 1..=(max_retries + 1) {
             match self.run_one_attempt(node_id, stage, attempt).await {
                 Ok(()) => {
-                    self.graph
-                        .lock()
-                        .get_mut(node_id)
-                        .unwrap()
-                        .stages
-                        .set(stage, StageState::Done);
+                    let node_name = {
+                        let mut g = self.graph.lock();
+                        let n = g.get_mut(node_id).unwrap();
+                        n.stages.set(stage, StageState::Done);
+                        n.name.clone()
+                    };
                     self.sync_graph_to_state();
+                    // Snapshot the workdir into git as a node-stage commit
+                    // so the gitlog panel shows progress one click at a
+                    // time. Commit failures are non-fatal — we just log
+                    // and continue.
+                    if let Err(e) = self.commit_stage_done(node_id, stage, &node_name) {
+                        tracing::warn!(
+                            "git commit for {node_name} {stage}: {e:#}"
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -458,11 +539,12 @@ impl Engine {
         self.state.emit(UiEvent::TaskCreated { task });
 
         // 1. Actor
-        let actor_text = self.run_role(task_id, node_id, stage, Role::Actor, None).await?;
+        let actor = self.run_role(task_id, node_id, stage, Role::Writer, None).await?;
 
         // 2. Critique cycle (optional)
         let critique_retries = self.config.toml.limits.critique_retries;
-        let mut last_text = actor_text;
+        let mut last_text = actor.text;
+        let mut last_failed = actor.failed_tools;
         for round in 1..=critique_retries {
             let critique = self
                 .run_role(
@@ -475,9 +557,11 @@ impl Engine {
                         prior_actor_text: Some(last_text.clone()),
                         prior_critique: None,
                         prior_revision: None,
+                        prior_failed_tools: last_failed.clone(),
                     }),
                 )
-                .await?;
+                .await?
+                .text;
             let revision = self
                 .run_role(
                     task_id,
@@ -489,12 +573,14 @@ impl Engine {
                         prior_actor_text: Some(last_text.clone()),
                         prior_critique: Some(critique.clone()),
                         prior_revision: None,
+                        prior_failed_tools: last_failed.clone(),
                     }),
                 )
                 .await?;
-            last_text = revision.clone();
+            last_text = revision.text.clone();
+            last_failed = revision.failed_tools.clone();
             // Judge
-            let _judge_text = self
+            let _judge = self
                 .run_role(
                     task_id,
                     node_id,
@@ -504,7 +590,8 @@ impl Engine {
                         round,
                         prior_actor_text: None,
                         prior_critique: Some(critique),
-                        prior_revision: Some(revision),
+                        prior_revision: Some(revision.text),
+                        prior_failed_tools: last_failed.clone(),
                     }),
                 )
                 .await?;
@@ -560,14 +647,15 @@ impl Engine {
         }
 
         // 4. Special-case: spec stage doesn't have a cargo gate, but we
-        // require that node.spec_md is populated (otherwise the actor
-        // didn't call submit_spec).
+        // require that node.spec_public_md is populated (otherwise the
+        // writer didn't call submit_spec_public). Private spec is
+        // optional.
         if stage == Stage::Spec {
             let g = self.graph.lock();
             let n = g.get(node_id).unwrap();
-            if n.spec_md.is_none() {
+            if n.spec_public_md.is_none() {
                 drop(g);
-                let msg = format!("node `{node_name}` spec stage produced no spec.md");
+                let msg = format!("node `{node_name}` spec stage produced no public.md");
                 self.state.write(|s| {
                     if let Some(t) = s.tasks.get_mut(&task_id) {
                         t.status = TaskStatus::Failed;
@@ -642,6 +730,37 @@ impl Engine {
         s
     }
 
+    /// Drive the LLM agent once, retrying internally on transient
+    /// errors (network blips, 5xx, rate-limit) with exponential backoff.
+    /// Non-transient errors propagate immediately.
+    async fn drive_with_transient_retry(
+        self: &Arc<Self>,
+        params: DriveParams,
+        ctx: Arc<TaskCtx>,
+    ) -> Result<DriveResponse> {
+        const MAX_TRANSIENT_RETRIES: u32 = 3;
+        let mut attempt = 0u32;
+        loop {
+            let r = self.driver.drive(params.clone(), ctx.clone()).await;
+            match r {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    if attempt < MAX_TRANSIENT_RETRIES && is_transient(&msg) {
+                        attempt += 1;
+                        let backoff = 400u64 * (1 << (attempt - 1).min(3));
+                        tracing::warn!(
+                            "transient agent error (attempt {attempt}), retrying in {backoff}ms: {msg}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     async fn run_role(
         self: &Arc<Self>,
         task_id: Uuid,
@@ -649,19 +768,52 @@ impl Engine {
         stage: Stage,
         role: Role,
         extras: Option<CycleExtras>,
-    ) -> Result<String> {
+    ) -> Result<RoleOutcome> {
         let model = self.config.toml.models.for_role(role).to_string();
 
-        // Build prompt context.
+        // Build prompt context. Always inject the project mission as the
+        // first section so every node — root or deep child — sees what
+        // the overall goal is. Without this the root node has no idea what
+        // it's building beyond its own name.
         let g_for_ctx = self.graph.lock().clone();
-        let mut bundle = node_context::build_for_stage(&g_for_ctx, node_id, stage);
+        let mut bundle = node_context::ContextBundle::new();
+        bundle.push("Project mission", self.config.problem.trim().to_string());
+        let inner = node_context::build_for_stage(
+            &g_for_ctx,
+            node_id,
+            stage,
+            self.config.toml.limits.max_nodes,
+            self.config.toml.limits.max_node_depth,
+        );
+        bundle.extend_from(inner);
         if let Some(ex) = &extras {
             // Annotate with the cycle extras: append a "Critique round"
             // section.
             let mut cyc = String::new();
             cyc.push_str(&format!("Round {}\n\n", ex.round));
+            if !ex.prior_failed_tools.is_empty() {
+                // Surface failed tool calls FIRST and prominently — these
+                // are the most important thing for the next role to act on,
+                // because they represent intent that didn't land.
+                cyc.push_str(
+                    "## ⚠ Prior turn had failed tool calls — these were NOT applied\n\n\
+                     The previous turn called these tools but they returned errors. \
+                     The intent behind each call was lost. Address every entry: read \
+                     the error, fix the args, and retry the call (or, if the goal \
+                     was actually wrong, explain in your own output why it should be \
+                     dropped).\n\n",
+                );
+                let args_cap = self.config.toml.limits.args_display_cap;
+                for (tool, args, err) in &ex.prior_failed_tools {
+                    let args_display = truncate_args_for_display(args, args_cap);
+                    cyc.push_str(&format!(
+                        "- **`{tool}`** — args: `{args_display}` — error: {err}\n"
+                    ));
+                }
+                cyc.push_str("\n");
+            }
             if let Some(t) = &ex.prior_actor_text {
-                cyc.push_str("## Prior actor summary\n\n");
+                cyc.push_str("## Prior writer summary\n\n");
                 cyc.push_str(t);
                 cyc.push_str("\n\n");
             }
@@ -679,21 +831,38 @@ impl Engine {
         }
         drop(g_for_ctx);
 
-        let preamble = role_preamble(stage, role);
+        let prompt_limits = crate::tools::PromptLimits {
+            max_file_lines: self.config.toml.limits.max_file_lines,
+            max_spec_section_lines: self.config.toml.limits.max_spec_section_lines,
+        };
+        let preamble = role_preamble(stage, role, prompt_limits);
         let context_doc = bundle.to_markdown();
         let user_prompt = role_user_prompt(stage, role);
         let combined_preamble = format!("{preamble}\n\n{context_doc}");
 
-        // Record system + user prompts.
+        // Record system + tool-definitions + user prompts. Tool defs are
+        // surfaced as a dedicated transcript entry so the UI can display
+        // exactly what the model was told the tools do — this is part of
+        // the input to every turn and is otherwise invisible.
         let now = Utc::now();
-        for (kind, content) in [
-            (TranscriptKind::System, combined_preamble.clone()),
-            (TranscriptKind::UserPrompt, user_prompt.clone()),
-        ] {
+        let tool_defs = crate::tools::tool_definitions_for(stage, role, prompt_limits);
+        let mut entries: Vec<(TranscriptKind, String)> = Vec::new();
+        entries.push((TranscriptKind::System, combined_preamble.clone()));
+        if !tool_defs.is_empty() {
+            entries.push((
+                TranscriptKind::ToolDefinitions {
+                    tools: tool_defs.clone(),
+                },
+                serde_json::to_string_pretty(&tool_defs).unwrap_or_default(),
+            ));
+        }
+        entries.push((TranscriptKind::UserPrompt, user_prompt.clone()));
+        for (kind, content) in entries {
             let entry = TranscriptEntry {
                 timestamp: now,
                 kind,
                 content,
+                role: Some(role),
             };
             self.state.write(|s| {
                 if let Some(t) = s.tasks.get_mut(&task_id) {
@@ -703,7 +872,6 @@ impl Engine {
             self.state.emit(UiEvent::TranscriptAppended {
                 task_id,
                 entry,
-                role,
             });
         }
 
@@ -712,16 +880,17 @@ impl Engine {
             task_id,
             node_id,
             stage,
+            role,
             self.graph.clone(),
             self.workdir.clone(),
             self.layout,
             self.config.toml.limits.max_file_lines,
             self.config.toml.limits.max_spec_section_lines,
+            self.config.toml.limits.max_nodes,
+            self.config.toml.limits.max_node_depth,
             self.cargo_lock.clone(),
         ));
 
-        const MAX_TRANSIENT_RETRIES: u32 = 3;
-        let mut transient_attempt = 0u32;
         let params = DriveParams {
             model: model.clone(),
             preamble: combined_preamble.clone(),
@@ -732,36 +901,116 @@ impl Engine {
             temperature: self.config.toml.models.temperature,
             max_turns: self.config.toml.models.max_turns,
         };
-        let resp = loop {
-            let r = self.driver.drive(params.clone(), ctx.clone()).await;
-            match r {
-                Ok(resp) => break resp,
-                Err(e) => {
-                    let msg = format!("{:#}", e);
-                    if transient_attempt < MAX_TRANSIENT_RETRIES && is_transient(&msg) {
-                        transient_attempt += 1;
-                        let backoff = 400u64 * (1 << (transient_attempt - 1).min(3));
-                        tracing::warn!(
-                            "transient agent error (attempt {transient_attempt}), retrying in {backoff}ms: {msg}"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        };
+        let resp = self.drive_with_transient_retry(params, ctx.clone()).await?;
 
-        let usage = resp.usage.clone();
+        // Aggregate usage and final-message text across the initial drive
+        // and any forced-retry drives we fire below for unresolved tool
+        // failures.
+        let mut total_usage = resp.usage.clone();
+        let mut combined_text = resp.output.clone();
+
+        // Force-retry loop: if the model left tool calls in a FAILED state
+        // and didn't fix them within its own agent loop, fire fresh
+        // `drive()` invocations with a focused retry preamble until either
+        // the failures clear or the budget is spent.
+        let max_forced_retries = self.config.toml.limits.tool_retry_budget;
+        for forced_attempt in 1..=max_forced_retries {
+            let snapshot = ctx.transcript.lock().clone();
+            let unresolved = collect_failed_tool_calls(&snapshot);
+            if unresolved.is_empty() {
+                break;
+            }
+            let remaining = max_forced_retries - forced_attempt;
+            let retry_preamble_text = retry_preamble(
+                role,
+                stage,
+                &unresolved,
+                forced_attempt,
+                remaining,
+                self.config.toml.limits.args_display_cap,
+            );
+            let retry_user_prompt = "Resolve the failed tool calls listed in the system prompt: \
+                 retry each with corrected args, or end your message with one sentence per \
+                 abandoned call explaining why it isn't needed."
+                .to_string();
+
+            self.note(format!(
+                "task {task_id} role {role:?}: forced retry {forced_attempt}/{max_forced_retries} for {} unresolved tool failure(s)",
+                unresolved.len()
+            ));
+
+            // Record the retry's system + user prompts as transcript entries
+            // so the UI shows what happened.
+            let retry_now = Utc::now();
+            for (kind, content) in [
+                (TranscriptKind::System, retry_preamble_text.clone()),
+                (TranscriptKind::UserPrompt, retry_user_prompt.clone()),
+            ] {
+                let entry = TranscriptEntry {
+                    timestamp: retry_now,
+                    kind,
+                    content,
+                    role: Some(role),
+                };
+                self.state.write(|s| {
+                    if let Some(t) = s.tasks.get_mut(&task_id) {
+                        t.transcript.push(entry.clone());
+                    }
+                });
+                self.state.emit(UiEvent::TranscriptAppended {
+                    task_id,
+                    entry,
+                });
+            }
+
+            let retry_params = DriveParams {
+                model: model.clone(),
+                preamble: retry_preamble_text,
+                user_prompt: retry_user_prompt,
+                stage,
+                role,
+                max_tokens: self.config.toml.models.max_tokens,
+                temperature: self.config.toml.models.temperature,
+                max_turns: self.config.toml.models.max_turns,
+            };
+            let retry_resp = self.drive_with_transient_retry(retry_params, ctx.clone()).await?;
+            total_usage.add(&retry_resp.usage);
+            combined_text.push_str(&format!(
+                "\n\n---\n[forced retry {forced_attempt}]\n{}",
+                retry_resp.output
+            ));
+        }
+
+        let resp = DriveResponse {
+            output: combined_text,
+            usage: total_usage.clone(),
+        };
+        let usage = total_usage;
 
         // Final assistant message.
         let final_entry = TranscriptEntry {
             timestamp: Utc::now(),
             kind: TranscriptKind::AssistantText,
             content: resp.output.clone(),
+            role: Some(role),
         };
         // Drain ctx transcripts.
         let ctx_entries = ctx.transcript.lock().drain(..).collect::<Vec<_>>();
+        // Surface failed tool calls from this turn — both as a
+        // higher-severity log entry (so the operator notices) and as a
+        // return value (so the cycle context tells the next role to
+        // retry them).
+        let failed_tools = collect_failed_tool_calls(&ctx_entries);
+        for (tool, args, err) in &failed_tools {
+            tracing::warn!(
+                node = %node_id,
+                stage = %stage,
+                role = ?role,
+                tool = %tool,
+                args = %args,
+                "tool call failed: {err}"
+            );
+        }
         // Drain verdict.
         let verdict = ctx.verdict.lock().take();
         // Drain fs events.
@@ -784,13 +1033,11 @@ impl Engine {
             self.state.emit(UiEvent::TranscriptAppended {
                 task_id,
                 entry,
-                role,
             });
         }
         self.state.emit(UiEvent::TranscriptAppended {
             task_id,
             entry: final_entry,
-            role,
         });
         for path in fs_events {
             self.state.emit(UiEvent::FileChanged { path });
@@ -806,8 +1053,22 @@ impl Engine {
         self.sync_graph_to_state();
         self.state.emit(UiEvent::NodeChanged { id: node_id });
 
-        Ok(resp.output)
+        Ok(RoleOutcome {
+            text: resp.output,
+            failed_tools,
+        })
     }
+}
+
+/// Output of a single role's turn within an writer → critic → reviser →
+/// judge cycle. The text is the model's final assistant message; the
+/// failed-tool list lets the next role's prompt context call out tool
+/// calls that errored so the model can retry rather than silently move
+/// on.
+#[derive(Debug, Clone, Default)]
+struct RoleOutcome {
+    text: String,
+    failed_tools: Vec<(String, String, String)>,
 }
 
 /// Returns true if the (node, stage) combination is ready to run right now.
@@ -929,6 +1190,114 @@ struct CycleExtras {
     prior_actor_text: Option<String>,
     prior_critique: Option<String>,
     prior_revision: Option<String>,
+    /// Tool calls that failed during the prior actor (or reviser) turn,
+    /// surfaced to the critic and the next reviser so they're not lost.
+    /// Each entry: (tool_name, args_json, error_msg).
+    prior_failed_tools: Vec<(String, String, String)>,
+}
+
+/// Scan a slice of transcript entries and return UNRESOLVED tool failures —
+/// for each tool name, only the LAST result is considered, so a model that
+/// failed once and then retried successfully reports nothing. Each tuple
+/// is `(tool, args, error)`. Args are paired by walking back to the most
+/// recent matching `ToolCall`.
+fn collect_failed_tool_calls(entries: &[TranscriptEntry]) -> Vec<(String, String, String)> {
+    use std::collections::HashMap;
+    // tool name → (transcript_index, ok, args, error)
+    let mut last: HashMap<String, (usize, bool, String, String)> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if let TranscriptKind::ToolResult { tool, ok, error, .. } = &e.kind {
+            let args = entries[..i]
+                .iter()
+                .rev()
+                .find_map(|p| match &p.kind {
+                    TranscriptKind::ToolCall { tool: t2 } if t2 == tool => Some(p.content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            last.insert(
+                tool.clone(),
+                (
+                    i,
+                    *ok,
+                    args,
+                    error.clone().unwrap_or_else(|| "(no error message)".into()),
+                ),
+            );
+        }
+    }
+    let mut failures: Vec<(usize, String, String, String)> = last
+        .into_iter()
+        .filter_map(|(tool, (idx, ok, args, err))| if ok { None } else { Some((idx, tool, args, err)) })
+        .collect();
+    failures.sort_by_key(|(idx, ..)| *idx);
+    failures.into_iter().map(|(_, t, a, e)| (t, a, e)).collect()
+}
+
+/// Truncate an args string for display in retry/critique preambles. Keeps
+/// the boundary clearly marked so the model doesn't lose track of where
+/// args end and prose resumes.
+fn truncate_args_for_display(args: &str, max: usize) -> String {
+    if args.len() <= max {
+        return args.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !args.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}…  [TRUNCATED — {} bytes total; the args you sent are not echoed back in full]",
+        &args[..end],
+        args.len()
+    )
+}
+
+/// Build the focused system prompt for a forced-retry attempt. Lists the
+/// unresolved failures with truncated args and tells the model exactly
+/// what to do.
+fn retry_preamble(
+    role: Role,
+    stage: Stage,
+    failures: &[(String, String, String)],
+    attempt: u32,
+    remaining: u32,
+    args_cap: usize,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# RETRY · {stage} · {role:?} (attempt {attempt}, {remaining} retries remaining after this)\n\n"
+    ));
+    s.push_str(
+        "Your previous turn left tool calls in a FAILED state. The framework will not \
+         accept this stage as complete until each is either retried successfully or \
+         explicitly abandoned with a reason in your final message. Process every \
+         failure below.\n\n",
+    );
+    s.push_str(
+        "For each failed call you must do ONE of:\n\
+         1. **Retry** the same tool with corrected arguments. Read the error message — \
+            it tells you exactly what's wrong.\n\
+         2. **Abandon** the call and explain in your end-of-turn message why it's not \
+            actually needed (one sentence per abandoned call).\n\n",
+    );
+    s.push_str(
+        "Note on truncated args: the args you sent are shown only as a stub for \
+         identification. For `submit_*` tools, do NOT try to reconstruct the truncated \
+         text from the stub — re-derive the full content from the spec / dep ifaces / \
+         tests in the context document, then submit it fresh.\n\n",
+    );
+    s.push_str("## Failed calls to address\n\n");
+    for (i, (tool, args, err)) in failures.iter().enumerate() {
+        let args_display = truncate_args_for_display(args, args_cap);
+        s.push_str(&format!(
+            "{}. **`{}`** — error: {}\n   args: `{}`\n\n",
+            i + 1,
+            tool,
+            err,
+            args_display
+        ));
+    }
+    s
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -955,9 +1324,8 @@ async fn run_rig_agent(
     // in `tools::tool_names_for` is the source of truth for "which tools";
     // we mirror it here to actually instantiate them.
     let resp = match (stage, role) {
-        (Stage::Spec, Role::Actor) | (Stage::Spec, Role::Reviser) => {
-            base.tool(SubmitSpecTool { ctx: ctx.clone() })
-                .tool(DecomposeTool { ctx })
+        (Stage::Spec, Role::Writer) | (Stage::Spec, Role::Reviser) => {
+            base.tool(SubmitSpecTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -974,7 +1342,7 @@ async fn run_rig_agent(
                 .await?
         }
 
-        (Stage::Iface, Role::Actor) | (Stage::Iface, Role::Reviser) => {
+        (Stage::Iface, Role::Writer) | (Stage::Iface, Role::Reviser) => {
             base.tool(SubmitPublicTool { ctx: ctx.clone() })
                 .tool(SubmitPrivateTool { ctx: ctx.clone() })
                 .tool(CargoCheckTool { ctx })
@@ -999,7 +1367,7 @@ async fn run_rig_agent(
                 .await?
         }
 
-        (Stage::Tests, Role::Actor) | (Stage::Tests, Role::Reviser) => {
+        (Stage::Tests, Role::Writer) | (Stage::Tests, Role::Reviser) => {
             base.tool(SubmitTestsTool { ctx: ctx.clone() })
                 .tool(CargoCheckTool { ctx: ctx.clone() })
                 .tool(CargoTestNoRunTool { ctx })
@@ -1026,7 +1394,7 @@ async fn run_rig_agent(
                 .await?
         }
 
-        (Stage::Impl, Role::Actor) | (Stage::Impl, Role::Reviser) => {
+        (Stage::Impl, Role::Writer) | (Stage::Impl, Role::Reviser) => {
             base.tool(SubmitPrivateTool { ctx: ctx.clone() })
                 .tool(CargoCheckTool { ctx: ctx.clone() })
                 .tool(CargoTestTool { ctx: ctx.clone() })
@@ -1055,7 +1423,7 @@ async fn run_rig_agent(
                 .await?
         }
 
-        (Stage::Debug, Role::Actor) | (Stage::Debug, Role::Reviser) => {
+        (Stage::Debug, Role::Writer) | (Stage::Debug, Role::Reviser) => {
             base.tool(SubmitPrivateTool { ctx: ctx.clone() })
                 .tool(SubmitTestsTool { ctx: ctx.clone() })
                 .tool(CargoCheckTool { ctx: ctx.clone() })
@@ -1083,7 +1451,7 @@ async fn run_rig_agent(
                 .await?
         }
 
-        (Stage::Opt, Role::Actor) | (Stage::Opt, Role::Reviser) => {
+        (Stage::Opt, Role::Writer) | (Stage::Opt, Role::Reviser) => {
             base.tool(SubmitPrivateTool { ctx: ctx.clone() })
                 .tool(CargoTestTool { ctx: ctx.clone() })
                 .tool(CargoClippyTool { ctx })
@@ -1112,72 +1480,441 @@ async fn run_rig_agent(
     Ok(resp)
 }
 
-fn role_preamble(stage: Stage, role: Role) -> String {
-    let role_block = match role {
-        Role::Actor => format!(
-            "# ROLE: ACTOR\n\nYou are the actor for the **{stage}** stage of one node. \
-             Use the available tools to author the right slot of this node:\n\
-             - **spec stage**: call `submit_spec` (and optionally `decompose` to add children).\n\
-             - **iface stage**: call BOTH `submit_public` AND `submit_private` in that order. \
-               public.rs holds trait declarations and newtype `pub struct` wrappers (NO `impl` \
-               blocks, NO function bodies). private.rs holds `impl Trait for Newtype` blocks \
-               with method bodies as `todo!()` for now — this scaffolding lets dependents \
-               compile against the trait. The impl stage will replace the `todo!()` bodies.\n\
-             - **tests stage**: call `submit_tests`. The tests should compile against the iface \
-               (impls exist as todo!() stubs) but they will fail at runtime — that's expected.\n\
-             - **impl stage**: call `submit_private` to replace the todo!() bodies with real \
-               implementations that make the tests pass.\n\
-             - **debug stage**: call `submit_private` and/or `submit_tests` to fix what's broken.\n\
-             - **opt stage**: call `submit_private` to optimize without breaking tests.\n\n\
-             Use cargo_* tools to verify before finishing. End with a brief plain-text summary."
+fn role_preamble(stage: Stage, role: Role, limits: crate::tools::PromptLimits) -> String {
+    let max_file = limits.max_file_lines;
+    let max_spec = limits.max_spec_section_lines;
+    let common = "\
+You are an expert Rust software engineer participating in a hierarchical \
+decomposition pipeline. The framework owns the project structure, the file \
+layout, and the dependency graph; you fill in slots through the tools \
+listed for this turn — never through free-form file writes. The context \
+document that follows starts with **Project mission**: read it first and \
+treat it as ground truth for what's being built. Subsequent sections give \
+you ancestor specs, sibling specs, dep public interfaces, and the current \
+node's already-authored slots.\n\n\
+# Universal rules\n\
+- The tool list provided this turn is exhaustive. Call only those tools; \
+  ignore patterns from other stages.\n\
+- When a tool returns `no_change: true`, the file already had identical \
+  content. Move on; do not re-call it.\n\
+- Same tool + same args three times in a row triggers a hard error. When \
+  you see that, finish with a one-line summary and stop calling tools.\n\
+- All node names are **snake_case Rust identifiers**. CamelCase is for \
+  Rust types, not nodes — never reference a sibling/dep as CamelCase.";
+
+    let role_block = match (stage, role) {
+        // ---- SPEC ----
+        (Stage::Spec, Role::Writer) => format!(
+            "# SPEC · WRITER\n\
+            \n\
+            You're writing a SPECIFICATION DOCUMENT for one piece of \
+            software (a node in the project's decomposition tree). The \
+            spec describes what the software DOES and PROMISES — it is \
+            NOT a record of your own work, your own goals, or your own \
+            editing process. Audience: a Rust engineer reading the spec \
+            in isolation, six months from now, deciding how to use the \
+            node.\n\
+            \n\
+            ONE call: `submit_spec`. Composite tool carrying public \
+            spec (required), optional private notes, optional children, \
+            optional deps. After it succeeds, end your turn with a \
+            one-line summary.\n\
+            \n\
+            Read the **Project mission** AND the **Decomposition \
+            budget** sections of the context document FIRST. The budget \
+            tells you whether the schema for this turn even includes a \
+            `children` field — if it doesn't (cap exhausted), you're \
+            writing a leaf spec, full stop.\n\
+            \n\
+            ## What the spec is NOT\n\
+            \n\
+            It is NOT a literate-Rust artifact. Specs are ARCHITECTURE \
+            and REQUIREMENTS, not code:\n\
+            - DON'T write Rust traits with method signatures. Describe \
+              capabilities in prose: \"the node provides a way to \
+              authenticate a user given credentials and a session \
+              context\" — NOT `pub trait Authenticator {{ fn auth(...) \
+              -> Result<...>; }}`. The iface stage writes the Rust.\n\
+            - DON'T enumerate every type and method. Name a few central \
+              concepts; let the iface stage flesh them out.\n\
+            - DO talk about: data shapes, ownership, concurrency, \
+              error model, key invariants, security/threat model, \
+              I/O surfaces, operational properties.\n\
+            \n\
+            Also NOT in the spec: meta-commentary about your own \
+            writing (`This spec defines…`, `In this revision…`, \
+            `Summary of addressed critique…`), process narrative \
+            (`Next steps`, `Deliverables…`), or anything that reads as \
+            a status report or PR description.\n\
+            \n\
+            ## `public` (REQUIRED, ≤{max_spec} lines)\n\
+            \n\
+            The INTERFACE specification — what dependents and downstream \
+            stages observe. Think of this like a public header file's \
+            documentation, but in prose. Suggested headings:\n\
+            - `## What it does` — one or two sentences naming the \
+              capability the node provides. (Avoid the word \"goal\" — \
+              describe behaviour, not aspiration.)\n\
+            - `## Public surface` — the named abstractions dependents \
+              will see (e.g. \"a `Session` handle that owns the \
+              underlying transport; a `Request`/`Response` pair that \
+              models one round-trip\"). Prose, not Rust signatures.\n\
+            - `## Invariants and guarantees` — properties dependents \
+              can rely on (e.g. \"`Session` is `Send + Sync`\"; \"every \
+              request is signed before transmission\").\n\
+            - `## Out of scope` — adjacent things this node \
+              deliberately does NOT do.\n\
+            \n\
+            CRITICAL — what counts as PUBLIC: only what callers of this \
+            node observe. If a type is purely internal — backends the \
+            user picks among, helper structs, configuration plumbing \
+            that callers never instantiate — it goes in `private`, NOT \
+            `public`. Rule of thumb: if removing it from the public \
+            spec wouldn't change how a dependent uses the node, it \
+            doesn't belong there.\n\
+            \n\
+            ## `private` (OPTIONAL, ≤{max_spec} lines)\n\
+            \n\
+            The IMPLEMENTATION specification — guidance for the iface / \
+            impl stages on THIS node about HOW it's built. Audience: \
+            YOU and your future selves doing the iface and impl stages \
+            on this node. Other nodes never see this content.\n\
+            \n\
+            DO include:\n\
+            - Internal data structures and their relationships.\n\
+            - Backends, helpers, internal types — anything observable \
+              only inside the node.\n\
+            - Concurrency / threading / state-machine sketches.\n\
+            - Algorithmic notes, performance considerations.\n\
+            - Tradeoffs you considered, alternatives rejected.\n\
+            \n\
+            DO NOT include:\n\
+            - A changelog of edits you made (`Rationale for edits…`, \
+              `I expanded section X…`). The private spec describes the \
+              SOFTWARE's internals, not the document's editing history. \
+              That goes in your end-of-turn summary, OUTSIDE the \
+              `submit_spec` call.\n\
+            - Re-statement of the public spec.\n\
+            \n\
+            ## `children` (OPTIONAL — schema may hide this field)\n\
+            \n\
+            The DEFAULT for any node is LEAF (no children). Decompose \
+            only when:\n\
+            - The node truly has multiple separable sub-responsibilities \
+              that can't fit in one Rust file (per-file cap {max_file} \
+              lines is your sanity check), AND\n\
+            - The Decomposition budget says you have room.\n\
+            \n\
+            Project-scale roots almost always decompose. Interior nodes \
+            usually shouldn't. One-trait-per-node is wrong: if you'd \
+            want one child per trait, the parent IS the leaf and the \
+            traits sit in its `public.rs`.\n\
+            \n\
+            For each child: snake_case `name` (NOT CamelCase — that's \
+            a type), one-sentence `description`, optional `deps` \
+            (existing names or earlier siblings in this same call), \
+            optional `crate_boundary` (default false; set true ONLY at \
+            major top-level subsystem boundaries — most children should \
+            leave it false and become modules within the parent's crate).\n\
+            \n\
+            Be careful with cross-crate `deps`: if children A and B are \
+            in DIFFERENT crates and A.deps includes something in B's \
+            crate while another node in B's crate depends on something \
+            in A's crate, you've created a cycle that cargo will \
+            reject. Keep cross-crate deps acyclic — typically arrange \
+            them as a DAG with shared utilities at the bottom.\n\
+            \n\
+            ## `deps` (OPTIONAL)\n\
+            \n\
+            Names of existing graph nodes that THIS node should depend \
+            on. For declaring that this node uses an existing utility \
+            without creating any children. Cycle-checked at submit time \
+            — both at the node level AND the crate level."
         ),
-        Role::Critic => format!(
-            "# ROLE: CRITIC\n\nYou are the critic for the **{stage}** stage of one node. \
-             Identify concrete problems with the actor's work that will matter for THIS \
-             stage's contract. Output a short bullet list of specific, actionable concerns. \
-             If the work is fine, say exactly `No issues found.`\n\n\
-             You may use diagnostic tools (cargo_*) to verify claims; you may NOT modify \
-             files. Don't pad. Don't comment on style if behavior is correct. Don't flag \
-             omissions that are out of scope for this stage."
+        (Stage::Spec, Role::Reviser) => format!(
+            "# SPEC · REVISER\n\
+            \n\
+            The writer wrote the spec; the critic raised points. Apply \
+            minimal targeted edits and re-call `submit_spec` with the \
+            WHOLE updated submission — public (≤{max_spec} lines, \
+            required), and whichever of private/children/deps the \
+            critic flagged. ONE composite call.\n\
+            \n\
+            ## Critical: BOTH public AND private stay clean specs\n\
+            \n\
+            Neither slot is a diff, a PR description, or a changelog. \
+            Do NOT write `Rationale for edits`, `I expanded the public \
+            spec`, `Summary of addressed critique`, `In this revision`, \
+            `These changes address…`, or ANY meta-narrative about your \
+            editing process — not in `public`, and ALSO NOT in \
+            `private`.\n\
+            \n\
+            Specifically:\n\
+            - `public` describes what the SOFTWARE does and exposes to \
+              dependents. Snapshot, not history.\n\
+            - `private` describes what the SOFTWARE looks like \
+              INTERNALLY (data structures, concurrency, algorithms, \
+              tradeoffs). Snapshot, not history. Note: the most \
+              common reviser mistake is writing change-rationale here \
+              — don't do that. If the previous private content needs \
+              updating, REWRITE it as a clean snapshot of the \
+              implementation rationale; don't append diff notes.\n\
+            \n\
+            A reader two months from now should not be able to tell \
+            which round of revision they're looking at, in either slot.\n\
+            \n\
+            Your end-of-turn assistant text (OUTSIDE the `submit_spec` \
+            call) is the ONLY place where you describe what you \
+            changed. One short paragraph there."
         ),
-        Role::Reviser => format!(
-            "# ROLE: REVISER\n\nYou are the reviser for the **{stage}** stage. The actor \
-             produced something; the critic raised concerns. Address each critic point with \
-             minimal targeted edits using the same write tools as the actor. Don't \
-             redesign. End with a one-paragraph summary of what you changed."
+        (Stage::Spec, Role::Critic) => {
+            "# SPEC · CRITIC\n\
+            \n\
+            Read the writer's spec. Bullet-list concrete problems: missing \
+            sections, vague invariants, scope creep, decomposition that \
+            doesn't match the project mission, child names that aren't \
+            snake_case. If the spec is fine, output exactly \
+            `No issues found.` Don't pad. Don't restate the spec."
+                .to_string()
+        }
+        (Stage::Spec, Role::Judge) => judge_block(Stage::Spec),
+
+        // ---- IFACE ----
+        (Stage::Iface, Role::Writer) | (Stage::Iface, Role::Reviser) => format!(
+            "# IFACE · WRITER\n\
+            \n\
+            Author the public surface and a stub private impl for this \
+            node. The exact contract for each tool is in the tool list; \
+            this preamble covers WORKFLOW.\n\
+            \n\
+            Workflow:\n\
+            1. Submit `public.rs` (declarations only — see the \
+               `submit_public` tool spec for what's allowed; in \
+               particular `mod`, `impl`, and `fn` outside trait decls \
+               are FORBIDDEN; cap {max_file} lines).\n\
+            2. Submit `private.rs` containing one `impl Trait for \
+               Newtype` block per trait in `public.rs`, with method \
+               bodies as `todo!()`. The stubs let dependents compile \
+               NOW; the next stage replaces them with real logic.\n\
+            3. Run `cargo_check` to verify, then end with a one-line \
+               summary.\n\
+            \n\
+            ## Module-path rules in `private.rs`\n\
+            \n\
+            - For your OWN public types: `use super::public::*;` — NEVER \
+              `use crate::TypeName`.\n\
+            - For a DECLARED DEP: copy the `import as ...` line from the \
+              dep's context section verbatim.\n\
+            - The first segment after `crate::` MUST resolve to a \
+              declared dep, an ancestor, an own child, or this node \
+              itself; the validator rejects anything else.\n\
+            - Never invent a dep. If something you need isn't in the \
+              context, mention it in your summary — don't paper over it.\n\
+            \n\
+            If this node has children (visible in the graph overview), \
+            it's an UMBRELLA — `public.rs` can be just doc comments or \
+            empty; the children carry the real surface."
         ),
-        Role::Judge => format!(
-            "# ROLE: JUDGE\n\nYou are the coherence check at the end of the actor → critic \
-             → reviser cycle for the **{stage}** stage. Your job: confirm the reviser \
-             addressed each point the critic raised. You are NOT a fresh reviewer; you are \
-             NOT the cargo gate (that runs separately). For each critic bullet, decide: \
-             addressed / deferred-with-good-reason / ignored. Call `submit_verdict` exactly \
-             once with `satisfactory: true` if all points are addressed (or there were no \
-             points), or `satisfactory: false` with a concrete reason quoting the unaddressed \
-             point(s). When in doubt: satisfactory=true."
+        (Stage::Iface, Role::Critic) => {
+            "# IFACE · CRITIC\n\
+            \n\
+            Use `cargo_check` to verify the iface compiles. Bullet-list \
+            problems: forbidden items in `public.rs`, missing `impl` stubs \
+            in `private.rs`, mismatch between trait signatures and the \
+            spec's API section, undeclared dep imports. If clean, say \
+            exactly `No issues found.`"
+                .to_string()
+        }
+        (Stage::Iface, Role::Judge) => judge_block(Stage::Iface),
+
+        // ---- TESTS ----
+        (Stage::Tests, Role::Writer) | (Stage::Tests, Role::Reviser) => format!(
+            "# TESTS · WRITER\n\
+            \n\
+            Author `#[test]` functions exercising this node's public \
+            surface against the spec. The framework wraps your content \
+            in a `#[cfg(test)] mod tests {{ ... }}` block. The exact \
+            contract for `submit_tests` is in its tool spec.\n\
+            \n\
+            Workflow:\n\
+            1. Import the node's public surface with `use \
+               super::public::*;` (NEVER `use crate::TypeName`).\n\
+            2. Cover the spec's invariants and edge cases.\n\
+            3. Run `cargo_test_no_run` to verify the file compiles.\n\
+            4. End with a one-line summary.\n\
+            \n\
+            Cap: {max_file} lines. Tests will COMPILE because \
+            `private.rs` has `todo!()` stubs satisfying the trait at the \
+            type level — they FAIL at runtime, which is expected. The \
+            next stage replaces the stubs and the same tests pass.\n\
+            \n\
+            `use crate::<X>::...` rule same as `private.rs`: X must be a \
+            declared dep / ancestor / own child. Don't write integration \
+            tests that need network or filesystem unless the spec calls \
+            for it."
         ),
+        (Stage::Tests, Role::Critic) => {
+            "# TESTS · CRITIC\n\
+            \n\
+            Use `cargo_test_no_run` to confirm tests compile. Bullet-list \
+            problems: tests that don't actually exercise the spec, tests \
+            that import via `crate::TypeName` instead of \
+            `super::public::*`, missing edge-case coverage. If clean, \
+            `No issues found.`"
+                .to_string()
+        }
+        (Stage::Tests, Role::Judge) => judge_block(Stage::Tests),
+
+        // ---- IMPL ----
+        (Stage::Impl, Role::Writer) | (Stage::Impl, Role::Reviser) => format!(
+            "# IMPL · WRITER\n\
+            \n\
+            Replace the `todo!()` bodies in `private.rs` with real \
+            implementations that make the tests pass. The public surface \
+            is FROZEN (don't touch it) and so are the tests (they define \
+            the contract). `submit_private` replaces the WHOLE file; cap \
+            {max_file} lines.\n\
+            \n\
+            Module-path rules same as iface: `use super::public::*;` for \
+            own types; copy the `import as ...` line from each Dependency \
+            section verbatim for declared deps; never invent a dep.\n\
+            \n\
+            Use `cargo_test` to confirm tests pass; `cargo_check` and \
+            `cargo_clippy` for early signal. End with a one-line summary."
+        ),
+        (Stage::Impl, Role::Critic) => {
+            "# IMPL · CRITIC\n\
+            \n\
+            Run `cargo_test`. Bullet-list failing tests, lints with \
+            obvious correctness implications, and any `unsafe` or \
+            `unwrap()` smell that the spec didn't sanction. If green, \
+            `No issues found.`"
+                .to_string()
+        }
+        (Stage::Impl, Role::Judge) => judge_block(Stage::Impl),
+
+        // ---- DEBUG ----
+        (Stage::Debug, Role::Writer) | (Stage::Debug, Role::Reviser) => format!(
+            "# DEBUG · WRITER\n\
+            \n\
+            Tests are still failing after the previous stage. Look at \
+            the failing-test output (in the `Critique cycle context` \
+            section below, or run `cargo_test` yourself). Apply MINIMAL \
+            targeted fixes via `submit_private` (≤ {max_file} lines) \
+            and, only if a test was actually wrong, `submit_tests`. \
+            Don't redesign. The public surface is still frozen."
+        ),
+        (Stage::Debug, Role::Critic) => {
+            "# DEBUG · CRITIC\n\
+            \n\
+            Run `cargo_test`. Are tests green? Bullet-list anything \
+            still failing or any test that was loosened to make impl \
+            pass. If clean, `No issues found.`"
+                .to_string()
+        }
+        (Stage::Debug, Role::Judge) => judge_block(Stage::Debug),
+
+        // ---- OPT ----
+        (Stage::Opt, Role::Writer) | (Stage::Opt, Role::Reviser) => format!(
+            "# OPT · WRITER\n\
+            \n\
+            Optional polish. Improve clarity, performance, or lint \
+            cleanliness in `private.rs` (≤ {max_file} lines) without \
+            breaking tests. Use `cargo_test` to confirm tests still \
+            pass; `cargo_clippy` for lints."
+        ),
+        (Stage::Opt, Role::Critic) => {
+            "# OPT · CRITIC\n\
+            \n\
+            Run `cargo_test` and `cargo_clippy`. If anything regressed \
+            or was made worse, bullet it. Otherwise `No issues found.`"
+                .to_string()
+        }
+        (Stage::Opt, Role::Judge) => judge_block(Stage::Opt),
     };
-    let common = "You are an expert Rust software engineer participating in a hierarchical \
-        decomposition pipeline. The framework owns the project structure, the file layout, \
-        and the dependency graph; you fill in slots through tools, not through free-form \
-        file writes. The context document below contains everything you should need: ancestor \
-        specs, dep public interfaces, current node files. You shouldn't need to read anything \
-        from disk.\n\n# IMPORTANT\n\
-        - When a tool returns `no_change: true`, the file already had identical content. Move on.\n\
-        - The harness detects loops: same tool + same args three times in a row → error. \
-          When you see that error, finish with a summary; don't call more tools.\n\
-        - Use cargo_* diagnostic tools to verify before finishing. Cheap and immediate.";
+
     format!("{common}\n\n{role_block}")
+}
+
+fn judge_block(stage: Stage) -> String {
+    let upper = match stage {
+        Stage::Spec => "SPEC",
+        Stage::Iface => "IFACE",
+        Stage::Tests => "TESTS",
+        Stage::Impl => "IMPL",
+        Stage::Debug => "DEBUG",
+        Stage::Opt => "OPT",
+    };
+    format!(
+        "# {upper} · JUDGE\n\
+        \n\
+        Coherence check at the end of the writer → critic → reviser \
+        cycle. Confirm the reviser addressed each critic point. You are \
+        NOT a fresh reviewer and you are NOT the cargo gate (it runs \
+        separately).\n\
+        \n\
+        For each critic bullet, decide: addressed / deferred-with-good- \
+        reason / ignored. Call `submit_verdict` exactly once: \
+        `satisfactory: true` if all points are addressed (or there were \
+        no points); `satisfactory: false` with a concrete reason quoting \
+        the unaddressed point(s). When in doubt: `satisfactory: true`."
+    )
+}
+
+/// Extract a one-line description from a markdown problem statement: the
+/// first non-blank, non-heading paragraph (joined to a single line, trimmed
+/// to ~200 chars). Falls back to the first non-blank line.
+fn problem_first_paragraph(md: &str) -> String {
+    let mut buf = String::new();
+    for line in md.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !buf.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if t.starts_with('#') {
+            // Skip headings until we hit prose.
+            continue;
+        }
+        if !buf.is_empty() {
+            buf.push(' ');
+        }
+        buf.push_str(t);
+    }
+    if buf.is_empty() {
+        // Fallback: first non-blank line, even if it's a heading.
+        for line in md.lines() {
+            let t = line.trim().trim_start_matches('#').trim();
+            if !t.is_empty() {
+                buf = t.to_string();
+                break;
+            }
+        }
+    }
+    if buf.is_empty() {
+        return "Project root.".to_string();
+    }
+    if buf.len() > 200 {
+        let mut end = 197;
+        while !buf.is_char_boundary(end) {
+            end -= 1;
+        }
+        buf.truncate(end);
+        buf.push_str("...");
+    }
+    buf
 }
 
 fn role_user_prompt(stage: Stage, role: Role) -> String {
     match (stage, role) {
-        (s, Role::Actor) => format!(
+        (s, Role::Writer) => format!(
             "Do the {s} stage for this node using the slot-filler tool(s). End with a one-line \
              summary."
         ),
         (s, Role::Critic) => format!(
-            "Critique the actor's {s}-stage output. Bullet list. Empty list = `No issues found.`"
+            "Critique the writer's {s}-stage output. Bullet list. Empty list = `No issues found.`"
         ),
         (s, Role::Reviser) => format!(
             "Address each critic point for the {s} stage. End with a one-line summary of the changes."
@@ -1376,5 +2113,183 @@ mod tests {
         assert!(is_transient("HTTP 502 Bad Gateway"));
         assert!(is_transient("connection reset"));
         assert!(!is_transient("invalid api key"));
+    }
+
+    #[test]
+    fn problem_first_paragraph_skips_headings() {
+        let md = "# Problem: A samba-equivalent server\n\n\
+                  Build a Rust workspace that reimplements a substantial subset of \
+                  Samba — SMB/CIFS file serving, NetBIOS, etc.\n\n\
+                  More text.";
+        let p = problem_first_paragraph(md);
+        assert!(p.starts_with("Build a Rust workspace"), "got: {p}");
+        assert!(!p.contains('#'));
+    }
+
+    #[test]
+    fn problem_first_paragraph_truncates_long_text() {
+        let md = format!("Lorem ipsum {}", "dolor sit amet ".repeat(40));
+        let p = problem_first_paragraph(&md);
+        assert!(p.len() <= 200, "len was {}", p.len());
+        assert!(p.ends_with("..."));
+    }
+
+    #[test]
+    fn problem_first_paragraph_falls_back_to_heading_when_no_prose() {
+        let p = problem_first_paragraph("# Just a Title\n");
+        assert_eq!(p, "Just a Title");
+    }
+
+    #[test]
+    fn problem_first_paragraph_handles_empty_input() {
+        assert_eq!(problem_first_paragraph(""), "Project root.");
+        assert_eq!(problem_first_paragraph("   \n   \n"), "Project root.");
+    }
+
+    fn test_limits() -> crate::tools::PromptLimits {
+        crate::tools::PromptLimits {
+            max_file_lines: 600,
+            max_spec_section_lines: 800,
+        }
+    }
+
+    #[test]
+    fn role_preamble_iface_actor_forbids_mod_and_directs_to_super_public() {
+        let p = role_preamble(Stage::Iface, Role::Writer, test_limits());
+        // The preamble should call out that `mod` is forbidden somewhere
+        // (the long-form "what's allowed" list now lives in the tool
+        // description; the preamble has the workflow-level reminder).
+        assert!(
+            p.contains("`mod`") && p.to_lowercase().contains("forbidden"),
+            "iface actor preamble should mention `mod` is forbidden: {p}"
+        );
+        assert!(p.contains("super::public"), "should direct to super::public");
+        assert!(
+            p.contains("snake_case"),
+            "should remind about snake_case node names"
+        );
+    }
+
+    #[test]
+    fn iface_tool_description_carries_the_full_forbidden_list() {
+        // The system prompt no longer dumps every allowed/forbidden item
+        // — that detail belongs in the tool description, sent separately
+        // by the rig API. Pin that the tool description still has it.
+        let limits = crate::tools::PromptLimits {
+            max_file_lines: 600,
+            max_spec_section_lines: 800,
+        };
+        let d = crate::tools::tool_description("submit_public", limits);
+        assert!(d.contains("FORBIDDEN") && d.contains("mod"));
+        assert!(d.contains("impl"));
+    }
+
+    #[test]
+    fn role_preamble_spec_actor_pushes_decompose_for_large_missions() {
+        let p = role_preamble(Stage::Spec, Role::Writer, test_limits());
+        assert!(
+            p.contains("decompose"),
+            "spec actor preamble must mention decompose"
+        );
+        assert!(
+            p.to_lowercase().contains("snake_case"),
+            "spec actor preamble must mention snake_case names"
+        );
+    }
+
+    #[test]
+    fn role_preamble_interpolates_limits_from_config() {
+        let limits = crate::tools::PromptLimits {
+            max_file_lines: 777,
+            max_spec_section_lines: 999,
+        };
+        let iface = role_preamble(Stage::Iface, Role::Writer, limits);
+        assert!(
+            iface.contains("777"),
+            "iface actor preamble should mention max_file_lines: {iface}"
+        );
+        let spec = role_preamble(Stage::Spec, Role::Writer, limits);
+        assert!(
+            spec.contains("999"),
+            "spec actor preamble should mention max_spec_section_lines: {spec}"
+        );
+    }
+
+    #[test]
+    fn role_preamble_universal_rules_no_longer_dump_all_tool_names() {
+        // Cross-stage tools should not appear in a stage's universal rules.
+        // E.g. impl writer's preamble shouldn't mention spec / verdict tools.
+        let p = role_preamble(Stage::Impl, Role::Writer, test_limits());
+        assert!(
+            !p.contains("submit_spec_public") && !p.contains("submit_spec_private"),
+            "impl writer should not see spec tools in its preamble: {p}"
+        );
+        assert!(
+            !p.contains("submit_verdict"),
+            "impl writer should not see submit_verdict in its preamble: {p}"
+        );
+    }
+
+    #[test]
+    fn spec_reviser_warns_against_changelog_in_spec_body() {
+        // The reviser's spec stays a clean spec — no meta-narrative.
+        // This test pins the guidance.
+        let p = role_preamble(Stage::Spec, Role::Reviser, test_limits());
+        let lc = p.to_lowercase();
+        assert!(
+            lc.contains("changelog") || lc.contains("meta-narrative") || lc.contains("clean spec"),
+            "spec reviser preamble must call out 'no changelog/meta-narrative': {p}"
+        );
+    }
+
+    #[test]
+    fn collect_failed_tool_calls_pairs_args_to_results() {
+        let now = Utc::now();
+        let entries = vec![
+            TranscriptEntry {
+                timestamp: now,
+                kind: TranscriptKind::ToolCall {
+                    tool: "decompose".into(),
+                },
+                content: "{\"children\":[{\"name\":\"x\",\"deps\":[\"x\"]}]}".into(),
+                role: None,
+            },
+            TranscriptEntry {
+                timestamp: now,
+                kind: TranscriptKind::ToolResult {
+                    tool: "decompose".into(),
+                    ok: false,
+                    error: Some("child 'x' lists itself".into()),
+                    output: None,
+                },
+                content: String::new(),
+                role: None,
+            },
+            // A successful call should not appear in the result.
+            TranscriptEntry {
+                timestamp: now,
+                kind: TranscriptKind::ToolCall {
+                    tool: "submit_spec".into(),
+                },
+                content: "{\"content\":\"# x\\n\"}".into(),
+                role: None,
+            },
+            TranscriptEntry {
+                timestamp: now,
+                kind: TranscriptKind::ToolResult {
+                    tool: "submit_spec".into(),
+                    ok: true,
+                    error: None,
+                    output: Some("{\"bytes\":4}".into()),
+                },
+                content: String::new(),
+                role: None,
+            },
+        ];
+        let failures = collect_failed_tool_calls(&entries);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "decompose");
+        assert!(failures[0].1.contains("\"children\""));
+        assert!(failures[0].2.contains("lists itself"));
     }
 }

@@ -44,8 +44,10 @@ pub enum ValidateError {
     )]
     PublicForbiddenPubUse { path: String },
     #[error(
-        "private.rs: `use crate::{first}::...` references node '{first}' which is not a \
-         declared dep of this node; declare it via `decompose` first"
+        "private.rs: `use crate::{first}::...` — '{first}' is not a declared dep of this \
+         node, an ancestor, or one of its own children. If you meant to import this node's \
+         OWN public types, write `use super::public::*;` instead. If you meant to depend on \
+         another node, name it (snake_case) in the spec stage's `decompose` deps list."
     )]
     PrivateUndeclaredDep { first: String },
     #[error(
