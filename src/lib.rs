@@ -11,3 +11,4 @@ pub mod render;
 pub mod state;
 pub mod tools;
 pub mod web;
+pub mod worktree;

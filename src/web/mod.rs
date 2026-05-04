@@ -27,6 +27,10 @@ pub struct AppState {
     /// The engine's authoritative graph. Web mutations (e.g. reset_node)
     /// must hit this so the running engine sees them immediately.
     pub graph: std::sync::Arc<parking_lot::Mutex<crate::graph::NodeGraph>>,
+    /// Worktree pool — used to surface in-progress work in the files
+    /// panel. None when the web UI is started without an engine (e.g.
+    /// pure-checkpoint browse mode).
+    pub worktrees: Option<std::sync::Arc<crate::worktree::WorktreePool>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -36,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(api_events))
         .route("/api/files", get(api_files))
         .route("/api/file", get(api_file))
+        .route("/api/worktrees", get(api_worktrees))
         .route("/api/gitlog", get(api_gitlog))
         .route("/api/task_transcript", get(api_task_transcript))
         .route("/api/issues", get(api_issues))
@@ -88,9 +93,23 @@ struct FileEntry {
     size: u64,
 }
 
-async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
-    let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(&s.workdir)
+/// `?worktree=<task-id>` (optional) — list files from a specific
+/// worktree's tree instead of main. If not given, lists files on main.
+#[derive(Deserialize)]
+struct FilesQ {
+    worktree: Option<String>,
+}
+
+async fn api_files(
+    State(s): State<AppState>,
+    Query(q): Query<FilesQ>,
+) -> Response {
+    let scan_root = match resolve_worktree_root(&s, q.worktree.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::NOT_FOUND, e).into_response(),
+    };
+    let mut out: Vec<FileEntry> = Vec::new();
+    for entry in walkdir::WalkDir::new(&scan_root)
         .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -98,7 +117,7 @@ async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
     {
         let rel = entry
             .path()
-            .strip_prefix(&s.workdir)
+            .strip_prefix(&scan_root)
             .ok()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| entry.path().to_path_buf());
@@ -115,12 +134,13 @@ async fn api_files(State(s): State<AppState>) -> Json<Vec<FileEntry>> {
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Json(out)
+    Json(out).into_response()
 }
 
 #[derive(Deserialize)]
 struct PathQ {
     path: String,
+    worktree: Option<String>,
 }
 
 async fn api_file(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response {
@@ -128,11 +148,55 @@ async fn api_file(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response
     if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     }
-    let abs = s.workdir.join(&rel);
+    let root = match resolve_worktree_root(&s, q.worktree.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::NOT_FOUND, e).into_response(),
+    };
+    let abs = root.join(&rel);
     match std::fs::read_to_string(&abs) {
         Ok(c) => c.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, format!("{e}")).into_response(),
     }
+}
+
+/// Look up the on-disk root for a `?worktree=...` query. Empty / missing /
+/// `"main"` → the main workdir; otherwise look up the worktree by task-id.
+fn resolve_worktree_root(s: &AppState, key: Option<&str>) -> Result<PathBuf, String> {
+    match key {
+        None | Some("") | Some("main") => Ok(s.workdir.clone()),
+        Some(id) => {
+            let pool = s.worktrees.as_ref().ok_or("worktree pool unavailable")?;
+            for wt in pool.active_worktrees() {
+                if wt.task_id.to_string() == id {
+                    return Ok(wt.path.clone());
+                }
+            }
+            Err(format!("no active worktree for task {id}"))
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WorktreeInfo {
+    task_id: String,
+    branch: String,
+    /// Absolute path on disk — useful for diagnostics; the UI shouldn't
+    /// open this directly, only via /api/files?worktree=<task-id>.
+    path: String,
+}
+
+async fn api_worktrees(State(s): State<AppState>) -> Json<Vec<WorktreeInfo>> {
+    let mut out = Vec::new();
+    if let Some(pool) = &s.worktrees {
+        for wt in pool.active_worktrees() {
+            out.push(WorktreeInfo {
+                task_id: wt.task_id.to_string(),
+                branch: wt.branch,
+                path: wt.path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    Json(out)
 }
 
 #[derive(Serialize)]

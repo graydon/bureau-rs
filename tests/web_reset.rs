@@ -46,6 +46,7 @@ async fn reset_node_cascades_through_dependents() {
         state: state.clone(),
         workdir: workdir.path().to_path_buf(),
         graph: graph_mutex.clone(),
+        worktrees: None,
     };
     let r = router(app);
 
@@ -123,6 +124,7 @@ async fn reset_node_without_cascade_only_resets_target() {
         state: state.clone(),
         workdir: workdir.path().to_path_buf(),
         graph: graph_mutex.clone(),
+        worktrees: None,
     });
 
     let body = serde_json::to_vec(&serde_json::json!({

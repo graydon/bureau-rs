@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
 use rig::providers::openrouter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -143,8 +143,17 @@ pub struct Engine {
     pub workdir: PathBuf,
     pub layout: Layout,
     pub driver: Arc<dyn LlmDriver>,
-    /// Serializes cargo invocations across parallel tasks.
+    /// Serializes cargo invocations within a single workdir. Each task
+    /// runs in its own worktree (with its own `target/`), so this lock
+    /// is only contended for sequential cargos within ONE task — kept
+    /// for safety and to make it easy to fall back to single-workdir
+    /// mode if needed.
     pub cargo_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The main-branch git repo at `workdir`. All per-task worktrees
+    /// branch from this and merge back into it.
+    pub workspace: Arc<crate::worktree::Workspace>,
+    /// Pool managing per-task worktrees.
+    pub worktrees: Arc<crate::worktree::WorktreePool>,
 }
 
 impl Engine {
@@ -161,6 +170,8 @@ impl Engine {
         let workdir = state.read(|s| s.workdir.clone());
         let layout = config.layout();
         let graph = Arc::new(Mutex::new(state.read(|s| s.graph.clone())));
+        let workspace = crate::worktree::Workspace::init(&workdir)?;
+        let worktrees = Arc::new(crate::worktree::WorktreePool::new(workspace.clone())?);
         Ok(Self {
             config,
             state,
@@ -169,6 +180,8 @@ impl Engine {
             layout,
             driver,
             cargo_lock: Arc::new(tokio::sync::Mutex::new(())),
+            workspace,
+            worktrees,
         })
     }
 
@@ -300,75 +313,11 @@ impl Engine {
         let _ = g.insert_root(root)?;
         render::render_graph(&self.workdir, &g, self.layout)?;
         drop(g);
-        // Initialize the git repo + initial scaffold commit so subsequent
-        // stage commits have somewhere to land. If the repo already
-        // exists (resumed run), this is a no-op.
-        if let Err(e) = self.git_init_if_needed() {
-            tracing::warn!("git init: {e:#}");
+        // Commit the rendered scaffold to main so the first per-task
+        // worktree branches from a non-empty tree.
+        if let Err(e) = self.workspace.commit_main("scaffold: initial render") {
+            tracing::warn!("scaffold commit: {e:#}");
         }
-        Ok(())
-    }
-
-    /// Initialize the workdir as a git repo and make an initial commit
-    /// of the scaffolded files. No-op if the repo already exists.
-    fn git_init_if_needed(&self) -> Result<()> {
-        let dotgit = self.workdir.join(".git");
-        if dotgit.exists() {
-            return Ok(());
-        }
-        let repo = git2::Repository::init(&self.workdir)?;
-        // Configure a local user so commits work even if the global git
-        // config doesn't have one.
-        let mut cfg = repo.config()?;
-        if cfg.get_string("user.name").is_err() {
-            cfg.set_str("user.name", "bureau-rs")?;
-        }
-        if cfg.get_string("user.email").is_err() {
-            cfg.set_str("user.email", "bureau-rs@localhost")?;
-        }
-        // Stage everything currently rendered and make the seed commit.
-        let mut index = repo.index()?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        let sig = repo.signature()?;
-        repo.commit(Some("HEAD"), &sig, &sig, "scaffold", &tree, &[])?;
-        Ok(())
-    }
-
-    /// Commit the workdir state after a stage completes. Each commit is
-    /// keyed by node + stage so the gitlog panel shows a per-stage trail
-    /// of progress. Non-fatal: if git fails (e.g. no .git dir, or
-    /// nothing to commit), we just log and move on.
-    fn commit_stage_done(
-        &self,
-        _node_id: NodeId,
-        stage: Stage,
-        node_name: &str,
-    ) -> Result<()> {
-        let repo = git2::Repository::open(&self.workdir)?;
-        let mut index = repo.index()?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        // If the tree matches HEAD's tree, nothing changed — skip.
-        let parent = match repo.head().and_then(|h| h.peel_to_commit()) {
-            Ok(c) => Some(c),
-            Err(_) => None, // unborn HEAD — first commit
-        };
-        if let Some(p) = &parent {
-            if p.tree_id() == tree_id {
-                return Ok(()); // no changes to record
-            }
-        }
-        let sig = repo.signature().or_else(|_| {
-            git2::Signature::now("bureau-rs", "bureau-rs@localhost")
-        })?;
-        let msg = format!("{stage}: {node_name}");
-        let parents: Vec<&git2::Commit> = parent.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parents)?;
         Ok(())
     }
 
@@ -439,10 +388,28 @@ impl Engine {
             .set(stage, StageState::InProgress);
         self.sync_graph_to_state();
 
+        // Allocate a per-stage worktree off main HEAD. All renders, cargo
+        // invocations, and tool writes for this stage's attempts go into
+        // it. On stage success we merge it back; on failure we abandon.
+        // Retries within a stage REUSE the same worktree so the model's
+        // partial work persists across retries.
+        let stage_uuid = Uuid::new_v4();
+        let worktree = match self.worktrees.allocate(stage_uuid).await {
+            Ok(wt) => wt,
+            Err(e) => {
+                tracing::error!("worktree allocation: {e:#}");
+                return Err(e);
+            }
+        };
+
         let max_retries = self.config.toml.limits.max_stage_retries;
         let mut last_err: Option<anyhow::Error> = None;
+        let mut succeeded = false;
         for attempt in 1..=(max_retries + 1) {
-            match self.run_one_attempt(node_id, stage, attempt).await {
+            match self
+                .run_one_attempt(node_id, stage, attempt, &worktree.path)
+                .await
+            {
                 Ok(()) => {
                     let node_name = {
                         let mut g = self.graph.lock();
@@ -451,16 +418,59 @@ impl Engine {
                         n.name.clone()
                     };
                     self.sync_graph_to_state();
-                    // Snapshot the workdir into git as a node-stage commit
-                    // so the gitlog panel shows progress one click at a
-                    // time. Commit failures are non-fatal — we just log
-                    // and continue.
-                    if let Err(e) = self.commit_stage_done(node_id, stage, &node_name) {
-                        tracing::warn!(
-                            "git commit for {node_name} {stage}: {e:#}"
-                        );
+                    // Before merging: re-render the worktree from the
+                    // current shared graph (the canonical truth, already
+                    // cycle-checked by add_dep), and run a defensive
+                    // topo_order to confirm no cycle slipped in. The
+                    // re-render makes git's three-way merge clean:
+                    // every task's pre-merge tree reflects the SAME
+                    // shared graph, so node content already landed on
+                    // main is identical on both sides.
+                    let merge_msg = format!("{stage}: {node_name}");
+                    let canonical_render = {
+                        let g = self.graph.lock();
+                        if g.topo_order().is_none() {
+                            Err(anyhow!(
+                                "shared graph is cyclic at merge time — refusing to merge \
+                                 worktree for {node_name} {stage}"
+                            ))
+                        } else {
+                            render::render_graph(&worktree.path, &g, self.layout)
+                                .map_err(|e| anyhow!("re-render before merge: {e}"))
+                        }
+                    };
+                    match canonical_render {
+                        Ok(_) => {
+                            if let Err(e) = self
+                                .worktrees
+                                .clone()
+                                .merge_and_release(worktree.clone(), &merge_msg)
+                                .await
+                            {
+                                tracing::warn!("worktree merge {node_name} {stage}: {e:#}");
+                            }
+                        }
+                        Err(e) => {
+                            // Cycle or render failure — abandon, don't
+                            // merge corrupted state to main.
+                            tracing::error!(
+                                "refusing to merge worktree for {node_name} {stage}: {e:#}"
+                            );
+                            if let Err(ae) = self
+                                .worktrees
+                                .clone()
+                                .abandon(worktree.clone())
+                                .await
+                            {
+                                tracing::warn!("worktree abandon: {ae:#}");
+                            }
+                            // Fall through to mark the stage Failed.
+                            last_err = Some(e);
+                            break;
+                        }
                     }
-                    return Ok(());
+                    succeeded = true;
+                    break;
                 }
                 Err(e) => {
                     self.note(format!(
@@ -477,6 +487,15 @@ impl Engine {
                     }
                 }
             }
+        }
+        if !succeeded {
+            // All retries exhausted — drop the worktree without merging.
+            if let Err(e) = self.worktrees.clone().abandon(worktree).await {
+                tracing::warn!("worktree abandon: {e:#}");
+            }
+        }
+        if succeeded {
+            return Ok(());
         }
 
         // Out of attempts. Mark Failed; some stages can recover via Debug
@@ -514,6 +533,7 @@ impl Engine {
         node_id: NodeId,
         stage: Stage,
         attempt: u32,
+        task_workdir: &Path,
     ) -> Result<()> {
         let task_id = Uuid::new_v4();
         let node_name = self.graph.lock().get(node_id).unwrap().name.clone();
@@ -539,7 +559,9 @@ impl Engine {
         self.state.emit(UiEvent::TaskCreated { task });
 
         // 1. Actor
-        let actor = self.run_role(task_id, node_id, stage, Role::Writer, None).await?;
+        let actor = self
+            .run_role(task_id, node_id, stage, Role::Writer, None, task_workdir)
+            .await?;
 
         // 2. Critique cycle (optional)
         let critique_retries = self.config.toml.limits.critique_retries;
@@ -559,6 +581,7 @@ impl Engine {
                         prior_revision: None,
                         prior_failed_tools: last_failed.clone(),
                     }),
+                    task_workdir,
                 )
                 .await?
                 .text;
@@ -575,6 +598,7 @@ impl Engine {
                         prior_revision: None,
                         prior_failed_tools: last_failed.clone(),
                     }),
+                    task_workdir,
                 )
                 .await?;
             last_text = revision.text.clone();
@@ -593,6 +617,7 @@ impl Engine {
                         prior_revision: Some(revision.text),
                         prior_failed_tools: last_failed.clone(),
                     }),
+                    task_workdir,
                 )
                 .await?;
             let v = self.state.read(|s| {
@@ -621,7 +646,7 @@ impl Engine {
         if let Some(kind) = gate_kind {
             let outcome = {
                 let _guard = self.cargo_lock.lock().await;
-                crate::gate::run_gate(&self.workdir, kind).await?
+                crate::gate::run_gate(task_workdir, kind).await?
             };
             if !outcome.passed {
                 let summary = self.summarize_errors(&outcome.errors, 5);
@@ -768,6 +793,7 @@ impl Engine {
         stage: Stage,
         role: Role,
         extras: Option<CycleExtras>,
+        task_workdir: &Path,
     ) -> Result<RoleOutcome> {
         let model = self.config.toml.models.for_role(role).to_string();
 
@@ -882,7 +908,7 @@ impl Engine {
             stage,
             role,
             self.graph.clone(),
-            self.workdir.clone(),
+            task_workdir.to_path_buf(),
             self.layout,
             self.config.toml.limits.max_file_lines,
             self.config.toml.limits.max_spec_section_lines,

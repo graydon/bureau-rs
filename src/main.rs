@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
             state: state.clone(),
             workdir: cli.work_dir.clone(),
             graph: engine.graph.clone(),
+            worktrees: Some(engine.worktrees.clone()),
         };
         let port = cli.port;
         Some(tokio::spawn(async move {

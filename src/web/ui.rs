@@ -199,7 +199,12 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div class="panel-h">Files</div>
     <div class="panel-body">
       <div class="section open">
-        <div class="sec-summary">Workdir <span class="muted" id="files-count"></span></div>
+        <div class="sec-summary">
+          Workdir <span class="muted" id="files-count"></span>
+          <select id="files-source" style="margin-left:auto; font-size:11px;">
+            <option value="main">main</option>
+          </select>
+        </div>
         <div class="sec-body"><ul class="file-tree" id="file-tree"></ul></div>
       </div>
       <div class="section">
@@ -536,8 +541,39 @@ function renderTranscript() {
   el.scrollTop = wasAtBottom ? el.scrollHeight : prevTop;
 }
 
+// Currently-selected file source for the Files panel: "main" or a
+// task UUID matching an active worktree.
+let filesSource = 'main';
+
 async function refreshFiles() {
-  const files = await api('/api/files');
+  // Refresh worktree list and dropdown options first.
+  const worktrees = await api('/api/worktrees').catch(() => []);
+  const sel = document.getElementById('files-source');
+  if (sel) {
+    const desired = filesSource;
+    const opts = ['<option value="main">main</option>'];
+    for (const wt of worktrees) {
+      const short = wt.task_id.slice(0, 8);
+      opts.push(`<option value="${wt.task_id}">WIP · ${short} (${escapeHtml(wt.branch)})</option>`);
+    }
+    // Only re-set HTML when the option set changed, to preserve focus.
+    const newHtml = opts.join('');
+    if (sel.innerHTML !== newHtml) {
+      sel.innerHTML = newHtml;
+    }
+    // Pick the desired source if it's still in the list; else fall back to main.
+    if ([...sel.options].some(o => o.value === desired)) {
+      sel.value = desired;
+    } else {
+      sel.value = 'main';
+      filesSource = 'main';
+    }
+    sel.onchange = () => { filesSource = sel.value; refreshFiles(); };
+  }
+  const url = filesSource === 'main'
+    ? '/api/files'
+    : '/api/files?worktree=' + encodeURIComponent(filesSource);
+  const files = await api(url).catch(() => []);
   const el = document.getElementById('file-tree');
   el.innerHTML = '';
   for (const f of files) {
@@ -548,7 +584,10 @@ async function refreshFiles() {
     li.appendChild(a);
     el.appendChild(li);
   }
-  document.getElementById('files-count').textContent = `(${files.length})`;
+  const label = filesSource === 'main'
+    ? `(${files.length} on main)`
+    : `(${files.length} WIP)`;
+  document.getElementById('files-count').textContent = label;
 }
 
 async function refreshGit() {
@@ -603,8 +642,14 @@ async function refreshIssues() {
 }
 
 async function openFile(path) {
-  const t = await api('/api/file?path=' + encodeURIComponent(path));
-  document.getElementById('preview-h').textContent = path;
+  // Fetch from whatever source the Files panel is currently showing.
+  let url = '/api/file?path=' + encodeURIComponent(path);
+  if (filesSource && filesSource !== 'main') {
+    url += '&worktree=' + encodeURIComponent(filesSource);
+  }
+  const t = await api(url);
+  const tag = filesSource === 'main' ? '' : `  ·  WIP (${filesSource.slice(0,8)})`;
+  document.getElementById('preview-h').textContent = path + tag;
   document.getElementById('preview').textContent = t;
 }
 
