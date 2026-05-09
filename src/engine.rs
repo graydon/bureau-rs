@@ -26,8 +26,8 @@ use crate::state::{
     UiEvent,
 };
 use crate::tools::{
-    CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool,
-    JudgeVerdict, Role, SubmitPrivateTool, SubmitPublicTool, SubmitSpecTool, SubmitTestsTool,
+    CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool, JudgeVerdict, Role,
+    SubmitArchitectureTool, SubmitPrivateTool, SubmitPublicTool, SubmitSpecTool, SubmitTestsTool,
     SubmitVerdictTool, TaskCtx, TranscriptEntry, TranscriptKind,
 };
 use anyhow::{Result, anyhow};
@@ -297,6 +297,50 @@ impl Engine {
         }
     }
 
+    /// Architect's "merge to main": the architect produced the entire
+    /// project structure, and there's only ONE architect task ever, so
+    /// we just copy every file from the worktree onto main wholesale
+    /// (excluding `.git` and bookkeeping dirs) and commit. No
+    /// three-way merge needed because there's no concurrent task that
+    /// could race with the architect.
+    async fn land_architect_to_main(
+        &self,
+        wt: &crate::worktree::Worktree,
+        message: &str,
+    ) -> Result<()> {
+        // Walk the worktree, copy everything outside .git / target /
+        // .bureau onto main. Any file that already exists on main is
+        // overwritten — main was empty (or just-scaffolded) when the
+        // architect started.
+        for entry in walkdir::WalkDir::new(&wt.path).min_depth(1) {
+            let entry = entry?;
+            let p = entry.path();
+            let rel = match p.strip_prefix(&wt.path) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            };
+            if rel.components().any(|c| {
+                let s = c.as_os_str().to_string_lossy();
+                s == ".git" || s == "target" || s == ".bureau"
+            }) {
+                continue;
+            }
+            let dst = self.workdir.join(&rel);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&dst).ok();
+            } else if entry.file_type().is_file() {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::copy(p, &dst)?;
+            }
+        }
+        let _ = self.workspace.commit_main(message)?;
+        // Drop the worktree (we don't need its branch).
+        let _ = self.worktrees.clone().abandon(wt.clone()).await;
+        Ok(())
+    }
+
     fn ensure_root_seeded(&self) -> Result<()> {
         let mut g = self.graph.lock();
         if g.root.is_some() {
@@ -343,11 +387,10 @@ impl Engine {
     fn pick_next_ready(&self) -> Option<(NodeId, Stage)> {
         let g = self.graph.lock();
         let order = g.topo_order()?;
-        // Walk in reverse-topo so deps come first; that means leaves first
-        // at any given stage. But we want the OVERALL earliest stage that's
-        // ready, which can sit anywhere. So scan all nodes for each stage
-        // in order, picking the first match.
+        // Architect is FIRST — it must run on root before anything else.
+        // Then per-node stages in order.
         for stage in [
+            Stage::Architect,
             Stage::Spec,
             Stage::Iface,
             Stage::Tests,
@@ -367,6 +410,17 @@ impl Engine {
 
     fn all_done(&self) -> bool {
         let g = self.graph.lock();
+        // Architect on root must be Done; spec/iface/tests/impl on every
+        // node must be Done.
+        if let Some(rid) = g.root {
+            if !g
+                .get(rid)
+                .map(|r| r.stages.architect.is_done())
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
         for n in g.iter() {
             for s in [Stage::Spec, Stage::Iface, Stage::Tests, Stage::Impl] {
                 if !n.stages.get(s).is_done() {
@@ -418,36 +472,60 @@ impl Engine {
                         n.name.clone()
                     };
                     self.sync_graph_to_state();
-                    // Before merging: re-render the worktree from the
-                    // current shared graph (the canonical truth, already
-                    // cycle-checked by add_dep), and run a defensive
-                    // topo_order to confirm no cycle slipped in. The
-                    // re-render makes git's three-way merge clean:
-                    // every task's pre-merge tree reflects the SAME
-                    // shared graph, so node content already landed on
-                    // main is identical on both sides.
+                    // Land THIS task's owned files onto main. We
+                    // deliberately AVOID a three-way merge here: each
+                    // task's worktree contains a full-tree render that
+                    // includes other nodes' content (because cargo_check
+                    // needs the full tree to compile), and that content
+                    // can diverge between concurrent tasks (different
+                    // snapshots of the shared graph). The three-way
+                    // merge then trips on "both branches modified the
+                    // same file with different content" even though
+                    // neither task actually intended to write that file.
+                    //
+                    // Instead we copy ONLY the files this stage owns
+                    // (per-node spec/source/Cargo.toml as appropriate)
+                    // from the worktree to main, then commit on main.
+                    // Concurrent tasks are serialized by the worktree
+                    // pool's main_lock.
+                    //
+                    // Architect is special: it produces the whole
+                    // workspace structure, so we commit the worktree
+                    // wholesale to main (effectively the existing merge
+                    // flow, but it only ever runs once).
                     let merge_msg = format!("{stage}: {node_name}");
                     let canonical_render = {
                         let g = self.graph.lock();
                         if g.topo_order().is_none() {
                             Err(anyhow!(
-                                "shared graph is cyclic at merge time — refusing to merge \
+                                "shared graph is cyclic at merge time — refusing to land \
                                  worktree for {node_name} {stage}"
                             ))
                         } else {
                             render::render_graph(&worktree.path, &g, self.layout)
-                                .map_err(|e| anyhow!("re-render before merge: {e}"))
+                                .map_err(|e| anyhow!("re-render before commit: {e}"))
                         }
                     };
                     match canonical_render {
                         Ok(_) => {
-                            if let Err(e) = self
-                                .worktrees
-                                .clone()
-                                .merge_and_release(worktree.clone(), &merge_msg)
-                                .await
-                            {
-                                tracing::warn!("worktree merge {node_name} {stage}: {e:#}");
+                            let result = if stage == Stage::Architect {
+                                // Architect: copy the whole worktree to main.
+                                self.land_architect_to_main(&worktree, &merge_msg).await
+                            } else {
+                                let owned: Vec<std::path::PathBuf> = {
+                                    let g = self.graph.lock();
+                                    let n = g.get(node_id).unwrap();
+                                    render::files_owned_by_stage(&g, n, stage, self.layout)
+                                };
+                                self.worktrees
+                                    .clone()
+                                    .apply_to_main(worktree.clone(), &owned, &merge_msg)
+                                    .await
+                            };
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    "worktree apply-to-main {node_name} {stage}: {e:#}"
+                                );
                             }
                         }
                         Err(e) => {
@@ -537,14 +615,22 @@ impl Engine {
     ) -> Result<()> {
         let task_id = Uuid::new_v4();
         let node_name = self.graph.lock().get(node_id).unwrap().name.clone();
-        let actor_model = self.config.toml.models.actor.clone();
+        // Resolve the writer's model for THIS stage as the task-level
+        // model name (other roles within the cycle may use different
+        // models — see `run_role`).
+        let writer_model = self
+            .config
+            .toml
+            .models
+            .for_stage_role(stage, Role::Writer)
+            .to_string();
         let task = EngineTask {
             id: task_id,
             node_id,
             node_name: node_name.clone(),
             stage,
             status: TaskStatus::Running,
-            model: actor_model.clone(),
+            model: writer_model.clone(),
             transcript: Vec::new(),
             cost: TokenUsage::default(),
             started_at: Some(Utc::now()),
@@ -564,7 +650,13 @@ impl Engine {
             .await?;
 
         // 2. Critique cycle (optional)
-        let critique_retries = self.config.toml.limits.critique_retries;
+        // Architect runs single-shot (no critic/reviser/judge cycle); other
+        // stages use the configured critique_retries.
+        let critique_retries = if stage == Stage::Architect {
+            0
+        } else {
+            self.config.toml.limits.critique_retries
+        };
         let mut last_text = actor.text;
         let mut last_failed = actor.failed_tools;
         for round in 1..=critique_retries {
@@ -638,7 +730,7 @@ impl Engine {
         // model verify itself, but a final hard gate ensures the on-disk
         // state is good before we mark the stage Done.
         let gate_kind = match stage {
-            Stage::Spec => None,
+            Stage::Architect | Stage::Spec => None,
             Stage::Iface => Some(crate::gate::GateKind::Check),
             Stage::Tests => Some(crate::gate::GateKind::TestNoRun),
             Stage::Impl | Stage::Debug | Stage::Opt => Some(crate::gate::GateKind::Test),
@@ -695,6 +787,10 @@ impl Engine {
                 return Err(anyhow!(msg));
             }
         }
+        // (No post-stage check for Architect — the tool's call() either
+        // succeeded or failed; if it failed the writer's retry logic
+        // will have surfaced it. An empty children list is a legitimate
+        // output for a single-crate project with no sub-modules.)
 
         // 5. Verdict gate: if critique cycle ran and final verdict is
         // unsatisfactory, fail.
@@ -795,15 +891,25 @@ impl Engine {
         extras: Option<CycleExtras>,
         task_workdir: &Path,
     ) -> Result<RoleOutcome> {
-        let model = self.config.toml.models.for_role(role).to_string();
+        let model = self
+            .config
+            .toml
+            .models
+            .for_stage_role(stage, role)
+            .to_string();
 
         // Build prompt context. Always inject the project mission as the
         // first section so every node — root or deep child — sees what
         // the overall goal is. Without this the root node has no idea what
-        // it's building beyond its own name.
+        // it's building beyond its own name. If a `style.md` is present
+        // in the config dir, inject it right after as a "Style guide"
+        // section the user can use to nudge tone, verbosity, etc.
         let g_for_ctx = self.graph.lock().clone();
         let mut bundle = node_context::ContextBundle::new();
         bundle.push("Project mission", self.config.problem.trim().to_string());
+        if let Some(style) = &self.config.style {
+            bundle.push("Style guide", style.clone());
+        }
         let inner = node_context::build_for_stage(
             &g_for_ctx,
             node_id,
@@ -1103,7 +1209,10 @@ struct RoleOutcome {
 /// - all required preconditions hold (see below)
 ///
 /// Stage preconditions:
-/// - `Spec`: parent's `Spec` is Done (or there is no parent).
+/// - `Architect`: only the ROOT node, only when its Architect is
+///   NotStarted. Builds the whole tree in one shot before anything else.
+/// - `Spec`: root's `Architect` is Done AND parent's `Spec` is Done
+///   (or this node IS the root).
 /// - `Iface`: this node's `Spec` is Done AND every dep's `Iface` is Done.
 /// - `Tests`: this node's `Iface` is Done AND every dep's `Iface` is Done.
 /// - `Impl`: this node's `Tests` is Done AND every dep's `Impl` is Done.
@@ -1117,10 +1226,29 @@ fn stage_is_ready(graph: &NodeGraph, id: NodeId, stage: Stage) -> bool {
         None => return false,
     };
     let cur = n.stages.get(stage);
+    // Helper: is the architect phase done? It runs on root only.
+    let architect_done = match graph.root {
+        Some(rid) => graph
+            .get(rid)
+            .map(|r| r.stages.architect.is_done())
+            .unwrap_or(false),
+        None => false,
+    };
     match stage {
         Stage::Opt => false, // Skip opt for now; see comment above.
+        Stage::Architect => {
+            // Architect runs ONLY on root, ONLY once, BEFORE anything else.
+            if cur != StageState::NotStarted {
+                return false;
+            }
+            n.parent.is_none()
+        }
         Stage::Spec => {
             if cur != StageState::NotStarted {
+                return false;
+            }
+            // Every node's spec waits for the architect to lay out the tree.
+            if !architect_done {
                 return false;
             }
             match n.parent {
@@ -1350,6 +1478,18 @@ async fn run_rig_agent(
     // in `tools::tool_names_for` is the source of truth for "which tools";
     // we mirror it here to actually instantiate them.
     let resp = match (stage, role) {
+        (Stage::Architect, Role::Writer) => {
+            base.tool(SubmitArchitectureTool { ctx })
+                .build()
+                .prompt(user_prompt)
+                .extended_details()
+                .await?
+        }
+        (Stage::Architect, _) => {
+            // Architect runs single-shot — no critic/reviser/judge cycles.
+            base.build().prompt(user_prompt).extended_details().await?
+        }
+
         (Stage::Spec, Role::Writer) | (Stage::Spec, Role::Reviser) => {
             base.tool(SubmitSpecTool { ctx })
                 .build()
@@ -1515,9 +1655,12 @@ decomposition pipeline. The framework owns the project structure, the file \
 layout, and the dependency graph; you fill in slots through the tools \
 listed for this turn — never through free-form file writes. The context \
 document that follows starts with **Project mission**: read it first and \
-treat it as ground truth for what's being built. Subsequent sections give \
-you ancestor specs, sibling specs, dep public interfaces, and the current \
-node's already-authored slots.\n\n\
+treat it as ground truth for what's being built. If a **Style guide** \
+section follows, it carries user-supplied preferences about tone, \
+verbosity, code style, and what to avoid — treat its instructions as \
+overriding the defaults below where they conflict. Subsequent sections \
+give you ancestor specs, sibling specs, dep public interfaces, and the \
+current node's already-authored slots.\n\n\
 # Universal rules\n\
 - The tool list provided this turn is exhaustive. Call only those tools; \
   ignore patterns from other stages.\n\
@@ -1526,9 +1669,67 @@ node's already-authored slots.\n\n\
 - Same tool + same args three times in a row triggers a hard error. When \
   you see that, finish with a one-line summary and stop calling tools.\n\
 - All node names are **snake_case Rust identifiers**. CamelCase is for \
-  Rust types, not nodes — never reference a sibling/dep as CamelCase.";
+  Rust types, not nodes — never reference a sibling/dep as CamelCase.\n\
+- DEFAULT WRITING STYLE (overridable by **Style guide**): be terse. \
+  Specs and code should be matter-of-fact and minimal. Avoid \
+  just-in-case caveats, jargon padding, marketing language, or \
+  rambly prose. Short sentences. Concrete nouns. If a sentence \
+  doesn't add information, delete it.";
 
     let role_block = match (stage, role) {
+        // ---- ARCHITECT ----
+        (Stage::Architect, Role::Writer) => format!(
+            "# ARCHITECT · WRITER\n\
+            \n\
+            You are designing the WHOLE STRUCTURE of this Rust project in \
+            ONE call. Read the **Project mission** above, then submit the \
+            project's complete decomposition tree via `submit_architecture` \
+            — exactly once. After that the per-node stages take over and \
+            flesh things out; you don't need to (and shouldn't) write any \
+            spec content here.\n\
+            \n\
+            Output: the SKELETON — crates, modules, parent-child \
+            relationships, cross-node dep edges, anticipated external \
+            Cargo deps. Think of it like sitting down to draft the project \
+            layout: which crates exist, how they nest as modules, which \
+            subsystem depends on which, where the natural seams are.\n\
+            \n\
+            ## Heuristics\n\
+            \n\
+            - Aim shallower-and-broader, not deeper-and-narrower. A healthy \
+              project-scale tree might be 5–10 first-level subsystems, each \
+              splitting once or twice more. Not hundreds of leaves at depth \
+              5.\n\
+            - One module per Rust file. Per-file cap is {max_file} lines, so \
+              if a leaf can't reasonably express its surface in that, split \
+              it; otherwise keep it a leaf.\n\
+            - `crate_boundary` is for MAJOR top-level subsystems that \
+              warrant a separate Cargo package. A handful per project. \
+              Most children become modules within their parent's crate. \
+              One-crate-per-leaf is wrong.\n\
+            - Names are GLOBALLY unique snake_case Rust idents — they're \
+              how dep edges resolve. CamelCase is for types, never nodes.\n\
+            - Keep cross-crate dep edges acyclic (the framework checks \
+              this at submit time at both the node and crate level). \
+              Typical shape: shared utility crates at the bottom, \
+              subsystems above, daemons/binaries at the top.\n\
+            \n\
+            ## What goes in `description`\n\
+            \n\
+            One short sentence per node — what it's for, in functional \
+            terms. Not a spec; not implementation hints. Just enough that \
+            the per-node spec writer downstream can recognize what its \
+            node is supposed to be.\n\
+            \n\
+            End your turn with a one-line summary after the tool call \
+            returns."
+        ),
+        (Stage::Architect, _) => "# ARCHITECT (non-writer)\n\
+            \n\
+            The architect stage runs single-shot — only the Writer role \
+            speaks. Output nothing."
+            .into(),
+
         // ---- SPEC ----
         (Stage::Spec, Role::Writer) => format!(
             "# SPEC · WRITER\n\
@@ -1864,6 +2065,7 @@ node's already-authored slots.\n\n\
 
 fn judge_block(stage: Stage) -> String {
     let upper = match stage {
+        Stage::Architect => "ARCHITECT",
         Stage::Spec => "SPEC",
         Stage::Iface => "IFACE",
         Stage::Tests => "TESTS",
@@ -2042,11 +2244,26 @@ mod tests {
     use crate::graph::Node;
 
     #[test]
-    fn stage_is_ready_root_spec_starts() {
+    fn architect_runs_first_then_root_spec() {
         let mut g = NodeGraph::new();
         let _root = g.insert_root(Node::new("app", "")).unwrap();
+        // Architect is ready on root immediately.
+        assert!(stage_is_ready(&g, g.root.unwrap(), Stage::Architect));
+        // Spec waits for architect.
+        assert!(!stage_is_ready(&g, g.root.unwrap(), Stage::Spec));
+        // Once architect is done, root's spec becomes ready.
+        g.get_mut(g.root.unwrap()).unwrap().stages.architect = StageState::Done;
         assert!(stage_is_ready(&g, g.root.unwrap(), Stage::Spec));
         assert!(!stage_is_ready(&g, g.root.unwrap(), Stage::Iface));
+    }
+
+    #[test]
+    fn architect_only_on_root() {
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        let c = g.add_child(root, Node::new("c", "")).unwrap();
+        // Even with NotStarted, architect on a non-root is never ready.
+        assert!(!stage_is_ready(&g, c, Stage::Architect));
     }
 
     #[test]
@@ -2054,6 +2271,8 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         let c = g.add_child(root, Node::new("c", "")).unwrap();
+        // Architect must be done first.
+        g.get_mut(root).unwrap().stages.architect = StageState::Done;
         // Root spec NotStarted → child spec NOT ready.
         assert!(!stage_is_ready(&g, c, Stage::Spec));
         g.get_mut(root).unwrap().stages.spec = StageState::Done;

@@ -1,29 +1,42 @@
 # bureau-rs config for the samba-rs example.
 #
 # This example targets a Samba-equivalent server suite. It's the test case
-# for the workspace layout, deep hierarchical decomposition, and parallel
-# scheduling. Expect ~50+ leaf crates, several thousand LLM tasks, and a
-# total cost on the order of tens of dollars depending on model choice —
-# the cost_cap_usd below is the safety rail, not a target.
+# for the workspace layout, the architect phase, and parallel scheduling.
+# Expect dozens of leaf modules, several thousand LLM tasks, and a total
+# cost on the order of tens of dollars depending on model choice — the
+# cost_cap_usd below is the safety rail, not a target.
 
 project_name = "samba_rs"
 layout = "workspace"
 
 [models]
-# A samba reimplementation involves real protocol work — NDR marshalling,
-# ASN.1 Kerberos, SMB framing, ACL evaluation. Use a strong model for the
-# actor and reviser; the judge is just a coherence check, so spend less
-# there.
+# Models resolve through:
+#   1. stage-specific override (e.g. `architect = "..."`)
+#   2. role-specific override (e.g. `critic = "..."`)
+#   3. `default` (required)
+# Stage wins over role when both apply.
 #
-# These are OpenRouter model IDs; substitute whatever you have access to.
-# Suggested alternatives:
-#   actor   = "anthropic/claude-opus-4.7"
-#   actor   = "openai/gpt-5"
-#   actor   = "google/gemini-2.5-pro"
-actor   = "openai/gpt-5-mini"
-critic  = "openai/gpt-5-mini"
-reviser = "openai/gpt-5-mini"
-judge   = "openai/gpt-5-mini"
+# These are OpenRouter model IDs — substitute whatever you have access to.
+
+# Default model for everything not overridden below.
+default = "deepseek/deepseek-v4-flash"
+
+# Architect lays out the entire project tree in ONE call — it deserves
+# the strongest model you have. Suggested alternatives:
+#   architect = "anthropic/claude-opus-4.7"
+#   architect = "openai/gpt-5.5"
+#   architect = "google/google/gemini-3.1-pro-preview"
+architect = "openai/gpt-5.5"
+
+# Per-stage examples (commented out; uncomment + edit as desired):
+# spec  = "openai/gpt-5.5              # smarter for spec writing
+# iface = "openai/gpt-5.4-mini"        # simpler for iface scaffolding
+# impl  = "openai/gpt-5.4-mini"        # cargo-driven; iteration matters more than smarts
+# debug = "openai/gpt-5.5"             # bring back the smart model when things break
+
+# Per-role examples (commented out):
+# critic  = "openai/gpt-5.4-mini"
+# judge   = "openai/gpt-5.4-mini"
 
 # Larger budget per turn — protocol crates have a lot of mechanical
 # code and the spec context the prompt builder includes can be hefty.
@@ -33,40 +46,33 @@ max_turns   = 60
 
 [limits]
 # Crate `lib.rs` files for protocol parsers tend to be longer than the
-# default; bump the per-file cap so the actor isn't forced to over-split.
+# default; bump the per-file cap so the writer isn't forced to over-split.
 max_file_lines         = 600
 max_spec_section_lines = 800
 
-# 4 parallel tasks: enough to overlap LLM latency across independent
-# nodes, not so many that the cargo lock thrashes. Bump to 8 if you've
-# got fast SSD + spare cores.
-max_parallel_tasks = 8
+# 8 parallel tasks: each runs in its own git worktree with its own
+# `target/` dir, so cargo doesn't contend.
+max_parallel_tasks = 128
 
 # Protocol code occasionally needs more than two retries before the
 # cargo gate is happy — be slightly more generous than the default.
-max_stage_retries = 3
+max_stage_retries = 4
 critique_retries  = 2
 
 # How many times the framework will re-prompt a role to fix unresolved
-# failed tool calls before giving up. 0 = never auto-retry (failures
-# still surface to the next role's cycle context). Default 2 is fine for
-# most projects; a few extra retries are cheap insurance against a small
-# model fumbling tool args on the first try.
-tool_retry_budget = 3
+# failed tool calls before giving up. Default 2; a few extra retries are
+# cheap insurance against a small model fumbling tool args on the first
+# try.
+tool_retry_budget = 4
 
 # Bytes of failed-tool-call args echoed back to the model in the focused
-# retry preamble. Default 60 is fine — the model has the spec / dep
-# ifaces in context and re-derives full content; only enough bytes to
-# identify the call are needed. Bump only if you want larger args
-# excerpts in the transcript.
+# retry preamble.
 args_display_cap = 60
 
-# Hard caps on the decomposition graph. Without these the spec stage can
-# loop indefinitely — every child's spec stage decomposes into more
-# children, and you wake up with hundreds of nodes and no iface stage
-# ever runs. For a samba-scale project a tree of ~50 nodes ≤ 4 deep is
-# plenty: ~5 top-level subsystems × ~5 leaves each, with one extra
-# level for a handful of heavy subsystems.
+# Hard caps on the architect's tree. The architect lays out the whole
+# project up front; these set the ceiling. For a samba-scale project a
+# tree of ~50 nodes ≤ 4 deep is plenty: ~5 top-level subsystems × ~5
+# leaves each, with one extra level for a handful of heavy subsystems.
 max_nodes = 60
 max_node_depth = 4
 
@@ -77,7 +83,7 @@ max_tasks_total = 8192
 
 # Hard cost cap. The pipeline halts when this is exceeded. Tune to your
 # wallet; raise if you're using a strong model and want it to finish.
-cost_cap_usd = 50.0
+cost_cap_usd = 20.0
 
 [provider]
 api_key_env = "OPENROUTER_API_KEY"

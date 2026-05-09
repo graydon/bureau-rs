@@ -1,9 +1,18 @@
-//! Configuration loaded from `<config-dir>/{problem.md, config.toml}`.
+//! Configuration loaded from `<config-dir>/{problem.md, config.toml,
+//! style.md?}`.
 //!
-//! The new engine has a much simpler config than the old phase-based one:
-//! - one model per role (actor/critic/reviser/judge), with sensible defaults
-//! - a few global limits (file size, parallelism, max retries)
-//! - the layout (single crate vs workspace)
+//! The model field hierarchy: every (stage, role) call resolves through
+//!   1. stage-specific override (e.g. `architect = "..."`)
+//!   2. role-specific override (e.g. `critic = "..."`)
+//!   3. `default` (required)
+//!
+//! Stage overrides win over role overrides — stage is the more specific
+//! axis (architect needs a smarter model; reviser-of-anything tends to
+//! match its writer).
+//!
+//! `style.md` is optional. If present, its contents are inlined into
+//! every prompt context as a "Style guide" section so the user can
+//! customize coding/writing style without editing prompts in code.
 
 use crate::render::Layout;
 use anyhow::{Context, Result};
@@ -12,13 +21,37 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    pub actor: String,
+    /// Default model used for any (stage, role) not overridden by the
+    /// fields below. REQUIRED.
+    pub default: String,
+
+    // ---- Per-stage overrides (apply across all roles in that stage) ----
+    #[serde(default)]
+    pub architect: Option<String>,
+    #[serde(default)]
+    pub spec: Option<String>,
+    #[serde(default)]
+    pub iface: Option<String>,
+    #[serde(default)]
+    pub tests: Option<String>,
+    /// `impl` is a Rust keyword; the TOML key is still `impl`.
+    #[serde(default, rename = "impl")]
+    pub impl_: Option<String>,
+    #[serde(default)]
+    pub debug: Option<String>,
+    #[serde(default)]
+    pub opt: Option<String>,
+
+    // ---- Per-role overrides (apply across all stages for that role) ----
+    #[serde(default)]
+    pub writer: Option<String>,
     #[serde(default)]
     pub critic: Option<String>,
     #[serde(default)]
     pub reviser: Option<String>,
     #[serde(default)]
     pub judge: Option<String>,
+
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_temperature")]
@@ -38,13 +71,31 @@ fn default_max_turns() -> usize {
 }
 
 impl ModelConfig {
-    pub fn for_role(&self, role: crate::tools::Role) -> &str {
-        match role {
-            crate::tools::Role::Writer => &self.actor,
-            crate::tools::Role::Critic => self.critic.as_deref().unwrap_or(&self.actor),
-            crate::tools::Role::Reviser => self.reviser.as_deref().unwrap_or(&self.actor),
-            crate::tools::Role::Judge => self.judge.as_deref().unwrap_or(&self.actor),
+    /// Resolve the model name for a given (stage, role): stage-specific
+    /// override wins, then role-specific, then `default`.
+    pub fn for_stage_role(&self, stage: crate::graph::Stage, role: crate::tools::Role) -> &str {
+        let stage_override = match stage {
+            crate::graph::Stage::Architect => &self.architect,
+            crate::graph::Stage::Spec => &self.spec,
+            crate::graph::Stage::Iface => &self.iface,
+            crate::graph::Stage::Tests => &self.tests,
+            crate::graph::Stage::Impl => &self.impl_,
+            crate::graph::Stage::Debug => &self.debug,
+            crate::graph::Stage::Opt => &self.opt,
+        };
+        if let Some(s) = stage_override.as_deref() {
+            return s;
         }
+        let role_override = match role {
+            crate::tools::Role::Writer => &self.writer,
+            crate::tools::Role::Critic => &self.critic,
+            crate::tools::Role::Reviser => &self.reviser,
+            crate::tools::Role::Judge => &self.judge,
+        };
+        if let Some(s) = role_override.as_deref() {
+            return s;
+        }
+        &self.default
     }
 }
 
@@ -195,7 +246,12 @@ fn default_project_name() -> String {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub config_dir: PathBuf,
+    /// Contents of `<config-dir>/problem.md` — the project mission.
     pub problem: String,
+    /// Contents of `<config-dir>/style.md` if present — coding/writing
+    /// style guide, inlined into every prompt context as a "Style guide"
+    /// section. None when the file is absent.
+    pub style: Option<String>,
     pub toml: ConfigToml,
 }
 
@@ -209,9 +265,26 @@ impl Config {
             .with_context(|| format!("reading {}", toml_path.display()))?;
         let toml: ConfigToml = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", toml_path.display()))?;
+        // Style guide is optional: missing file → None.
+        let style_path = config_dir.join("style.md");
+        let style = match std::fs::read_to_string(&style_path) {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", style_path.display()));
+            }
+        };
         Ok(Self {
             config_dir: config_dir.to_path_buf(),
             problem,
+            style,
             toml,
         })
     }

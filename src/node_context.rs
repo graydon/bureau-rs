@@ -320,6 +320,10 @@ pub fn build_for_stage(
     max_node_depth: usize,
 ) -> ContextBundle {
     match stage {
+        // Architect runs on the root, before any per-node work. Its
+        // context is just the project mission (already prepended by the
+        // engine) plus a depth/cap budget — no ancestor specs etc.
+        Stage::Architect => build_for_architect(graph, node_id, max_nodes, max_node_depth),
         Stage::Spec => build_for_spec(graph, node_id, max_nodes, max_node_depth),
         Stage::Iface => build_for_iface(graph, node_id),
         Stage::Tests => build_for_tests(graph, node_id),
@@ -327,6 +331,44 @@ pub fn build_for_stage(
         Stage::Debug => build_for_debug(graph, node_id),
         Stage::Opt => build_for_impl(graph, node_id), // same surface as impl
     }
+}
+
+/// Build the architect-stage context bundle. Minimal — the architect
+/// just needs the budget (so it knows how many nodes/depth it has).
+/// The Project mission is prepended by the engine, so we don't add it
+/// here.
+pub fn build_for_architect(
+    graph: &NodeGraph,
+    node_id: NodeId,
+    max_nodes: usize,
+    max_node_depth: usize,
+) -> ContextBundle {
+    let mut bundle = ContextBundle::new();
+    let Some(node) = graph.get(node_id) else {
+        return bundle;
+    };
+    bundle.push(
+        "Architect node",
+        format!(
+            "**root**: `{}`\n**description (seeded from problem.md)**: {}\n",
+            node.name, node.description
+        ),
+    );
+    bundle.push(
+        "Architecture budget",
+        format!(
+            "You may submit up to **{}** nodes total (currently {} = just the \
+             root), and the tree may go up to **{}** levels deep below the root.\n\
+             \n\
+             Aim shallower-and-broader. Most nodes are leaves. Only set \
+             `crate_boundary: true` for major top-level subsystems — most \
+             children are modules within their parent's crate.\n",
+            max_nodes,
+            graph.len(),
+            max_node_depth
+        ),
+    );
+    bundle
 }
 
 // ---- helpers ----

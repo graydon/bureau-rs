@@ -21,6 +21,8 @@
 //! by `node_context`; writes go through these slot-fillers.
 
 use crate::graph::{Node, NodeGraph, NodeId, Stage};
+#[cfg(test)]
+use crate::graph::StageState;
 use crate::node_validate::{self, ValidateError};
 use crate::render::{self, Layout};
 use anyhow::Result;
@@ -337,13 +339,11 @@ pub struct SubmitSpecArgs {
     /// rationale only this node's later writers will see.
     #[serde(default)]
     pub private: Option<String>,
-    /// New child nodes to create under THIS node. Omit (or empty) for
-    /// a leaf. The schema hides this field entirely when the framework
-    /// has no room for more children.
-    #[serde(default)]
-    pub children: Vec<ChildDecl>,
     /// Existing node names that THIS node should depend on. Adds dep
-    /// edges from the current node; does not create nodes.
+    /// edges from the current node; does NOT create nodes (the architect
+    /// stage already laid out the tree). Adding a NEW dep here triggers
+    /// a cascade-reset of every dependent of this node (their
+    /// iface/tests/impl assumptions may have changed).
     #[serde(default)]
     pub deps: Vec<String>,
 }
@@ -354,28 +354,15 @@ pub struct SubmitSpecOk {
     pub public_lines: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_bytes: Option<u64>,
-    pub children_created: Vec<NodeIdRef>,
     pub deps_added: Vec<NodeIdRef>,
+    /// Names of nodes whose post-architect stages were reset because of
+    /// new dep edges added by this submission. The framework will re-run
+    /// spec/iface/etc. for these nodes.
+    pub cascade_reset: Vec<String>,
 }
 
 pub struct SubmitSpecTool {
     pub ctx: Arc<TaskCtx>,
-}
-
-impl SubmitSpecTool {
-    /// Whether this stage may decompose right now. False once the graph
-    /// has hit the node-count cap or this node is at the depth cap.
-    fn decomposition_allowed(&self) -> bool {
-        let g = self.ctx.graph.lock();
-        if g.len() >= self.ctx.max_nodes {
-            return false;
-        }
-        let depth = g.ancestors(self.ctx.node_id, true).len().saturating_sub(1);
-        if depth + 1 > self.ctx.max_node_depth {
-            return false;
-        }
-        true
-    }
 }
 
 impl Tool for SubmitSpecTool {
@@ -385,71 +372,35 @@ impl Tool for SubmitSpecTool {
     type Output = SubmitSpecOk;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        // Build the schema with `children` only when decomposition is
-        // allowed. Model can't add children it can't see in the schema.
-        let mut props = serde_json::Map::new();
-        props.insert("public".into(), json!({
-            "type": "string",
-            "description": format!(
-                "Public spec markdown — REQUIRED. Cap {} lines. Audience: \
-                 dependents and downstream stages.",
-                self.ctx.max_spec_section_lines
-            ),
-        }));
-        props.insert("private".into(), json!({
-            "type": "string",
-            "description": format!(
-                "Private spec markdown — OPTIONAL. Cap {} lines. Audience: \
-                 only this node's own iface/impl writers. Implementation \
-                 notes, design rationale, alternatives considered.",
-                self.ctx.max_spec_section_lines
-            ),
-        }));
-        if self.decomposition_allowed() {
-            props.insert("children".into(), json!({
-                "type": "array",
-                "description": "OPTIONAL. New child nodes to create under THIS \
-                                node. Omit or [] for a leaf. Most nodes are leaves.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "snake_case Rust ident"},
-                        "description": {"type": "string"},
-                        "deps": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Names this child depends on (existing nodes or earlier siblings in this call)."
-                        },
-                        "crate_boundary": {
-                            "type": "boolean",
-                            "default": false,
-                            "description": "true ONLY at major subsystem boundaries that need their own Cargo crate. Default false."
-                        }
-                    },
-                    "required": ["name", "description"]
-                }
-            }));
-        }
-        props.insert("deps".into(), json!({
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "OPTIONAL. Names of existing graph nodes that THIS node should depend on."
-        }));
-        // Description: switch the children-related blurb based on whether
-        // the schema even includes the field. Don't tell the model about
-        // a knob it doesn't have.
-        let limits = self.ctx.prompt_limits();
-        let description = if self.decomposition_allowed() {
-            tool_description(Self::NAME, limits)
-        } else {
-            submit_spec_description_leaf_only(limits)
-        };
+        let max_spec = self.ctx.max_spec_section_lines;
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description,
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
             parameters: json!({
                 "type": "object",
-                "properties": props,
+                "properties": {
+                    "public": {
+                        "type": "string",
+                        "description": format!(
+                            "Public spec markdown — REQUIRED, ≤{max_spec} lines. \
+                             Audience: dependents and downstream stages."
+                        ),
+                    },
+                    "private": {
+                        "type": "string",
+                        "description": format!(
+                            "Private spec markdown — OPTIONAL, ≤{max_spec} lines. \
+                             Audience: only this node's own iface/impl writers."
+                        ),
+                    },
+                    "deps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "OPTIONAL. Names of existing graph nodes that \
+                                        THIS node should depend on. Adding a NEW dep \
+                                        triggers a cascade-reset of dependents."
+                    }
+                },
                 "required": ["public"]
             }),
         }
@@ -464,44 +415,14 @@ impl Tool for SubmitSpecTool {
     }
 }
 
-/// `submit_spec` description used when the decomposition cap is exhausted
-/// — the schema for this turn does NOT include `children`, so the prose
-/// shouldn't mention it as an option either. The model is told plainly
-/// that this node will be a leaf.
-fn submit_spec_description_leaf_only(limits: PromptLimits) -> String {
-    let max_spec = limits.max_spec_section_lines;
-    let max_file = limits.max_file_lines;
-    format!(
-        "Submit THIS node's spec — the spec stage's whole writer output in ONE call. \
-        The decomposition cap is exhausted for this turn (either the node-count cap \
-        or the depth cap), so this node MUST be a LEAF — no children. The schema \
-        accordingly does not offer a `children` field.\n\
-        \n\
-        Fields:\n\
-        - `public` (REQUIRED, ≤{max_spec} lines) — markdown describing what this \
-          node DOES, exposes, and guarantees. Audience: dependents and downstream \
-          stages. Suggested sections: `## Goal`, `## API`, `## Invariants`, \
-          `## Out of scope`.\n\
-        - `private` (optional, ≤{max_spec} lines) — implementation notes / \
-          rationale for this node's own future iface/impl writers. Skip if there's \
-          nothing worth recording.\n\
-        - `deps` (optional) — names of existing graph nodes that THIS node should \
-          depend on. Cycle-checked at submit time.\n\
-        \n\
-        (Per-file cap for code is {max_file} lines — describe an API the iface \
-        stage can fit in that.)"
-    )
-}
-
-/// Apply the composite `submit_spec` submission. Validates fully before
-/// mutating so a failure mid-way doesn't leave the graph half-changed.
+/// Apply the spec submission. Validates fully before mutating.
 fn submit_spec_apply(
     ctx: &Arc<TaskCtx>,
     args: SubmitSpecArgs,
 ) -> Result<SubmitSpecOk, ToolFailure> {
     ctx.require_stage(SubmitSpecTool::NAME, &[Stage::Spec])?;
 
-    // ---- 1. Validate sizes (public required, private optional) ----
+    // ---- Validate sizes (public required, private optional) ----
     let public_lines = args.public.lines().count();
     if public_lines > ctx.max_spec_section_lines {
         return Err(ToolFailure::FileTooLarge(
@@ -512,7 +433,8 @@ fn submit_spec_apply(
     if args.public.trim().is_empty() {
         return Err(ToolFailure::Subtask(
             "submit_spec: `public` must be non-empty markdown describing what \
-             this node does".into(),
+             this node does"
+                .into(),
         ));
     }
     let priv_lines = args.private.as_deref().map(|s| s.lines().count());
@@ -523,52 +445,13 @@ fn submit_spec_apply(
     }
 
     let mut g = ctx.graph.lock();
-    let parent_id = ctx.node_id;
-    let parent_name = g
-        .get(parent_id)
-        .map(|n| n.name.clone())
-        .unwrap_or_default();
+    let self_id = ctx.node_id;
+    let self_name = g.get(self_id).map(|n| n.name.clone()).unwrap_or_default();
 
-    // ---- 2. Validate decomposition cap (only matters if children present) ----
-    let cur_nodes = g.len();
-    let new_count = args.children.len();
-    let remaining = ctx.max_nodes.saturating_sub(cur_nodes);
-    if new_count > remaining {
-        let msg = if remaining == 0 {
-            format!(
-                "ABANDON CHILDREN — DO NOT RETRY with children. The node-count \
-                 cap ({}) is fully exhausted; this graph cannot accept ANY new \
-                 children. Resubmit `submit_spec` WITHOUT the `children` field, \
-                 keeping `public` and the rest. Treat this node as a leaf.",
-                ctx.max_nodes
-            )
-        } else {
-            format!(
-                "submit_spec rejected — you asked for {new_count} children but \
-                 only {remaining} slot(s) remain (cap {}). Either resubmit with \
-                 AT MOST {remaining} children (drop the less-essential ones), \
-                 OR resubmit without `children` and treat this node as a leaf.",
-                ctx.max_nodes
-            )
-        };
-        return Err(ToolFailure::Subtask(msg));
-    }
-    let parent_depth = g.ancestors(parent_id, true).len().saturating_sub(1);
-    let child_depth = parent_depth + 1;
-    if !args.children.is_empty() && child_depth > ctx.max_node_depth {
-        return Err(ToolFailure::Subtask(format!(
-            "ABANDON CHILDREN — DO NOT RETRY with children. Children of this \
-             node would land at depth {child_depth}, past the depth cap of {}. \
-             Resubmit `submit_spec` WITHOUT `children` — this node must be a \
-             leaf.",
-            ctx.max_node_depth
-        )));
-    }
-
-    // ---- 3. Validate `deps` (current-node-to-existing edges) ----
+    // ---- Validate `deps` (resolve names to ids, check self-dep) ----
     let mut deps_resolved: Vec<NodeId> = Vec::new();
     for name in &args.deps {
-        if name == &parent_name {
+        if name == &self_name {
             return Err(ToolFailure::Subtask(format!(
                 "deps: '{name}' is THIS node — a node cannot depend on itself"
             )));
@@ -579,105 +462,56 @@ fn submit_spec_apply(
         deps_resolved.push(id);
     }
 
-    // ---- 4. Validate children + classify their per-child deps ----
-    #[derive(Clone)]
-    enum DepRef {
-        Existing(NodeId),
-        Sibling(String),
-    }
-    let new_names: HashSet<&str> = args.children.iter().map(|c| c.name.as_str()).collect();
-    if new_names.len() != args.children.len() {
-        return Err(ToolFailure::Subtask(
-            "duplicate child names in this submit_spec call".into(),
-        ));
-    }
-    let mut planned: Vec<(ChildDecl, Vec<DepRef>)> = Vec::new();
-    let mut created_so_far: HashSet<String> = HashSet::new();
-    for child in &args.children {
-        if !is_valid_ident(&child.name) {
-            return Err(ToolFailure::Subtask(format!(
-                "child name '{}' is not a valid Rust identifier",
-                child.name
-            )));
-        }
-        let mut deps: Vec<DepRef> = Vec::new();
-        for dep_name in &child.deps {
-            if dep_name == &child.name {
-                return Err(ToolFailure::Subtask(format!(
-                    "child '{name}' lists itself in its own `deps` — that's a \
-                     self-loop. To declare an edge FROM the current parent node \
-                     TO this child or any other existing node, use the top-level \
-                     `deps` field of submit_spec instead.",
-                    name = child.name
-                )));
-            }
-            if created_so_far.contains(dep_name) {
-                deps.push(DepRef::Sibling(dep_name.clone()));
-            } else if new_names.contains(dep_name.as_str()) {
-                return Err(ToolFailure::Subtask(format!(
-                    "child '{}' references later sibling '{}'; reorder so the \
-                     dep comes first",
-                    child.name, dep_name
-                )));
-            } else {
-                let id = g.find_by_name(dep_name).map(|n| n.id).ok_or_else(|| {
-                    ToolFailure::Subtask(format!(
-                        "child '{}': no existing node named '{}'",
-                        child.name, dep_name
-                    ))
-                })?;
-                deps.push(DepRef::Existing(id));
-            }
-        }
-        planned.push((child.clone(), deps));
-        created_so_far.insert(child.name.clone());
-    }
-
-    // ---- 5. Apply (validation passed; mutate) ----
+    // ---- Apply: write spec content, add dep edges, cascade-reset ----
     let public_bytes = args.public.len() as u64;
     let private_bytes = args.private.as_ref().map(|p| p.len() as u64);
     {
-        let n = g.get_mut(parent_id).ok_or_else(|| {
-            ToolFailure::Other(format!("node {} missing", parent_id))
-        })?;
+        let n = g
+            .get_mut(self_id)
+            .ok_or_else(|| ToolFailure::Other(format!("node {self_id} missing")))?;
         n.spec_public_md = Some(args.public);
         if let Some(p) = args.private {
             n.spec_private_md = Some(p);
         }
         n.updated_at = Utc::now();
     }
+    // Add dep edges. Existing edges are no-ops (add_dep dedupes); new
+    // edges trigger cascade-reset.
+    let prev_deps: HashSet<NodeId> = g
+        .get(self_id)
+        .map(|n| n.deps.iter().copied().collect())
+        .unwrap_or_default();
     let mut deps_added = Vec::new();
-    for to in deps_resolved {
-        g.add_dep(parent_id, to)?;
-        let n = g.get(to).unwrap();
+    let mut new_edges = false;
+    for to in &deps_resolved {
+        if !prev_deps.contains(to) {
+            new_edges = true;
+        }
+        g.add_dep(self_id, *to)?;
+        let n = g.get(*to).unwrap();
         deps_added.push(NodeIdRef {
             id: n.id.to_string(),
             name: n.name.clone(),
         });
     }
-    let mut name_to_id: std::collections::HashMap<String, NodeId> =
-        std::collections::HashMap::new();
-    let mut children_created = Vec::new();
-    for (child, dep_refs) in planned {
-        let mut node = Node::new(&child.name, &child.description);
-        node.crate_boundary = child.crate_boundary;
-        let new_id = g.add_child(parent_id, node)?;
-        name_to_id.insert(child.name.clone(), new_id);
-        for dep_ref in dep_refs {
-            let dep_id = match dep_ref {
-                DepRef::Existing(id) => id,
-                DepRef::Sibling(name) => *name_to_id.get(&name).ok_or_else(|| {
-                    ToolFailure::Subtask(format!(
-                        "internal: sibling '{name}' should have been created already"
-                    ))
-                })?,
-            };
-            g.add_dep(new_id, dep_id)?;
+
+    // Cascade reset: any node that transitively depends on THIS node
+    // gets its post-architect stages reset (their assumptions about
+    // this node's iface may have changed). We DON'T reset this node
+    // itself — its spec stage just succeeded.
+    let mut cascade_reset = Vec::new();
+    if new_edges {
+        let closure = g.reverse_dep_closure(self_id);
+        for id in closure {
+            if id == self_id {
+                continue; // don't undo our own success
+            }
+            let name = g.get(id).map(|n| n.name.clone()).unwrap_or_default();
+            if let Some(n) = g.get_mut(id) {
+                n.stages.reset_post_architect();
+            }
+            cascade_reset.push(name);
         }
-        children_created.push(NodeIdRef {
-            id: new_id.to_string(),
-            name: child.name,
-        });
     }
 
     drop(g);
@@ -686,8 +520,8 @@ fn submit_spec_apply(
         public_bytes,
         public_lines,
         private_bytes,
-        children_created,
         deps_added,
+        cascade_reset,
     })
 }
 
@@ -927,6 +761,334 @@ pub struct NodeIdRef {
     pub name: String,
 }
 
+// --------------------------------------------------------------------------
+// submit_architecture  (architect stage — builds the whole tree in one shot)
+// --------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ArchNode {
+    /// snake_case Rust ident; unique among siblings.
+    pub name: String,
+    /// One-sentence description. Read by every dependent's prompt.
+    pub description: String,
+    #[serde(default)]
+    pub crate_boundary: bool,
+    /// Names of OTHER nodes anywhere in the tree this node depends on.
+    /// References resolve after the full tree is built.
+    #[serde(default)]
+    pub deps: Vec<String>,
+    /// Recursive children.
+    #[serde(default)]
+    pub children: Vec<ArchNode>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ExternalCrateDep {
+    /// crates.io name (e.g. `serde`, `tokio`, `rustls`).
+    pub name: String,
+    /// One-sentence reason this is needed.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether to enable default features.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SubmitArchitectureArgs {
+    /// Top-level children of the workspace root node, recursively
+    /// describing the entire tree.
+    pub children: Vec<ArchNode>,
+    /// Anticipated external Cargo dependencies the project will need.
+    /// Stored on the root node for later use; not enforced.
+    #[serde(default)]
+    pub external_deps: Vec<ExternalCrateDep>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SubmitArchitectureOk {
+    pub nodes_created: usize,
+    pub deps_added: usize,
+    pub external_deps: usize,
+}
+
+pub struct SubmitArchitectureTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for SubmitArchitectureTool {
+    const NAME: &'static str = "submit_architecture";
+    type Error = ToolFailure;
+    type Args = SubmitArchitectureArgs;
+    type Output = SubmitArchitectureOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "children": {
+                        "type": "array",
+                        "description": "Top-level children of the workspace root, recursively describing the whole tree.",
+                        "items": arch_node_schema(),
+                    },
+                    "external_deps": {
+                        "type": "array",
+                        "description": "Anticipated external Cargo dependencies. Optional.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "features": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["children"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<SubmitArchitectureOk, _>(e));
+        }
+        let r = submit_architecture_apply(&self.ctx, args);
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+/// Recursive JSON schema fragment describing one `ArchNode`. We define
+/// it once here and reference it from `submit_architecture` and (in
+/// principle) anywhere else that wants to describe the recursive shape.
+fn arch_node_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "snake_case Rust ident; unique among siblings."},
+            "description": {"type": "string", "description": "One short sentence describing this node's purpose."},
+            "crate_boundary": {
+                "type": "boolean",
+                "default": false,
+                "description": "true ONLY at major top-level subsystems that need their own Cargo crate. Most should be false."
+            },
+            "deps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Names of OTHER nodes (anywhere in the tree) this node depends on."
+            },
+            "children": {
+                "type": "array",
+                "items": {"$ref": "#/definitions/ArchNode"},
+                "description": "Recursive children of this node. Most leaves have an empty list."
+            }
+        },
+        "required": ["name", "description"]
+    })
+}
+
+fn submit_architecture_apply(
+    ctx: &Arc<TaskCtx>,
+    args: SubmitArchitectureArgs,
+) -> Result<SubmitArchitectureOk, ToolFailure> {
+    ctx.require_stage(SubmitArchitectureTool::NAME, &[Stage::Architect])?;
+
+    // 1. Flatten the recursive children into a list of (name, parent_name)
+    //    plus a list of dep edges. Validate names + structure.
+    struct Pending<'a> {
+        decl: &'a ArchNode,
+        parent_path: Vec<String>,
+    }
+    let mut flat: Vec<(Vec<String>, &ArchNode)> = Vec::new();
+    let mut stack: Vec<Pending> = args
+        .children
+        .iter()
+        .map(|c| Pending {
+            decl: c,
+            parent_path: Vec::new(),
+        })
+        .collect();
+    while let Some(p) = stack.pop() {
+        flat.push((p.parent_path.clone(), p.decl));
+        for child in &p.decl.children {
+            let mut sub = p.parent_path.clone();
+            sub.push(p.decl.name.clone());
+            stack.push(Pending {
+                decl: child,
+                parent_path: sub,
+            });
+        }
+    }
+    // (Empty children list is valid — a single-crate project with no
+    // sub-modules is a legitimate output. The post-stage check in the
+    // engine only requires that the architect ran and called the tool;
+    // it doesn't require a non-trivial tree.)
+
+    // 2. Validate names: each must be a valid snake_case Rust ident, and
+    //    NAMES MUST BE GLOBALLY UNIQUE so deps can be resolved by name
+    //    without ambiguity.
+    let mut name_seen: HashSet<String> = HashSet::new();
+    for (_path, decl) in &flat {
+        if !is_valid_ident(&decl.name) {
+            return Err(ToolFailure::Subtask(format!(
+                "submit_architecture: node name '{}' is not a valid Rust identifier",
+                decl.name
+            )));
+        }
+        if !name_seen.insert(decl.name.clone()) {
+            return Err(ToolFailure::Subtask(format!(
+                "submit_architecture: node name '{}' is used more than once. Architect-stage \
+                 names must be globally unique so deps can be resolved unambiguously.",
+                decl.name
+            )));
+        }
+    }
+
+    // 3. Apply: build NodeIds, insert into graph as children of root.
+    //    We have to build top-down so parents exist before their kids.
+    flat.sort_by_key(|(path, _)| path.len());
+
+    let mut g = ctx.graph.lock();
+    let root_id = g
+        .root
+        .ok_or_else(|| ToolFailure::Other("graph has no root".into()))?;
+    let root_name = g.get(root_id).unwrap().name.clone();
+    if name_seen.contains(&root_name) {
+        return Err(ToolFailure::Subtask(format!(
+            "submit_architecture: node name '{root_name}' clashes with the workspace \
+             root's name. Pick a different name for that child."
+        )));
+    }
+    // Map from name → NodeId for resolving deps later.
+    let mut by_name: std::collections::HashMap<String, NodeId> =
+        std::collections::HashMap::new();
+    by_name.insert(root_name.clone(), root_id);
+
+    let mut nodes_created = 0usize;
+    for (parent_path, decl) in &flat {
+        let parent_id = if parent_path.is_empty() {
+            root_id
+        } else {
+            // The immediate parent is the last segment of parent_path.
+            let p = parent_path.last().unwrap();
+            *by_name.get(p).ok_or_else(|| {
+                ToolFailure::Subtask(format!(
+                    "submit_architecture: internal — parent '{p}' not yet created"
+                ))
+            })?
+        };
+        let mut node = Node::new(&decl.name, &decl.description);
+        node.crate_boundary = decl.crate_boundary;
+        let new_id = g.add_child(parent_id, node)?;
+        by_name.insert(decl.name.clone(), new_id);
+        nodes_created += 1;
+    }
+
+    // 4. Apply dep edges (after all nodes exist). These cross subtrees.
+    let mut deps_added = 0usize;
+    for (_path, decl) in &flat {
+        let from = *by_name.get(&decl.name).expect("just created");
+        for dep_name in &decl.deps {
+            if dep_name == &decl.name {
+                return Err(ToolFailure::Subtask(format!(
+                    "submit_architecture: node '{}' lists itself in its own `deps`",
+                    decl.name
+                )));
+            }
+            let to = *by_name.get(dep_name).ok_or_else(|| {
+                ToolFailure::Subtask(format!(
+                    "submit_architecture: node '{}' deps on unknown node '{}'. \
+                     All dep names must reference nodes declared elsewhere in this same call.",
+                    decl.name, dep_name
+                ))
+            })?;
+            g.add_dep(from, to)?;
+            deps_added += 1;
+        }
+    }
+
+    // 5. External deps: stored on the root node's description tail for
+    //    now (the renderer will pick them up later when crate Cargo.tomls
+    //    learn about external deps). Just count them so the model gets
+    //    feedback.
+    let external_deps = args.external_deps.len();
+    if external_deps > 0 {
+        let r = g.get_mut(root_id).unwrap();
+        let mut note = String::from("\n\n## External crate deps (architect)\n\n");
+        for dep in &args.external_deps {
+            note.push_str(&format!("- `{}` — {}\n", dep.name, dep.reason));
+        }
+        // Append to spec_private_md so it shows up in private notes
+        // without polluting the public spec.
+        let prev = r.spec_private_md.take().unwrap_or_default();
+        r.spec_private_md = Some(prev + &note);
+    }
+
+    drop(g);
+    ctx.render_after_write()?;
+    Ok(SubmitArchitectureOk {
+        nodes_created,
+        deps_added,
+        external_deps,
+    })
+}
+
+/// Resolve a model-supplied `package` arg to a REAL workspace member's
+/// crate name. Returns `None` to skip the `-p` flag entirely (single-crate
+/// mode), `Some(name)` to use a valid workspace package. If the model
+/// passed something invalid (a module name, a typo'd crate name), we fall
+/// back to the containing crate of the current node — that's almost
+/// always what they meant.
+fn resolve_cargo_package(ctx: &TaskCtx, requested: Option<&str>) -> Option<String> {
+    let g = ctx.graph.lock();
+    // In single-crate layout, cargo doesn't need `-p`; the workdir IS
+    // the one and only package.
+    if matches!(ctx.layout, crate::render::Layout::SingleCrate) {
+        return None;
+    }
+    // Workspace mode: collect the names of crate-boundary nodes (these
+    // are the workspace members).
+    let mut members: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in g.iter() {
+        if n.crate_boundary {
+            members.insert(n.name.clone());
+        }
+    }
+    // 1. If the model supplied a name and it's a real member, use it.
+    if let Some(p) = requested {
+        if members.contains(p) {
+            return Some(p.to_string());
+        }
+        // Else: the model handed us a non-package name (typically a
+        // module path inside a crate). Fall through to the default —
+        // log a hint so the operator can spot misuse but don't fail
+        // the call (the model would just retry uselessly).
+        tracing::debug!(
+            "cargo `package` arg `{p}` is not a workspace member; \
+             falling back to current node's crate"
+        );
+    }
+    // 2. Default: the crate that owns the current node.
+    if let Some(node) = g.get(ctx.node_id) {
+        let crate_id = crate::render::containing_crate(&g, node);
+        if let Some(crate_node) = g.get(crate_id) {
+            if members.contains(&crate_node.name) {
+                return Some(crate_node.name.clone());
+            }
+            // Crate-boundary node exists but isn't in members? (root,
+            // perhaps — root is technically a crate boundary in
+            // workspace mode). Still pass its name; cargo will accept
+            // it if it's a real package, otherwise omit.
+            return Some(crate_node.name.clone());
+        }
+    }
+    None
+}
+
 fn is_valid_ident(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -1047,9 +1209,14 @@ async fn run_cargo(
 ) -> Result<CargoOk, ToolFailure> {
     let start = std::time::Instant::now();
     let mut args: Vec<String> = kind.args().iter().map(|s| s.to_string()).collect();
-    if let Some(p) = package {
+    // Resolve `-p <name>` to a REAL workspace member. Models often pass
+    // module names (not crates) here; cargo would reject those with a
+    // confusing error. We map invalid names to the current node's
+    // containing crate, and skip -p entirely in single-crate mode where
+    // cargo doesn't need it.
+    if let Some(p) = resolve_cargo_package(ctx, package) {
         args.push("-p".to_string());
-        args.push(p.to_string());
+        args.push(p);
     }
     if !test_filters.is_empty()
         && matches!(
@@ -1267,9 +1434,9 @@ async fn run_clippy(ctx: &TaskCtx, package: Option<&str>) -> Result<CargoOk, Too
         "--message-format=json".to_string(),
         "--no-deps".to_string(),
     ];
-    if let Some(p) = package {
+    if let Some(p) = resolve_cargo_package(ctx, package) {
         args.push("-p".to_string());
-        args.push(p.to_string());
+        args.push(p);
     }
     args.push("--".to_string());
     args.push("-D".to_string());
@@ -1378,16 +1545,47 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
     let max_file = limits.max_file_lines;
     let max_spec = limits.max_spec_section_lines;
     match name {
+        "submit_architecture" => format!(
+            "Build the WHOLE project tree in ONE call. The Architect stage runs once, \
+            on the root node, before any per-node stages. You produce the SKELETON: \
+            crates, modules, parent-child relationships, cross-node dependency edges, \
+            anticipated external Cargo deps. You do NOT write specs, traits, or code \
+            here — those come later, run per-node, on the graph you produce.\n\
+            \n\
+            Fields:\n\
+            - `children` (REQUIRED) — top-level children of the workspace root, \
+              recursively describing the whole tree. Each node has:\n\
+                · `name` — snake_case Rust ident, GLOBALLY unique across the whole \
+                  tree so deps can be resolved unambiguously by name.\n\
+                · `description` — one short sentence on what the node is for.\n\
+                · `crate_boundary` (default false) — set true ONLY at major top-level \
+                  subsystem boundaries that need their own Cargo crate. Most should \
+                  be false: children become modules within their parent's crate.\n\
+                · `deps` — names of OTHER nodes (anywhere in the tree) this node \
+                  depends on. Resolved after the full tree is built; cycle-checked \
+                  at the node AND crate level.\n\
+                · `children` — recursive children. Most leaves have an empty list.\n\
+            - `external_deps` (optional) — anticipated crates.io dependencies the \
+              project will need, with a one-sentence reason. Stored for downstream \
+              stages; not a binding contract.\n\
+            \n\
+            Sizing: the framework caps total node count and depth (visible in the \
+            Decomposition budget section). Aim shallower-and-broader rather than \
+            deeper-and-narrower. Each leaf module ≈ one Rust file (per-file cap \
+            {max_file} lines)."
+        ),
+
         "submit_spec" => format!(
             "Submit THIS node's spec — the spec stage's whole writer output in ONE call. \
-            Required: `public`. Optional: `private`, `children`, `deps`. Call once per \
-            spec stage.\n\
+            Required: `public`. Optional: `private`, `deps`. Call once per spec stage.\n\
             \n\
             The spec is a SPECIFICATION DOCUMENT describing the software, NOT a literate \
             Rust file. Specs talk about data shapes, ownership, concurrency, error model, \
             invariants, I/O surfaces — at the level of REQUIREMENTS and ARCHITECTURE. \
             The iface stage is what writes Rust traits and signatures; do not preempt \
-            that here.\n\
+            that here. THIS STAGE CANNOT CREATE NEW NODES — the architect already laid \
+            out the tree. The most you can do to the graph is add new dep edges via the \
+            `deps` field if you discover one was missing.\n\
             \n\
             Fields:\n\
             - `public` (REQUIRED, ≤{max_spec} lines) — the INTERFACE specification: \
@@ -1400,20 +1598,11 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
               specification: HOW the node is built internally — backends, internal \
               data structures, concurrency, algorithmic notes, tradeoffs considered. \
               Audience: this node's own future iface/impl writers. Other nodes never \
-              see this. NOT a changelog of your edits — describe the software's \
-              internals, not the document's history.\n\
-            - `children` (optional; schema only includes this field when the \
-              decomposition cap allows) — list of child nodes to create under THIS \
-              node. Most nodes should be LEAVES. Each child:\n\
-                · `name` — snake_case Rust ident (not CamelCase — that's a type).\n\
-                · `description` — one short sentence.\n\
-                · `deps` — names this child depends on (existing graph nodes or \
-                  earlier siblings in this same call).\n\
-                · `crate_boundary` (default false) — set true ONLY at major top-level \
-                  subsystem boundaries. Most children leave this false; they become \
-                  modules within the parent's crate.\n\
+              see this. NOT a changelog of your edits.\n\
             - `deps` (optional) — names of existing graph nodes that THIS node depends \
-              on. Cycle-checked at submit time at BOTH the node and crate level.\n\
+              on. Adds dep edges to the graph; cycle-checked at the node AND crate \
+              level. Adding a new dep here will RESET this node's dependents back to \
+              re-spec, since their assumptions about this node may have changed.\n\
             \n\
             (Per-file cap for code is {max_file} lines, for context.)"
         ),
@@ -1502,10 +1691,12 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
     use Role::*;
     use Stage::*;
     match (stage, role) {
+        // Architect runs single-shot — only Writer; no critic/reviser/judge.
+        (Architect, Writer) => vec![SubmitArchitectureTool::NAME],
+        (Architect, _) => vec![],
+
         (Spec, Writer) | (Spec, Reviser) => {
-            vec![
-                SubmitSpecTool::NAME,
-            ]
+            vec![SubmitSpecTool::NAME]
         }
         (Spec, Critic) => vec![],
         (Spec, Judge) => vec![SubmitVerdictTool::NAME],
@@ -1603,7 +1794,6 @@ mod tests {
             .call(SubmitSpecArgs {
                 public: "# Spec\n\nDoes the thing.".into(),
                 private: None,
-                children: vec![],
                 deps: vec![],
             })
             .await
@@ -1624,7 +1814,6 @@ mod tests {
         tool.call(SubmitSpecArgs {
             public: "# Spec\n\nDoes the thing.".into(),
             private: Some("# Notes\n\nWhy I chose option B.".into()),
-            children: vec![],
             deps: vec![],
         })
         .await
@@ -1645,7 +1834,6 @@ mod tests {
             .call(SubmitSpecArgs {
                 public: "x".into(),
                 private: None,
-                children: vec![],
                 deps: vec![],
             })
             .await
@@ -1654,45 +1842,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_spec_creates_children_in_one_call() {
-        // The whole point of the composite tool: spec, private, children,
-        // deps all in ONE roundtrip.
-        let (_tmp, graph, _root, ctx) = fixture(Stage::Spec);
+    async fn submit_spec_adding_dep_resets_dependents() {
+        // Architect lays out: root -> a, b. b has no deps. After spec
+        // stage on `b` adds a dep on `a`, `a` doesn't get reset (b is
+        // a's dependent, not the other way around). After spec stage
+        // on `a` adds a dep on... actually let me set this up cleanly.
+        //
+        // root -> a, b. Initially no deps. b's iface/impl are Done.
+        // Now spec on `a` adds dep on `b`. Since b depends on... wait,
+        // b does NOT depend on a here. Let me do:
+        //
+        // root -> a, b. b deps on a (set up). a's spec writer adds a
+        // new dep on... uh, root? Hmm, let me just verify: when a node
+        // gains a new dep, its transitive reverse-dependents reset.
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        let util = g.add_child(root, Node::new("util", "shared")).unwrap();
+        let core = g.add_child(root, Node::new("core", "main logic")).unwrap();
+        let leaf = g.add_child(core, Node::new("leaf", "depends on core")).unwrap();
+        g.add_dep(leaf, core).unwrap();
+        // Pretend leaf, core, util all have iface/impl Done.
+        for id in [util, core, leaf] {
+            let n = g.get_mut(id).unwrap();
+            n.stages.spec = StageState::Done;
+            n.stages.iface = StageState::Done;
+            n.stages.impl_ = StageState::Done;
+        }
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        // Now run a spec stage on `core` that adds a dep on `util`.
+        // `core`'s reverse-deps include `leaf`, so leaf should reset.
+        // `core` itself is NOT reset (its spec just succeeded).
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            core,
+            Stage::Spec,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300,
+            500,
+            64,
+            5,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
         let tool = SubmitSpecTool { ctx };
         let r = tool
             .call(SubmitSpecArgs {
-                public: "# umbrella\n\ncoordinates two children".into(),
+                public: "# core\n\nNow uses util.".into(),
                 private: None,
-                children: vec![
-                    ChildDecl {
-                        name: "alpha".into(),
-                        description: "first".into(),
-                        deps: vec![],
-                        crate_boundary: false,
-                    },
-                    ChildDecl {
-                        name: "beta".into(),
-                        description: "second; depends on alpha".into(),
-                        deps: vec!["alpha".into()],
-                        crate_boundary: false,
-                    },
-                ],
-                deps: vec![],
+                deps: vec!["util".into()],
             })
             .await
             .unwrap();
-        assert_eq!(r.children_created.len(), 2);
+        assert_eq!(r.deps_added.len(), 1);
+        assert!(r.cascade_reset.contains(&"leaf".to_string()));
         let g = graph.lock();
-        assert_eq!(g.len(), 3); // root + alpha + beta
-        let beta = g.find_by_name("beta").unwrap();
-        let alpha = g.find_by_name("alpha").unwrap();
-        assert_eq!(beta.deps, vec![alpha.id]);
+        // leaf's iface should now be NotStarted.
+        assert_eq!(g.get(leaf).unwrap().stages.iface, StageState::NotStarted);
+        // core's spec stays Done (we just ran it).
+        // util untouched.
+        assert_eq!(g.get(util).unwrap().stages.iface, StageState::Done);
     }
 
     #[tokio::test]
-    async fn submit_spec_schema_hides_children_when_at_cap() {
-        // When the cap is exhausted, the schema must not contain the
-        // `children` field — the model literally can't ask for one.
+    async fn submit_architecture_builds_a_full_tree_in_one_call() {
+        // The architect tool: one shot, builds the whole graph.
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "the app")).unwrap();
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            root,
+            Stage::Architect,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300,
+            500,
+            64,
+            5,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let tool = SubmitArchitectureTool { ctx };
+        let r = tool
+            .call(SubmitArchitectureArgs {
+                children: vec![
+                    ArchNode {
+                        name: "util".into(),
+                        description: "shared utilities".into(),
+                        crate_boundary: false,
+                        deps: vec![],
+                        children: vec![],
+                    },
+                    ArchNode {
+                        name: "core".into(),
+                        description: "core logic".into(),
+                        crate_boundary: true,
+                        deps: vec!["util".into()],
+                        children: vec![ArchNode {
+                            name: "engine".into(),
+                            description: "inner engine".into(),
+                            crate_boundary: false,
+                            deps: vec![],
+                            children: vec![],
+                        }],
+                    },
+                ],
+                external_deps: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.nodes_created, 3); // util, core, engine
+        assert_eq!(r.deps_added, 1); // core -> util
+        let g = graph.lock();
+        assert_eq!(g.len(), 4); // root + 3
+        let core = g.find_by_name("core").unwrap();
+        let util = g.find_by_name("util").unwrap();
+        assert_eq!(core.deps, vec![util.id]);
+        assert!(core.crate_boundary);
+        // engine is a child of core
+        let engine = g.find_by_name("engine").unwrap();
+        assert_eq!(engine.parent, Some(core.id));
+    }
+
+    #[tokio::test]
+    async fn submit_architecture_rejects_duplicate_names() {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().to_path_buf();
         let mut g = NodeGraph::new();
@@ -1702,31 +1984,75 @@ mod tests {
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             root,
-            Stage::Spec,
+            Stage::Architect,
             Role::Writer,
             graph.clone(),
             workdir,
             Layout::SingleCrate,
-            300,
-            500,
-            1, // max_nodes — already at cap (1 root)
-            5,
+            300, 500, 64, 5,
             Arc::new(tokio::sync::Mutex::new(())),
         ));
-        let tool = SubmitSpecTool { ctx };
-        let def = tool.definition(String::new()).await;
-        let props = def
-            .parameters
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .unwrap();
-        assert!(props.contains_key("public"), "public is required, must always appear");
-        assert!(props.contains_key("private"), "private is always optional");
-        assert!(props.contains_key("deps"), "deps doesn't add nodes, always allowed");
-        assert!(
-            !props.contains_key("children"),
-            "children must be HIDDEN at cap — got: {props:?}"
-        );
+        let tool = SubmitArchitectureTool { ctx };
+        let err = tool
+            .call(SubmitArchitectureArgs {
+                children: vec![
+                    ArchNode {
+                        name: "x".into(),
+                        description: "first".into(),
+                        crate_boundary: false,
+                        deps: vec![],
+                        children: vec![ArchNode {
+                            name: "x".into(),
+                            description: "duplicate".into(),
+                            crate_boundary: false,
+                            deps: vec![],
+                            children: vec![],
+                        }],
+                    },
+                ],
+                external_deps: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("globally unique"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn submit_architecture_rejects_unknown_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
+        let graph = Arc::new(Mutex::new(g));
+        let ctx = Arc::new(TaskCtx::new(
+            Uuid::new_v4(),
+            root,
+            Stage::Architect,
+            Role::Writer,
+            graph.clone(),
+            workdir,
+            Layout::SingleCrate,
+            300, 500, 64, 5,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        let tool = SubmitArchitectureTool { ctx };
+        let err = tool
+            .call(SubmitArchitectureArgs {
+                children: vec![ArchNode {
+                    name: "a".into(),
+                    description: "deps on missing".into(),
+                    crate_boundary: false,
+                    deps: vec!["nonexistent".into()],
+                    children: vec![],
+                }],
+                external_deps: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown node"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -1772,177 +2098,9 @@ mod tests {
         assert!(r2.no_change);
     }
 
-    #[tokio::test]
-    async fn submit_spec_creates_children_with_deps() {
-        let (_tmp, graph, root, ctx) = fixture(Stage::Spec);
-        // Pre-existing utility node so a child can declare dep on it.
-        graph
-            .lock()
-            .add_child(root, Node::new("util", "shared"))
-            .unwrap();
-        let tool = SubmitSpecTool { ctx };
-        let r = tool
-            .call(SubmitSpecArgs {
-                public: "# umbrella\n\nFrobs widgets via util".into(),
-                private: None,
-                children: vec![ChildDecl {
-                    name: "frob".into(),
-                    description: "frobs widgets".into(),
-                    deps: vec!["util".into()],
-                    crate_boundary: false,
-                }],
-                deps: vec![],
-            })
-            .await
-            .unwrap();
-        assert_eq!(r.children_created.len(), 1);
-        let g = graph.lock();
-        let frob = g.find_by_name("frob").unwrap();
-        assert_eq!(frob.deps.len(), 1);
-        assert_eq!(g.get(frob.deps[0]).unwrap().name, "util");
-    }
-
-    #[tokio::test]
-    async fn submit_spec_unknown_child_dep_fails_atomically() {
-        let (_tmp, graph, _root, ctx) = fixture(Stage::Spec);
-        let tool = SubmitSpecTool { ctx };
-        let err = tool
-            .call(SubmitSpecArgs {
-                public: "# x".into(),
-                private: None,
-                children: vec![ChildDecl {
-                    name: "x".into(),
-                    description: "".into(),
-                    deps: vec!["nonexistent".into()],
-                    crate_boundary: false,
-                }],
-                deps: vec![],
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolFailure::Subtask(_)));
-        // Atomic: no node created, public spec NOT written.
-        assert_eq!(graph.lock().len(), 1);
-        assert_eq!(graph.lock().iter().next().unwrap().spec_public_md, None);
-    }
-
-    #[tokio::test]
-    async fn submit_spec_invalid_child_name_rejected() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Spec);
-        let tool = SubmitSpecTool { ctx };
-        let err = tool
-            .call(SubmitSpecArgs {
-                public: "# x".into(),
-                private: None,
-                children: vec![ChildDecl {
-                    name: "1bad".into(),
-                    description: "".into(),
-                    deps: vec![],
-                    crate_boundary: false,
-                }],
-                deps: vec![],
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolFailure::Subtask(_)));
-    }
-
-    #[tokio::test]
-    async fn submit_spec_rejects_when_max_nodes_would_be_exceeded() {
-        // fixture() seeds 1 root node. Build a ctx with max_nodes=2: one
-        // child is OK, two children at once is rejected atomically.
-        let tmp = tempfile::tempdir().unwrap();
-        let workdir = tmp.path().to_path_buf();
-        let mut g = NodeGraph::new();
-        let root = g.insert_root(Node::new("app", "the app")).unwrap();
-        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
-        let ctx = Arc::new(TaskCtx::new(
-            Uuid::new_v4(),
-            root,
-            Stage::Spec,
-            Role::Writer,
-            graph.clone(),
-            workdir,
-            Layout::SingleCrate,
-            300,
-            500,
-            2, // max_nodes — only one more child fits
-            5,
-            Arc::new(tokio::sync::Mutex::new(())),
-        ));
-        let tool = SubmitSpecTool { ctx };
-        let r = tool
-            .call(SubmitSpecArgs {
-                public: "# x".into(),
-                private: None,
-                children: vec![
-                    ChildDecl {
-                        name: "a".into(),
-                        description: "".into(),
-                        deps: vec![],
-                        crate_boundary: false,
-                    },
-                    ChildDecl {
-                        name: "b".into(),
-                        description: "".into(),
-                        deps: vec![],
-                        crate_boundary: false,
-                    },
-                ],
-                deps: vec![],
-            })
-            .await;
-        let err = r.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("ABANDON") || msg.contains("Either"), "got: {msg}");
-        assert!(msg.contains("cap"), "should mention the cap: {msg}");
-        assert_eq!(graph.lock().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn submit_spec_rejects_when_max_node_depth_would_be_exceeded() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workdir = tmp.path().to_path_buf();
-        let mut g = NodeGraph::new();
-        let root = g.insert_root(Node::new("app", "")).unwrap();
-        let mid = g.add_child(root, Node::new("mid", "")).unwrap();
-        render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
-        let ctx = Arc::new(TaskCtx::new(
-            Uuid::new_v4(),
-            mid,
-            Stage::Spec,
-            Role::Writer,
-            graph.clone(),
-            workdir,
-            Layout::SingleCrate,
-            300,
-            500,
-            64,
-            1, // max_node_depth
-            Arc::new(tokio::sync::Mutex::new(())),
-        ));
-        let tool = SubmitSpecTool { ctx };
-        let r = tool
-            .call(SubmitSpecArgs {
-                public: "# mid".into(),
-                private: None,
-                children: vec![ChildDecl {
-                    name: "deep".into(),
-                    description: "".into(),
-                    deps: vec![],
-                    crate_boundary: false,
-                }],
-                deps: vec![],
-            })
-            .await;
-        let err = r.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("ABANDON"), "should tell model to abandon: {msg}");
-        assert!(msg.contains("depth cap"), "should mention depth cap: {msg}");
-        assert_eq!(graph.lock().len(), 2);
-    }
+    // (Tests for spec-stage decomposition removed — `submit_spec` no
+    // longer accepts `children`. Decomposition is now exclusively the
+    // architect stage's job; see the architect tests above.)
 
     #[tokio::test]
     async fn submit_verdict_records_into_ctx() {

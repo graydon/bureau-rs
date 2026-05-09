@@ -247,6 +247,53 @@ impl WorktreePool {
         Ok(())
     }
 
+    /// Apply only specific files from the worktree to main, skipping the
+    /// three-way merge entirely. This is the path the engine uses when
+    /// it knows EXACTLY which files this task owns (e.g. spec stage
+    /// owns its node's spec/<path>/public.md, etc.) — copying just
+    /// those files onto main avoids the "two tasks rendered the same
+    /// node's file at different snapshots and now conflict" problem
+    /// that plagues full-tree merges.
+    ///
+    /// `owned_paths` are paths relative to the workdir root. Files that
+    /// don't exist in the worktree are silently skipped.
+    pub async fn apply_to_main(
+        &self,
+        wt: Worktree,
+        owned_paths: &[PathBuf],
+        message: &str,
+    ) -> Result<()> {
+        let _guard = self.main_lock.lock().await;
+        for rel in owned_paths {
+            // Defensive: reject absolute / parent-dir-traversing paths.
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let src = wt.path.join(rel);
+            let dst = self.workspace.root.join(rel);
+            if !src.exists() {
+                continue;
+            }
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating parent of {}", dst.display())
+                })?;
+            }
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+        }
+        // Commit on main if anything actually changed.
+        let made_commit = self.workspace.commit_main(message)?;
+        // Cleanup the worktree regardless.
+        self.cleanup(&wt);
+        let _ = made_commit;
+        Ok(())
+    }
+
     /// Drop a worktree without merging — used on task failure.
     pub async fn abandon(&self, wt: Worktree) -> Result<()> {
         let _guard = self.main_lock.lock().await;

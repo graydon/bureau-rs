@@ -7,7 +7,7 @@ use bureau_rs::engine::Engine;
 use bureau_rs::graph::StageState;
 use bureau_rs::mock_driver::{MockLlmDriver, ScriptedCall};
 use bureau_rs::state::{EngineState, StateHandle};
-use bureau_rs::tools::{ChildDecl, Role};
+use bureau_rs::tools::Role;
 use bureau_rs::graph::Stage;
 use std::sync::Arc;
 
@@ -15,9 +15,18 @@ fn make_config(workdir: std::path::PathBuf, project_name: &str) -> Arc<Config> {
     Arc::new(Config {
         config_dir: workdir.clone(),
         problem: "Build a thing.".to_string(),
+        style: None,
         toml: ConfigToml {
             models: ModelConfig {
-                actor: "mock".into(),
+                default: "mock".into(),
+                architect: None,
+                spec: None,
+                iface: None,
+                tests: None,
+                impl_: None,
+                debug: None,
+                opt: None,
+                writer: None,
                 critic: None,
                 reviser: None,
                 judge: None,
@@ -65,8 +74,13 @@ async fn engine_injects_project_mission_into_root_node_preamble() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
-    // Don't bother completing the pipeline — we just need ONE drive() call
-    // to verify the preamble. Script enough to advance spec.
+    // Architect runs first (single-shot, empty tree is fine for this
+    // test — we just need at least one drive to inspect).
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     driver.script(
         Stage::Spec,
         Role::Writer,
@@ -77,11 +91,11 @@ async fn engine_injects_project_mission_into_root_node_preamble() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
     let _ = engine.run().await;
 
-    // The first call should be (Spec, Actor) on the root.
+    // The first call should be (Architect, Writer) on the root.
     let received = driver.received.lock().clone();
     assert!(!received.is_empty(), "engine should drive at least once");
     let (stage, role, preamble) = &received[0];
-    assert_eq!(*stage, Stage::Spec);
+    assert_eq!(*stage, Stage::Architect);
     assert_eq!(*role, Role::Writer);
     assert!(
         preamble.contains("Project mission"),
@@ -123,36 +137,33 @@ async fn unresolved_tool_failure_triggers_forced_retry_until_resolved() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
-    // Initial actor turn: ONE composite submit_spec carrying a child
-    // with a self-dep — the whole submission fails atomically.
+    // Architect first — give the architect a single-leaf tree so we have
+    // a `core` node to run spec on.
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[(
+            "core",
+            "math primitives",
+        )])],
+    );
+    // Initial spec turn: bad submit_spec (empty public — atomic failure).
     driver.script(
         Stage::Spec,
         Role::Writer,
         vec![ScriptedCall::SubmitSpec {
-            public: "# retry\n\nA tiny crate.".into(),
+            public: "".into(), // invalid — required to be non-empty
             private: None,
-            children: vec![ChildDecl {
-                name: "core".into(),
-                description: "math".into(),
-                deps: vec!["core".into()], // self-dep — fails
-                crate_boundary: false,
-            }],
             deps: vec![],
         }],
     );
-    // Forced retry script: re-call submit_spec, this time with valid args.
+    // Forced retry script: re-call submit_spec with valid args.
     driver.script(
         Stage::Spec,
         Role::Writer,
         vec![ScriptedCall::SubmitSpec {
             public: "# retry\n\nA tiny crate.".into(),
             private: None,
-            children: vec![ChildDecl {
-                name: "core".into(),
-                description: "math".into(),
-                deps: vec![],
-                crate_boundary: false,
-            }],
             deps: vec![],
         }],
     );
@@ -161,33 +172,28 @@ async fn unresolved_tool_failure_triggers_forced_retry_until_resolved() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
     let _ = engine.run().await;
 
-    // Two actor invocations should have happened (initial + 1 forced retry).
+    // Two spec-writer invocations should have happened (initial + retry).
     let received = driver.received.lock().clone();
-    let actor_count = received
+    let spec_writer_drives: Vec<&(Stage, Role, String)> = received
         .iter()
         .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
-        .count();
+        .collect();
     assert!(
-        actor_count >= 2,
-        "expected ≥2 actor drives (initial + forced retry); got {actor_count}: {:?}",
+        spec_writer_drives.len() >= 2,
+        "expected ≥2 spec writer drives (initial + forced retry); got {}: {:?}",
+        spec_writer_drives.len(),
         received.iter().map(|(s, r, _)| (s, r)).collect::<Vec<_>>()
     );
-
-    // The retry preamble should have been the focused RETRY one.
-    let retry_preamble = &received[1].2;
+    // The second spec-writer drive should be the focused RETRY one.
+    let retry_preamble = &spec_writer_drives[1].2;
     assert!(
         retry_preamble.contains("RETRY"),
-        "second actor drive should use the focused retry preamble: {retry_preamble}"
+        "second spec writer drive should use the focused retry preamble: {retry_preamble}"
     );
     assert!(
         retry_preamble.contains("submit_spec"),
         "retry preamble should name the failed tool: {retry_preamble}"
     );
-
-    // After the retry succeeded, the graph should have the child.
-    let g = state.snapshot().graph;
-    let core = g.find_by_name("core");
-    assert!(core.is_some(), "core child should exist after successful retry");
 }
 
 #[tokio::test]
@@ -207,6 +213,11 @@ async fn retry_preamble_truncates_long_args() {
         "trunc".into(),
     ));
     let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     // Force a failure with a big args blob — submit_spec with more lines
     // than max_spec triggers FileTooLarge, and the args (the spec body)
     // are big enough to exercise truncation.
@@ -227,9 +238,14 @@ async fn retry_preamble_truncates_long_args() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
     let _ = engine.run().await;
 
+    // Find the spec-stage retry preamble (architect ran first).
     let received = driver.received.lock().clone();
-    assert!(received.len() >= 2, "should have retried");
-    let retry_preamble = &received[1].2;
+    let spec_drives: Vec<&(Stage, Role, String)> = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
+        .collect();
+    assert!(spec_drives.len() >= 2, "should have retried spec");
+    let retry_preamble = &spec_drives[1].2;
     assert!(
         retry_preamble.contains("TRUNCATED"),
         "retry preamble should mark the truncation: {retry_preamble}"
@@ -261,6 +277,11 @@ async fn args_display_cap_is_configurable_and_respected() {
         "cap".into(),
     ));
     let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     let too_long = format!("# spec\n\n{}", "lorem ipsum dolor.\n".repeat(500));
     driver.script(
         Stage::Spec,
@@ -276,7 +297,11 @@ async fn args_display_cap_is_configurable_and_respected() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
     let _ = engine.run().await;
     let received = driver.received.lock().clone();
-    let retry_preamble = &received[1].2;
+    let spec_drives: Vec<&(Stage, Role, String)> = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
+        .collect();
+    let retry_preamble = &spec_drives[1].2;
     let count_lorem = retry_preamble.matches("lorem ipsum").count();
     // With 400-byte cap, ~22 lorem occurrences (each is ~18 bytes); pin
     // that we get more than the 60-byte cap would have allowed (≤2).
@@ -305,20 +330,24 @@ async fn failed_decompose_in_actor_turn_surfaces_to_critic_and_reviser() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
-    // Spec actor: call submit_spec, then a BAD decompose (child deps on
-    // itself).
+    // Architect lays out a single child, then spec stage on root makes
+    // a BAD submit_spec call (empty `public` — atomic failure).
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[(
+            "core",
+            "core subsystem",
+        )])],
+    );
     driver.script(
         Stage::Spec,
         Role::Writer,
-        vec![
-            ScriptedCall::submit_spec("# split\n\nA crate with subsystems."),
-            ScriptedCall::decompose(vec![ChildDecl {
-                name: "core".into(),
-                description: "math primitives".into(),
-                deps: vec!["core".into()], // self-dep — will fail
-                crate_boundary: false,
-            }]),
-        ],
+        vec![ScriptedCall::SubmitSpec {
+            public: "".into(), // empty — fails atomically
+            private: None,
+            deps: vec![],
+        }],
     );
     // Force a critique cycle so we get to see the critic preamble.
     driver.script(Stage::Spec, Role::Critic, vec![]);
@@ -341,17 +370,12 @@ async fn failed_decompose_in_actor_turn_surfaces_to_critic_and_reviser() {
         .expect("critic should have run");
     assert!(
         critic.2.contains("Prior turn had failed tool calls"),
-        "critic preamble must surface the failed decompose call: {}",
+        "critic preamble must surface the failed submit_spec call: {}",
         critic.2
     );
     assert!(
-        critic.2.contains("decompose"),
+        critic.2.contains("submit_spec"),
         "critic should see which tool failed: {}",
-        critic.2
-    );
-    assert!(
-        critic.2.to_lowercase().contains("self-loop") || critic.2.contains("itself"),
-        "critic should see WHY it failed: {}",
         critic.2
     );
 }
@@ -368,6 +392,11 @@ async fn engine_advances_root_through_spec_stage() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     driver.script(
         Stage::Spec,
         Role::Writer,
@@ -446,6 +475,11 @@ use super::public::*;
 "#;
 
     let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     driver.script(
         Stage::Spec,
         Role::Writer,
@@ -532,21 +566,22 @@ async fn engine_decomposes_root_then_advances_children() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
-    // Root spec: decompose into one child + write a thin spec for the umbrella.
+    // Architect lays out: root + one child `core`.
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[(
+            "core",
+            "core math primitives",
+        )])],
+    );
+    // Root spec: thin umbrella spec, no decompose (architect already did).
     driver.script(
         Stage::Spec,
         Role::Writer,
-        vec![
-            ScriptedCall::submit_spec(
-                "# split\n\nThe split crate. Decomposes into `core` for math.",
-            ),
-            ScriptedCall::decompose(vec![ChildDecl {
-                name: "core".into(),
-                description: "core math primitives".into(),
-                deps: vec![],
-                crate_boundary: false,
-            }]),
-        ],
+        vec![ScriptedCall::submit_spec(
+            "# split\n\nThe split crate. Decomposed by architect into `core`.",
+        )],
     );
     // Child spec.
     driver.script(
@@ -668,29 +703,21 @@ async fn engine_runs_two_independent_nodes_in_parallel() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
-    // Root spec decomposes into two siblings.
+    // Architect lays out two leaves under root.
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[
+            ("alpha", "first"),
+            ("beta", "second"),
+        ])],
+    );
+    // Root + two child specs.
     driver.script(
         Stage::Spec,
         Role::Writer,
-        vec![
-            ScriptedCall::submit_spec("# para\n\nUmbrella with two leaves.\n"),
-            ScriptedCall::decompose(vec![
-                ChildDecl {
-                    name: "alpha".into(),
-                    description: "first".into(),
-                    deps: vec![],
-                    crate_boundary: false,
-                },
-                ChildDecl {
-                    name: "beta".into(),
-                    description: "second".into(),
-                    deps: vec![],
-                    crate_boundary: false,
-                },
-            ]),
-        ],
+        vec![ScriptedCall::submit_spec("# para\n\nUmbrella with two leaves.\n")],
     );
-    // Two child spec calls (one each).
     driver.script(
         Stage::Spec,
         Role::Writer,
@@ -767,6 +794,11 @@ async fn engine_halts_on_unsatisfactory_judge_verdict() {
     ));
 
     let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
     // The actor writes a spec; the judge always rejects.
     for _ in 0..8 {
         driver.script(

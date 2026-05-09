@@ -40,6 +40,11 @@ impl std::fmt::Display for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    /// Build the WHOLE node tree in one shot — runs once, on the root
+    /// only, before any other stages. The architect produces the
+    /// project's structure (crates, modules, dep edges) but no spec
+    /// content; later per-node stages flesh out individual nodes.
+    Architect,
     /// Author the prose spec for this node (markdown).
     Spec,
     /// Author the public interface (`public.rs`).
@@ -55,7 +60,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 6] = [
+    pub const ALL: [Stage; 7] = [
+        Stage::Architect,
         Stage::Spec,
         Stage::Iface,
         Stage::Tests,
@@ -66,6 +72,7 @@ impl Stage {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Stage::Architect => "architect",
             Stage::Spec => "spec",
             Stage::Iface => "iface",
             Stage::Tests => "tests",
@@ -112,6 +119,11 @@ impl StageState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeStages {
+    /// Architect stage. Only meaningful on the ROOT node — runs once and
+    /// produces the entire tree. On every other node it stays
+    /// `NotStarted` forever (`stage_is_ready` enforces this).
+    #[serde(default)]
+    pub architect: StageState,
     pub spec: StageState,
     pub iface: StageState,
     pub tests: StageState,
@@ -124,6 +136,7 @@ pub struct NodeStages {
 impl NodeStages {
     pub fn get(&self, stage: Stage) -> StageState {
         match stage {
+            Stage::Architect => self.architect,
             Stage::Spec => self.spec,
             Stage::Iface => self.iface,
             Stage::Tests => self.tests,
@@ -135,6 +148,7 @@ impl NodeStages {
 
     pub fn set(&mut self, stage: Stage, value: StageState) {
         match stage {
+            Stage::Architect => self.architect = value,
             Stage::Spec => self.spec = value,
             Stage::Iface => self.iface = value,
             Stage::Tests => self.tests = value,
@@ -142,6 +156,18 @@ impl NodeStages {
             Stage::Debug => self.debug = value,
             Stage::Opt => self.opt = value,
         }
+    }
+
+    /// Reset every per-node-content stage (everything past architect) to
+    /// `NotStarted`. Called when a node gains a new dep edge — its
+    /// iface/tests/impl assumptions may have changed.
+    pub fn reset_post_architect(&mut self) {
+        self.spec = StageState::NotStarted;
+        self.iface = StageState::NotStarted;
+        self.tests = StageState::NotStarted;
+        self.impl_ = StageState::NotStarted;
+        self.debug = StageState::NotStarted;
+        self.opt = StageState::NotStarted;
     }
 }
 
@@ -424,6 +450,35 @@ impl NodeGraph {
             }
         }
         false
+    }
+
+    /// Set of nodes that transitively depend on `target` (i.e. nodes
+    /// for which `dep_reaches(node, target)` is true). Includes
+    /// `target` itself. Used by the engine's cascade-reset path: when
+    /// a node gains a new dep, every node that ever depended on it
+    /// needs its post-architect stages reset.
+    pub fn reverse_dep_closure(&self, target: NodeId) -> HashSet<NodeId> {
+        let mut out = HashSet::new();
+        out.insert(target);
+        // Build reverse edges once.
+        let mut rev: std::collections::HashMap<NodeId, Vec<NodeId>> =
+            std::collections::HashMap::new();
+        for n in self.nodes.values() {
+            for d in &n.deps {
+                rev.entry(*d).or_default().push(n.id);
+            }
+        }
+        let mut frontier = vec![target];
+        while let Some(n) = frontier.pop() {
+            if let Some(parents) = rev.get(&n) {
+                for p in parents {
+                    if out.insert(*p) {
+                        frontier.push(*p);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Path of names from root to `id` (inclusive). For `root → frontend → router`

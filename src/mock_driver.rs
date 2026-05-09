@@ -27,7 +27,7 @@ use crate::engine::{DriveParams, DriveResponse, LlmDriver};
 use crate::graph::Stage;
 use crate::state::TokenUsage;
 use crate::tools::{
-    self, ChildDecl, Role, SubmitRustArgs, SubmitSpecArgs, SubmitVerdictArgs, TaskCtx,
+    self, Role, SubmitRustArgs, SubmitSpecArgs, SubmitVerdictArgs, TaskCtx,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -38,11 +38,16 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum ScriptedCall {
+    /// The architect-stage submission — runs once, builds the whole tree.
+    SubmitArchitecture {
+        children: Vec<tools::ArchNode>,
+        external_deps: Vec<tools::ExternalCrateDep>,
+    },
     /// The composite spec-stage submission. Mirrors `SubmitSpecArgs`.
+    /// No `children` field — specs no longer decompose.
     SubmitSpec {
         public: String,
         private: Option<String>,
-        children: Vec<ChildDecl>,
         deps: Vec<String>,
     },
     SubmitPublic(String),
@@ -58,32 +63,36 @@ impl ScriptedCall {
         Self::SubmitSpec {
             public: s.into(),
             private: None,
-            children: vec![],
             deps: vec![],
         }
     }
-    /// Submit a spec WITH children — replaces the old separate
-    /// `decompose` call. Tests that decomposed in two steps now combine
-    /// into one composite submission.
-    pub fn submit_spec_with_children(
-        public: impl Into<String>,
-        children: Vec<ChildDecl>,
+    /// Convenience for the architect stage: submit a flat list of
+    /// top-level children (with no nested children/deps). Most tests
+    /// only need a tiny tree; this avoids verbose ArchNode literals.
+    pub fn submit_architecture_simple(children: &[(&str, &str)]) -> Self {
+        let arch_children = children
+            .iter()
+            .map(|(name, desc)| tools::ArchNode {
+                name: (*name).into(),
+                description: (*desc).into(),
+                crate_boundary: false,
+                deps: vec![],
+                children: vec![],
+            })
+            .collect();
+        Self::SubmitArchitecture {
+            children: arch_children,
+            external_deps: vec![],
+        }
+    }
+    pub fn submit_architecture(
+        children: Vec<tools::ArchNode>,
+        external_deps: Vec<tools::ExternalCrateDep>,
     ) -> Self {
-        Self::SubmitSpec {
-            public: public.into(),
-            private: None,
+        Self::SubmitArchitecture {
             children,
-            deps: vec![],
+            external_deps,
         }
-    }
-    /// Convenience for tests that previously called `ScriptedCall::decompose`
-    /// separately. Folded into a public-spec submission with the given
-    /// children. The public string is a generic placeholder.
-    pub fn decompose(children: Vec<ChildDecl>) -> Self {
-        Self::submit_spec_with_children(
-            "# umbrella\n\nDecomposed into the listed children.",
-            children,
-        )
     }
     pub fn submit_public(s: impl Into<String>) -> Self {
         Self::SubmitPublic(s.into())
@@ -218,17 +227,27 @@ impl LlmDriver for MockLlmDriver {
 async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
     use ScriptedCall::*;
     match call {
+        SubmitArchitecture {
+            children,
+            external_deps,
+        } => {
+            let tool = tools::SubmitArchitectureTool { ctx: ctx.clone() };
+            tool.call(tools::SubmitArchitectureArgs {
+                children: children.clone(),
+                external_deps: external_deps.clone(),
+            })
+            .await
+            .map_err(|e| anyhow!("submit_architecture: {e}"))?;
+        }
         SubmitSpec {
             public,
             private,
-            children,
             deps,
         } => {
             let tool = tools::SubmitSpecTool { ctx: ctx.clone() };
             tool.call(SubmitSpecArgs {
                 public: public.clone(),
                 private: private.clone(),
-                children: children.clone(),
                 deps: deps.clone(),
             })
             .await
