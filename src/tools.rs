@@ -2070,6 +2070,24 @@ fn apply_slot_edit(
              only edit files in your own node's slots"
         )));
     }
+    // Stage-ownership check. The model used to be able to edit any of
+    // its node's slots from any stage — so a quickfix during the iface
+    // stage could rewrite `tests.rs`. `files_owned_by_stage(iface)`
+    // doesn't include tests.rs, so the change wouldn't land on main,
+    // but it would still be in the graph slot, and a downstream task
+    // rendering from the graph would pick up the unaudited content.
+    // Now we restrict edits to exactly the slots this stage owns
+    // (matching the submit_* tools' `require_stage` checks).
+    {
+        let allowed = crate::engine::slots_owned_by_stage(ctx.stage);
+        if !allowed.iter().any(|s| *s == slot) {
+            return Err(ToolFailure::Other(format!(
+                "{tool_name}: slot {:?} is not writable in stage `{}` — only \
+                 {:?} are. Use a different path or wait for the appropriate stage.",
+                slot, ctx.stage, allowed
+            )));
+        }
+    }
     // Per-slot validation (mirrors the submit_* tools).
     {
         let g = ctx.graph.lock();

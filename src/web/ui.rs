@@ -351,21 +351,39 @@ function rebuildIndexes() {
   }
 }
 
+// Per-section dirty flags. Without these every SSE event re-rendered
+// the WHOLE page including the node graph — and rebuilding the graph
+// DOM from scratch restarted the throb animation on every in-progress
+// pill, which the user perceived as flickering. We now mark only the
+// affected sections dirty on each event and the next rAF tick only
+// repaints those.
+const dirty = { header: true, graph: true, tasks: true, transcript: true };
+function markDirty(what) { dirty[what] = true; }
+function markAllDirty() {
+  dirty.header = true; dirty.graph = true; dirty.tasks = true; dirty.transcript = true;
+}
+
 function render() {
   if (!state) return;
   rebuildIndexes();
-  document.getElementById('sched').textContent = state.scheduler;
-  const nodeCount = Object.keys(state.graph?.nodes || {}).length;
-  const taskCount = Object.keys(state.tasks || {}).length;
-  document.getElementById('node-count').textContent = nodeCount;
-  document.getElementById('task-count').textContent = taskCount;
-  document.getElementById('counts').textContent = `${nodeCount} nodes, ${taskCount} tasks`;
-  document.getElementById('tokens').textContent =
-    `${fmt(state.total_cost?.input_tokens||0)} in / ${fmt(state.total_cost?.output_tokens||0)} out`;
-  document.getElementById('cost').textContent = `$${(state.estimated_cost_usd||0).toFixed(4)}`;
-  renderGraph();
-  renderTasks();
-  if (selectedTaskId) renderTranscript();
+  if (dirty.header) {
+    document.getElementById('sched').textContent = state.scheduler;
+    const nodeCount = Object.keys(state.graph?.nodes || {}).length;
+    const taskCount = Object.keys(state.tasks || {}).length;
+    document.getElementById('node-count').textContent = nodeCount;
+    document.getElementById('task-count').textContent = taskCount;
+    document.getElementById('counts').textContent = `${nodeCount} nodes, ${taskCount} tasks`;
+    document.getElementById('tokens').textContent =
+      `${fmt(state.total_cost?.input_tokens||0)} in / ${fmt(state.total_cost?.output_tokens||0)} out`;
+    document.getElementById('cost').textContent = `$${(state.estimated_cost_usd||0).toFixed(4)}`;
+    dirty.header = false;
+  }
+  if (dirty.graph) { renderGraph(); dirty.graph = false; }
+  if (dirty.tasks) { renderTasks(); dirty.tasks = false; }
+  if (dirty.transcript) {
+    if (selectedTaskId) renderTranscript();
+    dirty.transcript = false;
+  }
 }
 
 function renderGraph() {
@@ -457,18 +475,38 @@ function renderNodeRecursive(parent, nodeId) {
 function renderTasks() {
   const el = document.getElementById('task-list');
   el.innerHTML = '';
-  const tasks = Object.values(state.tasks || {}).slice().reverse(); // newest first
-  for (const t of tasks.slice(0, 30)) {
+  // Dedupe by (node_name, stage): retries and integrator passes create
+  // fresh task UUIDs for the same (node, stage), which made the list
+  // look like the same row appearing 3-4 times. We keep only the
+  // most-recently-started one per (node, stage) and show retry count
+  // separately. The user can still click into older attempts from
+  // the issues list or the graph's phase pills.
+  const grouped = new Map(); // "node|stage" -> { latest, count, totalCost }
+  for (const t of Object.values(state.tasks || {})) {
+    const key = t.node_name + '|' + t.stage;
+    let g = grouped.get(key);
+    if (!g) { g = { latest: t, count: 0, totalIn: 0, totalOut: 0 }; grouped.set(key, g); }
+    g.count++;
+    g.totalIn += (t.cost?.input_tokens || 0);
+    g.totalOut += (t.cost?.output_tokens || 0);
+    if ((t.started_at || '') > (g.latest.started_at || '')) g.latest = t;
+  }
+  // Sort newest-first by started_at.
+  const rows = [...grouped.values()].sort(
+    (a, b) => (b.latest.started_at || '').localeCompare(a.latest.started_at || '')
+  );
+  for (const g of rows.slice(0, 30)) {
+    const t = g.latest;
     const div = document.createElement('div');
     div.className = 'task' + (t.id === selectedTaskId ? ' selected' : '');
-    // Color comes ONLY from status. The entity ("task"), the phase
-    // ("iface"), and the node name are uncolored labels.
+    const tokens = g.totalIn + g.totalOut;
+    const attemptsTag = g.count > 1 ? ` <span class="muted">×${g.count}</span>` : '';
     div.innerHTML = `
       <span class="entity">task</span>
-      <strong>${escapeHtml(t.node_name)}</strong>
+      <strong>${escapeHtml(t.node_name)}</strong>${attemptsTag}
       <span class="phase">${t.stage}</span>
       <span class="status ${t.status}">${t.status}</span>
-      <span class="muted">${(t.cost?.input_tokens||0)+(t.cost?.output_tokens||0)} tok</span>`;
+      <span class="muted">${fmt(tokens)} tok</span>`;
     div.onclick = () => { selectTask(t.id); };
     el.appendChild(div);
   }
@@ -728,15 +766,21 @@ const CLIENT_COLLAPSED_CAP = 5000;
 function applyEvent(ev) {
   if (!state) return;
   switch (ev.type) {
-    case 'scheduler_state_changed': state.scheduler = ev.state; break;
+    case 'scheduler_state_changed':
+      state.scheduler = ev.state;
+      markDirty('header');
+      break;
     case 'task_created':
       state.tasks[ev.task.id] = ev.task;
+      markDirty('header'); markDirty('tasks'); markDirty('graph');
       break;
     case 'task_status_changed':
       if (state.tasks[ev.id]) state.tasks[ev.id].status = ev.status;
+      markDirty('tasks'); markDirty('graph');
       break;
     case 'task_updated':
       state.tasks[ev.task.id] = ev.task;
+      markDirty('tasks'); markDirty('graph');
       break;
     case 'transcript_appended':
       // Only retain the transcript for the SELECTED task in browser
@@ -753,6 +797,7 @@ function applyEvent(ev) {
           if (t.transcript.length > CLIENT_TRANSCRIPT_CAP) {
             t.transcript.splice(0, t.transcript.length - CLIENT_TRANSCRIPT_CAP / 2);
           }
+          markDirty('transcript');
         }
       }
       break;
@@ -761,6 +806,7 @@ function applyEvent(ev) {
       if (tc) tc.cost = ev.cost;
       state.total_cost = ev.total;
       state.estimated_cost_usd = ev.estimated_usd;
+      markDirty('header'); markDirty('tasks');
       break;
     case 'history_appended':
       state.history = state.history || [];
@@ -773,7 +819,9 @@ function applyEvent(ev) {
       scheduleRefresh();
       break;
     case 'node_changed':
-      // Defer to periodic state poll for now.
+      // Graph nodes update on the periodic state poll; setting graph
+      // dirty here would just cause animation restarts without new
+      // info.
       break;
   }
   scheduleRender();
@@ -834,6 +882,7 @@ setInterval(async () => {
   if (prev && selectedTaskId && state.tasks?.[selectedTaskId]) {
     state.tasks[selectedTaskId].transcript = prev;
   }
+  markAllDirty();
   render();
 }, 8000);
 </script>

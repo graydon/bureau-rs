@@ -264,6 +264,30 @@ impl WorktreePool {
         message: &str,
     ) -> Result<()> {
         let _guard = self.main_lock.lock().await;
+        self.copy_owned_and_commit(&wt, owned_paths, message)?;
+        self.cleanup(&wt);
+        Ok(())
+    }
+
+    /// Take the main-repo serialization lock. Held only by the caller
+    /// (this returns the guard). Used by the engine for the atomic
+    /// "re-render + gate + commit" cycle at land time so that no broken
+    /// commit can reach main: while we hold this, no other task can
+    /// land, and we re-gate the rendered worktree against the latest
+    /// canonical graph state before copying anything into main.
+    pub async fn lock_main(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.main_lock.lock().await
+    }
+
+    /// Copy `owned_paths` from worktree to main, then commit. The caller
+    /// must already hold `main_lock`. Returns whether a commit was
+    /// actually created (no-op if the tree is identical to HEAD).
+    pub fn copy_owned_and_commit(
+        &self,
+        wt: &Worktree,
+        owned_paths: &[PathBuf],
+        message: &str,
+    ) -> Result<bool> {
         for rel in owned_paths {
             // Defensive: reject absolute / parent-dir-traversing paths.
             if rel.is_absolute()
@@ -286,12 +310,17 @@ impl WorktreePool {
             std::fs::copy(&src, &dst)
                 .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
         }
-        // Commit on main if anything actually changed.
         let made_commit = self.workspace.commit_main(message)?;
-        // Cleanup the worktree regardless.
-        self.cleanup(&wt);
-        let _ = made_commit;
-        Ok(())
+        Ok(made_commit)
+    }
+
+    /// Cleanup helper exposed so callers (like the engine's gated-land
+    /// path) can abandon the worktree without going through one of the
+    /// apply paths. The caller must already hold (or not need)
+    /// `main_lock` — this only touches the worktree's own files and
+    /// the libgit2 worktree admin record, not the main working tree.
+    pub fn cleanup_worktree(&self, wt: &Worktree) {
+        self.cleanup(wt);
     }
 
     /// Drop a worktree without merging — used on task failure.

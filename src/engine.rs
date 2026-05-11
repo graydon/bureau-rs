@@ -432,6 +432,86 @@ impl Engine {
         true
     }
 
+    /// Capture the graph slots THIS stage is allowed to write to, so
+    /// `restore_stage_slots` can undo a failed stage's tentative writes.
+    /// Returned snapshot is opaque; only the matching `restore_*` reads it.
+    fn snapshot_stage_slots(&self, node_id: NodeId, stage: Stage) -> StageSlotSnapshot {
+        let g = self.graph.lock();
+        let n = g.get(node_id).cloned();
+        let n = match n {
+            Some(n) => n,
+            None => return StageSlotSnapshot::default(),
+        };
+        let mut snap = StageSlotSnapshot::default();
+        for slot in slots_owned_by_stage(stage) {
+            match slot {
+                render::NodeSlot::PublicRs => snap.public_rs = Some(n.public_rs.clone()),
+                render::NodeSlot::PrivateRs => snap.private_rs = Some(n.private_rs.clone()),
+                render::NodeSlot::TestsRs => snap.tests_rs = Some(n.tests_rs.clone()),
+                render::NodeSlot::SpecPublicMd => {
+                    snap.spec_public_md = Some(n.spec_public_md.clone())
+                }
+                render::NodeSlot::SpecPrivateMd => {
+                    snap.spec_private_md = Some(n.spec_private_md.clone())
+                }
+            }
+        }
+        snap
+    }
+
+    fn restore_stage_slots(
+        &self,
+        node_id: NodeId,
+        stage: Stage,
+        snap: StageSlotSnapshot,
+    ) {
+        let mut g = self.graph.lock();
+        let Some(n) = g.get_mut(node_id) else { return };
+        for slot in slots_owned_by_stage(stage) {
+            match slot {
+                render::NodeSlot::PublicRs => {
+                    if let Some(v) = snap.public_rs.clone() {
+                        n.public_rs = v;
+                    }
+                }
+                render::NodeSlot::PrivateRs => {
+                    if let Some(v) = snap.private_rs.clone() {
+                        n.private_rs = v;
+                    }
+                }
+                render::NodeSlot::TestsRs => {
+                    if let Some(v) = snap.tests_rs.clone() {
+                        n.tests_rs = v;
+                    }
+                }
+                render::NodeSlot::SpecPublicMd => {
+                    if let Some(v) = snap.spec_public_md.clone() {
+                        n.spec_public_md = v;
+                    }
+                }
+                render::NodeSlot::SpecPrivateMd => {
+                    if let Some(v) = snap.spec_private_md.clone() {
+                        n.spec_private_md = v;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-render main from the current canonical graph state, then
+    /// commit if anything changed. Used after restoring graph slots
+    /// to ensure main's on-disk state and the next downstream
+    /// worktree's render both reflect the rolled-back content.
+    fn render_and_commit_main(&self, stage: Stage, node_name: &str) -> Result<()> {
+        let g = self.graph.lock();
+        render::render_graph(&self.workdir, &g, self.layout)?;
+        drop(g);
+        let _ = self
+            .workspace
+            .commit_main(&format!("restore: {stage} {node_name} (rolled back failed stage)"))?;
+        Ok(())
+    }
+
     async fn advance_stage(self: &Arc<Self>, node_id: NodeId, stage: Stage) -> Result<()> {
         // Mark the stage InProgress immediately so concurrent picks (when we
         // add parallelism later) don't double-run.
@@ -442,6 +522,15 @@ impl Engine {
             .stages
             .set(stage, StageState::InProgress);
         self.sync_graph_to_state();
+
+        // Snapshot the graph slots this stage will write to. If the stage
+        // gives up after exhausting retries, we restore these slots —
+        // otherwise the last-submitted-but-broken content sits in the
+        // graph and any downstream task that re-renders from the graph
+        // picks up that broken content. Main itself may be fine (we
+        // didn't land), but the canonical graph is what renders into
+        // downstream worktrees, so this matters.
+        let pre_stage_slots = self.snapshot_stage_slots(node_id, stage);
 
         // Allocate a per-stage worktree off main HEAD. All renders, cargo
         // invocations, and tool writes for this stage's attempts go into
@@ -510,7 +599,6 @@ impl Engine {
                     match canonical_render {
                         Ok(_) => {
                             let result = if stage == Stage::Architect {
-                                // Architect: copy the whole worktree to main.
                                 self.land_architect_to_main(&worktree, &merge_msg).await
                             } else {
                                 let owned: Vec<std::path::PathBuf> = {
@@ -528,13 +616,13 @@ impl Engine {
                                     "worktree apply-to-main {node_name} {stage}: {e:#}"
                                 );
                             } else {
-                                // Integrator check: re-run the stage's
-                                // gate on MAIN (not the worktree). Even
-                                // when each task's worktree gate passes,
-                                // two concurrent tasks landing serially
-                                // can leave main in a broken state if
-                                // their changes interact. We refuse to
-                                // keep building on a broken tree.
+                                // Post-merge integrator check. Runs the
+                                // stage's gate on MAIN; if main now fails
+                                // (a concurrent land broke our combined
+                                // state), allocate a fresh worktree and
+                                // run quickfix on it, copying any fixed
+                                // owned files back to main on success.
+                                // If quickfix exhausts, halt.
                                 if let Err(e) = self
                                     .integrator_check(node_id, stage, &node_name)
                                     .await
@@ -546,8 +634,6 @@ impl Engine {
                             }
                         }
                         Err(e) => {
-                            // Cycle or render failure — abandon, don't
-                            // merge corrupted state to main.
                             tracing::error!(
                                 "refusing to merge worktree for {node_name} {stage}: {e:#}"
                             );
@@ -559,7 +645,6 @@ impl Engine {
                             {
                                 tracing::warn!("worktree abandon: {ae:#}");
                             }
-                            // Fall through to mark the stage Failed.
                             last_err = Some(e);
                             break;
                         }
@@ -588,6 +673,23 @@ impl Engine {
             if let Err(e) = self.worktrees.clone().abandon(worktree).await {
                 tracing::warn!("worktree abandon: {e:#}");
             }
+            // CRITICAL: revert the graph slots this stage may have written
+            // to. The submit_* and write_file/apply_patch tools update
+            // slots BEFORE the gate runs; if the stage ultimately fails,
+            // we'd otherwise leave the last-submitted-but-broken content
+            // in the graph. Subsequent renders (including for downstream
+            // tasks branching off main) read from the graph — so without
+            // this restore, downstream worktrees end up with broken
+            // content even though main itself is fine. Re-render main
+            // to match the restored slots.
+            self.restore_stage_slots(node_id, stage, pre_stage_slots);
+            if let Err(e) = self.render_and_commit_main(
+                stage,
+                &self.graph.lock().get(node_id).unwrap().name.clone(),
+            ) {
+                tracing::warn!("re-render main after slot restore: {e:#}");
+            }
+            self.sync_graph_to_state();
         }
         if succeeded {
             return Ok(());
@@ -886,23 +988,20 @@ impl Engine {
         Ok(())
     }
 
-    /// After landing this stage's owned files to main, verify the build
-    /// still works on main. Two concurrent tasks can each pass their own
-    /// worktree's gate but break the merged result on main (the classic
-    /// "concurrent integration" problem: each worktree was branched
-    /// before the other landed, so neither's gate saw the combined
-    /// state).
+    /// Post-merge integrator. Runs after each successful `apply_to_main`
+    /// to verify the combined state on main still passes the stage's
+    /// gate. Two concurrent tasks can each pass their own worktree's
+    /// gate but break the merged result on main if their changes
+    /// interact. The integrator catches this:
     ///
-    /// Procedure:
-    /// 1. Run the gate on main.
-    /// 2. If it passes, we're done.
-    /// 3. If it fails, allocate a fresh worktree off main, run the
-    ///    quickfix loop in it (which lets the model see the failing
-    ///    errors and edit the current node's files), and on success
-    ///    apply the changed files back to main.
-    /// 4. If the quickfix loop can't fix it, return an error — the
-    ///    caller marks the stage Failed and the pipeline ultimately
-    ///    halts rather than continuing on a broken tree.
+    /// 1. Run the gate on MAIN. If it passes, we're done.
+    /// 2. If it fails, allocate a fresh worktree off main, run the
+    ///    quickfix loop in it (model edits the current node's files
+    ///    based on the failing diagnostics), then apply the fixed
+    ///    owned files back to main.
+    /// 3. If the quickfix loop can't fix it, return Err — the caller
+    ///    marks the stage Failed and the pipeline halts rather than
+    ///    continuing to build on a broken tree.
     async fn integrator_check(
         self: &Arc<Self>,
         node_id: NodeId,
@@ -918,7 +1017,6 @@ impl Engine {
         let Some(kind) = gate_kind else {
             return Ok(());
         };
-        // Quick gate check on main.
         let outcome = {
             let _guard = self.cargo_lock.lock().await;
             crate::gate::run_gate(&self.workdir, kind).await?
@@ -930,10 +1028,6 @@ impl Engine {
         self.note(format!(
             "integrator: post-merge gate failed for `{node_name}` {stage}:\n{summary}"
         ));
-        // Allocate a fresh worktree off main and run quickfix in it.
-        // The quickfix loop sees the failing diagnostics and edits the
-        // current node's files; on success we apply just those owned
-        // files back to main.
         let wt = self.worktrees.allocate(Uuid::new_v4()).await?;
         let task_id = Uuid::new_v4();
         let n = self
@@ -969,7 +1063,6 @@ impl Engine {
         let quickfix_result = self
             .run_quickfix_loop(task_id, node_id, stage, kind, &wt.path)
             .await;
-        // After quickfix, re-check gate on the worktree.
         let post_outcome = match quickfix_result {
             Ok(()) => {
                 let _guard = self.cargo_lock.lock().await;
@@ -981,7 +1074,6 @@ impl Engine {
             }
         };
         if post_outcome.passed {
-            // Apply the owned files from the worktree back to main.
             let owned: Vec<std::path::PathBuf> = {
                 let g = self.graph.lock();
                 let nn = g.get(node_id).unwrap();
@@ -992,7 +1084,6 @@ impl Engine {
                 .clone()
                 .apply_to_main(wt.clone(), &owned, &merge_msg)
                 .await?;
-            // Re-verify on main (just to be safe).
             let recheck = {
                 let _guard = self.cargo_lock.lock().await;
                 crate::gate::run_gate(&self.workdir, kind).await?
@@ -1011,10 +1102,9 @@ impl Engine {
                 self.note(format!(
                     "integrator: post-merge gate fixed for `{node_name}` {stage}"
                 ));
-                return Ok(());
+                Ok(())
             } else {
                 let recheck_summary = self.summarize_errors(&recheck.errors, 5);
-                let _ = self.worktrees.clone().abandon(wt).await;
                 let msg = format!(
                     "integrator: post-merge gate still broken on main after quickfix \
                      for `{node_name}` {stage}:\n{recheck_summary}"
@@ -1030,7 +1120,7 @@ impl Engine {
                     id: task_id,
                     status: TaskStatus::Failed,
                 });
-                return Err(anyhow!(msg));
+                Err(anyhow!(msg))
             }
         } else {
             let post_summary = self.summarize_errors(&post_outcome.errors, 5);
@@ -1050,7 +1140,7 @@ impl Engine {
                 id: task_id,
                 status: TaskStatus::Failed,
             });
-            return Err(anyhow!(msg));
+            Err(anyhow!(msg))
         }
     }
 
@@ -1089,7 +1179,31 @@ impl Engine {
                 }
                 return Ok(());
             }
+            // Classify failing errors by which node owns the file. If
+            // EVERY error is in another node's slot, this writer can't
+            // fix any of them — calling the model would just produce
+            // refusals (the model correctly identifies out-of-scope and
+            // ends its turn). Skip the model call, log clearly, and let
+            // the outer retry/halt logic handle it.
+            let classification = classify_errors_by_owner(
+                &outcome.errors,
+                node_id,
+                &self.graph.lock(),
+                self.layout,
+            );
+            if !classification.mine_or_unknown() {
+                let upstream = classification.describe_upstream();
+                self.note(format!(
+                    "task {task_id} stage {stage}: gate failed entirely on upstream node(s) \
+                     [{upstream}] — cannot fix from this node's scope. Skipping quickfix; \
+                     the outer halt logic will surface this so those nodes can be reset."
+                ));
+                return Ok(());
+            }
             let summary = self.summarize_errors(&outcome.errors, 12);
+            // If SOME errors are upstream (not all), tell the model about
+            // it so it doesn't waste turns trying to fix out-of-scope code.
+            let preamble_extra = classification.upstream_note();
             self.note(format!(
                 "task {task_id} stage {stage}: quickfix iter {iter}/{max_iters} — gate failed:\n{summary}"
             ));
@@ -1102,7 +1216,7 @@ impl Engine {
                     Role::QuickFixer,
                     Some(CycleExtras {
                         round: iter,
-                        quickfix_gate_output: Some(summary),
+                        quickfix_gate_output: Some(format!("{summary}{preamble_extra}")),
                         quickfix_iter: Some((iter, max_iters - iter)),
                         ..Default::default()
                     }),
@@ -1486,9 +1600,19 @@ impl Engine {
         for path in fs_events {
             self.state.emit(UiEvent::FileChanged { path });
         }
+        // Ship the task's ACCUMULATED cost, not this role's delta. The UI
+        // overwrites `task.cost` from this event, so shipping a delta
+        // would make the task list display only the most recent role's
+        // tokens (and 0 for any role that produced no tokens). Reading
+        // the accumulated value off state requires re-locking, but it's
+        // a small clone.
+        let task_total_cost = self
+            .state
+            .read(|s| s.tasks.get(&task_id).map(|t| t.cost.clone()))
+            .unwrap_or_default();
         self.state.emit(UiEvent::TaskCost {
             task_id,
-            cost: usage.clone(),
+            cost: task_total_cost,
             total: self.state.read(|s| s.total_cost.clone()),
             estimated_usd: self.state.read(|s| s.estimated_cost_usd),
         });
@@ -2657,6 +2781,107 @@ fn role_user_prompt(stage: Stage, role: Role) -> String {
     }
 }
 
+/// Slots a given stage is permitted to write to (via submit_* or the
+/// quickfix file-edit tools). The framework uses this to snapshot
+/// before a stage runs (so we can roll back on stage failure) AND to
+/// validate quickfix edits (a stage shouldn't touch slots outside its
+/// scope — that's how unaudited content was leaking into the graph).
+pub(crate) fn slots_owned_by_stage(stage: Stage) -> &'static [crate::render::NodeSlot] {
+    use crate::render::NodeSlot::*;
+    match stage {
+        Stage::Architect => &[],
+        Stage::Spec => &[SpecPublicMd, SpecPrivateMd],
+        Stage::Iface => &[PublicRs, PrivateRs],
+        Stage::Tests => &[TestsRs],
+        Stage::Impl => &[PrivateRs],
+        Stage::Debug => &[PrivateRs, TestsRs],
+        Stage::Opt => &[PrivateRs],
+    }
+}
+
+/// Opaque snapshot of a node's slot contents at stage start. Restored
+/// verbatim if the stage gives up after exhausting retries.
+#[derive(Debug, Default, Clone)]
+struct StageSlotSnapshot {
+    public_rs: Option<Option<String>>,
+    private_rs: Option<Option<String>>,
+    tests_rs: Option<Option<String>>,
+    spec_public_md: Option<Option<String>>,
+    spec_private_md: Option<Option<String>>,
+}
+
+/// Per-owner breakdown of a gate's failing errors. "Mine" = errors in
+/// the current node's slots. "Upstream" = errors in OTHER nodes' slots
+/// (those owners need to fix it; the current node can't from its
+/// scope). "Unknown" = errors without a file path, or in files that
+/// don't map to any node's slot (build script, top-level Cargo.toml,
+/// etc.) — still potentially actionable from anywhere, so treated as
+/// "mine-ish" for the purpose of deciding whether to invoke quickfix.
+#[derive(Debug, Default, Clone)]
+struct ErrorClassification {
+    mine: Vec<crate::gate::CompilerError>,
+    upstream: std::collections::HashMap<NodeId, Vec<crate::gate::CompilerError>>,
+    upstream_names: std::collections::HashMap<NodeId, String>,
+    unknown: Vec<crate::gate::CompilerError>,
+}
+
+impl ErrorClassification {
+    fn mine_or_unknown(&self) -> bool {
+        !self.mine.is_empty() || !self.unknown.is_empty()
+    }
+    fn describe_upstream(&self) -> String {
+        let mut names: Vec<&str> = self
+            .upstream_names
+            .values()
+            .map(|s| s.as_str())
+            .collect();
+        names.sort();
+        names.join(", ")
+    }
+    /// Short narrative the quickfixer sees when SOME (but not all)
+    /// errors are upstream — tells it explicitly which entries to leave
+    /// alone so it doesn't burn turns trying to edit out-of-scope files.
+    fn upstream_note(&self) -> String {
+        if self.upstream.is_empty() {
+            return String::new();
+        }
+        let names = self.describe_upstream();
+        format!(
+            "\n\n⚠ Some of the failing errors are in OTHER nodes' files (node(s): {names}) — \
+             you cannot edit those from here. Only fix errors in YOUR node's slots; ignore \
+             the upstream errors. The framework will route those to the right node."
+        )
+    }
+}
+
+fn classify_errors_by_owner(
+    errors: &[crate::gate::CompilerError],
+    current_node: NodeId,
+    graph: &crate::graph::NodeGraph,
+    layout: crate::render::Layout,
+) -> ErrorClassification {
+    let mut out = ErrorClassification::default();
+    for e in errors {
+        let Some(file) = &e.file else {
+            out.unknown.push(e.clone());
+            continue;
+        };
+        match crate::render::resolve_path_to_slot(graph, file, layout) {
+            Some((nid, _)) if nid == current_node => out.mine.push(e.clone()),
+            Some((nid, _)) => {
+                if let Some(n) = graph.get(nid) {
+                    out.upstream_names
+                        .entry(nid)
+                        .or_insert_with(|| n.name.clone());
+                }
+                out.upstream.entry(nid).or_default().push(e.clone());
+            }
+            None => out.unknown.push(e.clone()),
+        }
+    }
+    out
+}
+
 fn is_transient(msg: &str) -> bool {
     msg.contains("no message or tool call")
         || msg.contains("ResponseError")
@@ -3039,5 +3264,55 @@ mod tests {
         assert_eq!(failures[0].0, "decompose");
         assert!(failures[0].1.contains("\"children\""));
         assert!(failures[0].2.contains("lists itself"));
+    }
+
+    fn mk_err(file: &str) -> crate::gate::CompilerError {
+        crate::gate::CompilerError {
+            id: "E0001".into(),
+            file: Some(std::path::PathBuf::from(file)),
+            line: Some(1),
+            message: "boom".into(),
+            raw: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn classify_errors_separates_mine_from_upstream() {
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        let a = g.add_child(root, Node::new("alpha", "")).unwrap();
+        let b = g.add_child(root, Node::new("beta", "")).unwrap();
+        let errors = vec![
+            mk_err("src/alpha/private.rs"),
+            mk_err("src/beta/public.rs"),
+            mk_err("src/beta/tests.rs"),
+            mk_err("build.rs"), // unknown — no slot
+        ];
+        let c = classify_errors_by_owner(&errors, a, &g, crate::render::Layout::SingleCrate);
+        assert_eq!(c.mine.len(), 1, "alpha's private.rs is mine");
+        assert_eq!(c.upstream.get(&b).map(|v| v.len()), Some(2), "two errors in beta");
+        assert_eq!(c.unknown.len(), 1, "build.rs is unknown");
+        assert!(c.mine_or_unknown(), "has at least one mine/unknown");
+        assert!(c.describe_upstream().contains("beta"));
+    }
+
+    #[test]
+    fn classify_errors_all_upstream_short_circuits() {
+        // The case the user hit in production: every error is in a
+        // different node's files, so the quickfix loop should skip
+        // invoking the model entirely.
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(Node::new("app", "")).unwrap();
+        let a = g.add_child(root, Node::new("alpha", "")).unwrap();
+        let b = g.add_child(root, Node::new("beta", "")).unwrap();
+        let errors = vec![
+            mk_err("src/beta/private.rs"),
+            mk_err("src/beta/public.rs"),
+        ];
+        let c = classify_errors_by_owner(&errors, a, &g, crate::render::Layout::SingleCrate);
+        assert!(c.mine.is_empty());
+        assert!(c.unknown.is_empty());
+        assert_eq!(c.upstream.get(&b).map(|v| v.len()), Some(2));
+        assert!(!c.mine_or_unknown(), "no mine or unknown => skip quickfix");
     }
 }
