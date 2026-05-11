@@ -46,6 +46,8 @@ fn make_config(workdir: std::path::PathBuf, project_name: &str) -> Arc<Config> {
                 max_nodes: 32,
                 max_node_depth: 4,
                 cost_cap_usd: None,
+                max_quickfix_iters: 0, // disable inner quickfix in scripted tests
+                task_transcript_cap: 0, // unbounded for predictable assertions
             },
             provider: Provider::default(),
             layout: LayoutKind::SingleCrate,
@@ -823,4 +825,132 @@ async fn engine_halts_on_unsatisfactory_judge_verdict() {
     // Spec stage should be Failed because judge rejected every attempt.
     assert_eq!(n.stages.spec, StageState::Failed, "spec should fail");
     assert!(result.is_err(), "engine should error out");
+}
+
+#[tokio::test]
+async fn critic_clean_skips_reviser_and_judge() {
+    // When the critic calls submit_critique with an empty issues list,
+    // the engine should skip the reviser AND judge for that round.
+    // We confirm this by tallying which (stage, role) drives the model
+    // actually saw — the reviser and judge for Spec should be ZERO
+    // even though critique_retries=1 is set.
+    let tmp = tempfile::tempdir().unwrap();
+    let workdir = tmp.path().to_path_buf();
+    let mut config = (*make_config(workdir.clone(), "tiny")).clone();
+    config.toml.limits.critique_retries = 1;
+    let config = Arc::new(config);
+    let state = StateHandle::new(EngineState::new(
+        workdir.clone(),
+        workdir.clone(),
+        "tiny".into(),
+    ));
+
+    let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
+    // Spec writer: produce content.
+    driver.script(
+        Stage::Spec,
+        Role::Writer,
+        vec![ScriptedCall::submit_spec("# tiny\n\nspec body\n")],
+    );
+    // Spec critic: empty issues list (clean) → engine skips reviser+judge.
+    driver.script(Stage::Spec, Role::Critic, vec![ScriptedCall::critique_clean()]);
+    // Iface / Tests / Impl: writer-only via auto_approve.
+    for stage in [Stage::Iface, Stage::Tests, Stage::Impl] {
+        driver.script(
+            stage,
+            Role::Writer,
+            vec![match stage {
+                Stage::Iface => ScriptedCall::submit_public("// empty\n"),
+                Stage::Tests => ScriptedCall::submit_tests("// no tests\n"),
+                Stage::Impl => ScriptedCall::submit_private("// nothing to do\n"),
+                _ => unreachable!(),
+            }],
+        );
+        driver.script(stage, Role::Critic, vec![ScriptedCall::critique_clean()]);
+    }
+
+    let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
+    engine.run().await.unwrap();
+
+    // Count Reviser and Judge invocations for Spec stage — should be zero.
+    let received = driver.received.lock();
+    let spec_reviser = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Reviser)
+        .count();
+    let spec_judge = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Judge)
+        .count();
+    assert_eq!(spec_reviser, 0, "reviser should not run when critic is clean");
+    assert_eq!(spec_judge, 0, "judge should not run when critic is clean");
+}
+
+#[tokio::test]
+async fn critic_with_issues_runs_full_cycle() {
+    // Counterpoint to the clean-critic test: if the critic raises any
+    // issues, the reviser AND judge should both run.
+    let tmp = tempfile::tempdir().unwrap();
+    let workdir = tmp.path().to_path_buf();
+    let mut config = (*make_config(workdir.clone(), "tiny")).clone();
+    config.toml.limits.critique_retries = 1;
+    let config = Arc::new(config);
+    let state = StateHandle::new(EngineState::new(
+        workdir.clone(),
+        workdir.clone(),
+        "tiny".into(),
+    ));
+
+    let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
+    driver.script(
+        Stage::Spec,
+        Role::Writer,
+        vec![ScriptedCall::submit_spec("# tiny\n\nspec body\n")],
+    );
+    driver.script(
+        Stage::Spec,
+        Role::Critic,
+        vec![ScriptedCall::critique_one("spec is too vague")],
+    );
+    driver.script(Stage::Spec, Role::Reviser, vec![]);
+    driver.script(Stage::Spec, Role::Judge, vec![ScriptedCall::verdict_ok()]);
+    // Other stages: keep them clean to avoid noise.
+    for stage in [Stage::Iface, Stage::Tests, Stage::Impl] {
+        driver.script(
+            stage,
+            Role::Writer,
+            vec![match stage {
+                Stage::Iface => ScriptedCall::submit_public("// empty\n"),
+                Stage::Tests => ScriptedCall::submit_tests("// no tests\n"),
+                Stage::Impl => ScriptedCall::submit_private("// nothing to do\n"),
+                _ => unreachable!(),
+            }],
+        );
+        driver.script(stage, Role::Critic, vec![ScriptedCall::critique_clean()]);
+    }
+
+    let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
+    engine.run().await.unwrap();
+
+    let received = driver.received.lock();
+    let spec_reviser = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Reviser)
+        .count();
+    let spec_judge = received
+        .iter()
+        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Judge)
+        .count();
+    assert_eq!(spec_reviser, 1, "reviser should run when critic has issues");
+    assert_eq!(spec_judge, 1, "judge should run when critic has issues");
 }

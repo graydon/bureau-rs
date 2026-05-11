@@ -26,9 +26,10 @@ use crate::state::{
     UiEvent,
 };
 use crate::tools::{
-    CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool, JudgeVerdict, Role,
-    SubmitArchitectureTool, SubmitPrivateTool, SubmitPublicTool, SubmitSpecTool, SubmitTestsTool,
-    SubmitVerdictTool, TaskCtx, TranscriptEntry, TranscriptKind,
+    ApplyPatchTool, CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool, Critique,
+    JudgeVerdict, ReadFileTool, Role, SubmitArchitectureTool, SubmitCritiqueTool,
+    SubmitPrivateTool, SubmitPublicTool, SubmitSpecTool, SubmitTestsTool, SubmitVerdictTool,
+    TaskCtx, TranscriptEntry, TranscriptKind, WriteFileRangeTool, WriteFileTool,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -526,6 +527,22 @@ impl Engine {
                                 tracing::warn!(
                                     "worktree apply-to-main {node_name} {stage}: {e:#}"
                                 );
+                            } else {
+                                // Integrator check: re-run the stage's
+                                // gate on MAIN (not the worktree). Even
+                                // when each task's worktree gate passes,
+                                // two concurrent tasks landing serially
+                                // can leave main in a broken state if
+                                // their changes interact. We refuse to
+                                // keep building on a broken tree.
+                                if let Err(e) = self
+                                    .integrator_check(node_id, stage, &node_name)
+                                    .await
+                                {
+                                    last_err = Some(e);
+                                    succeeded = false;
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -644,12 +661,29 @@ impl Engine {
         });
         self.state.emit(UiEvent::TaskCreated { task });
 
-        // 1. Actor
+        // The cargo gate for this stage. None for architect/spec.
+        let gate_kind = match stage {
+            Stage::Architect | Stage::Spec => None,
+            Stage::Iface => Some(crate::gate::GateKind::Check),
+            Stage::Tests => Some(crate::gate::GateKind::TestNoRun),
+            Stage::Impl | Stage::Debug | Stage::Opt => Some(crate::gate::GateKind::Test),
+        };
+
+        // 1. Writer turn.
         let actor = self
             .run_role(task_id, node_id, stage, Role::Writer, None, task_workdir)
             .await?;
 
-        // 2. Critique cycle (optional)
+        // 2. Quickfix loop after writer — if the gate fails, give the
+        // writer/quickfixer a chance to fix the errors directly via
+        // read/write/patch tools BEFORE escalating to critic. Mechanical
+        // compile-error fixes don't need a critique cycle.
+        if gate_kind.is_some() {
+            self.run_quickfix_loop(task_id, node_id, stage, gate_kind.unwrap(), task_workdir)
+                .await?;
+        }
+
+        // 3. Critique cycle (optional).
         // Architect runs single-shot (no critic/reviser/judge cycle); other
         // stages use the configured critique_retries.
         let critique_retries = if stage == Stage::Architect {
@@ -660,7 +694,7 @@ impl Engine {
         let mut last_text = actor.text;
         let mut last_failed = actor.failed_tools;
         for round in 1..=critique_retries {
-            let critique = self
+            let critic_outcome = self
                 .run_role(
                     task_id,
                     node_id,
@@ -669,14 +703,34 @@ impl Engine {
                     Some(CycleExtras {
                         round,
                         prior_actor_text: Some(last_text.clone()),
-                        prior_critique: None,
-                        prior_revision: None,
                         prior_failed_tools: last_failed.clone(),
+                        ..Default::default()
                     }),
                     task_workdir,
                 )
-                .await?
-                .text;
+                .await?;
+            // Critic-happy fast path: empty issue list via submit_critique
+            // = nothing to fix, skip reviser+judge. If the critic didn't
+            // call submit_critique at all (model misbehavior), fall
+            // through and run the full cycle — better wasted work than
+            // a silently-skipped review.
+            let (critique_text, skip_rest) = match critic_outcome.critique {
+                Some(c) if c.is_clean() => {
+                    self.note(format!(
+                        "task {task_id} round {round}: critic reported 0 issues — skipping reviser and judge"
+                    ));
+                    (c.render(), true)
+                }
+                Some(c) => (c.render(), false),
+                None => (
+                    "(critic did not call submit_critique — running reviser conservatively)"
+                        .to_string(),
+                    false,
+                ),
+            };
+            if skip_rest {
+                break;
+            }
             let revision = self
                 .run_role(
                     task_id,
@@ -686,16 +740,23 @@ impl Engine {
                     Some(CycleExtras {
                         round,
                         prior_actor_text: Some(last_text.clone()),
-                        prior_critique: Some(critique.clone()),
-                        prior_revision: None,
+                        prior_critique: Some(critique_text.clone()),
                         prior_failed_tools: last_failed.clone(),
+                        ..Default::default()
                     }),
                     task_workdir,
                 )
                 .await?;
             last_text = revision.text.clone();
             last_failed = revision.failed_tools.clone();
-            // Judge
+
+            // Quickfix loop after reviser too — same rationale.
+            if let Some(kind) = gate_kind {
+                self.run_quickfix_loop(task_id, node_id, stage, kind, task_workdir)
+                    .await?;
+            }
+
+            // Judge.
             let _judge = self
                 .run_role(
                     task_id,
@@ -704,10 +765,10 @@ impl Engine {
                     Role::Judge,
                     Some(CycleExtras {
                         round,
-                        prior_actor_text: None,
-                        prior_critique: Some(critique),
+                        prior_critique: Some(critique_text),
                         prior_revision: Some(revision.text),
                         prior_failed_tools: last_failed.clone(),
+                        ..Default::default()
                     }),
                     task_workdir,
                 )
@@ -726,15 +787,9 @@ impl Engine {
             }
         }
 
-        // 3. Cargo gate (where applicable). The actor's tools already let the
-        // model verify itself, but a final hard gate ensures the on-disk
-        // state is good before we mark the stage Done.
-        let gate_kind = match stage {
-            Stage::Architect | Stage::Spec => None,
-            Stage::Iface => Some(crate::gate::GateKind::Check),
-            Stage::Tests => Some(crate::gate::GateKind::TestNoRun),
-            Stage::Impl | Stage::Debug | Stage::Opt => Some(crate::gate::GateKind::Test),
-        };
+        // 4. Final cargo gate (safety net). The quickfix loops above
+        // should have ensured the gate already passes; if it doesn't
+        // somehow, this catches it.
         if let Some(kind) = gate_kind {
             let outcome = {
                 let _guard = self.cargo_lock.lock().await;
@@ -831,6 +886,248 @@ impl Engine {
         Ok(())
     }
 
+    /// After landing this stage's owned files to main, verify the build
+    /// still works on main. Two concurrent tasks can each pass their own
+    /// worktree's gate but break the merged result on main (the classic
+    /// "concurrent integration" problem: each worktree was branched
+    /// before the other landed, so neither's gate saw the combined
+    /// state).
+    ///
+    /// Procedure:
+    /// 1. Run the gate on main.
+    /// 2. If it passes, we're done.
+    /// 3. If it fails, allocate a fresh worktree off main, run the
+    ///    quickfix loop in it (which lets the model see the failing
+    ///    errors and edit the current node's files), and on success
+    ///    apply the changed files back to main.
+    /// 4. If the quickfix loop can't fix it, return an error — the
+    ///    caller marks the stage Failed and the pipeline ultimately
+    ///    halts rather than continuing on a broken tree.
+    async fn integrator_check(
+        self: &Arc<Self>,
+        node_id: NodeId,
+        stage: Stage,
+        node_name: &str,
+    ) -> Result<()> {
+        let gate_kind = match stage {
+            Stage::Architect | Stage::Spec => None,
+            Stage::Iface => Some(crate::gate::GateKind::Check),
+            Stage::Tests => Some(crate::gate::GateKind::TestNoRun),
+            Stage::Impl | Stage::Debug | Stage::Opt => Some(crate::gate::GateKind::Test),
+        };
+        let Some(kind) = gate_kind else {
+            return Ok(());
+        };
+        // Quick gate check on main.
+        let outcome = {
+            let _guard = self.cargo_lock.lock().await;
+            crate::gate::run_gate(&self.workdir, kind).await?
+        };
+        if outcome.passed {
+            return Ok(());
+        }
+        let summary = self.summarize_errors(&outcome.errors, 8);
+        self.note(format!(
+            "integrator: post-merge gate failed for `{node_name}` {stage}:\n{summary}"
+        ));
+        // Allocate a fresh worktree off main and run quickfix in it.
+        // The quickfix loop sees the failing diagnostics and edits the
+        // current node's files; on success we apply just those owned
+        // files back to main.
+        let wt = self.worktrees.allocate(Uuid::new_v4()).await?;
+        let task_id = Uuid::new_v4();
+        let n = self
+            .graph
+            .lock()
+            .get(node_id)
+            .ok_or_else(|| anyhow!("node {node_id} missing"))?
+            .clone();
+        let task = EngineTask {
+            id: task_id,
+            node_id,
+            node_name: n.name.clone(),
+            stage,
+            status: TaskStatus::Running,
+            model: self
+                .config
+                .toml
+                .models
+                .for_stage_role(stage, Role::QuickFixer)
+                .to_string(),
+            transcript: Vec::new(),
+            cost: TokenUsage::default(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            error: None,
+            final_verdict: None,
+            retries: 0,
+        };
+        self.state.write(|s| {
+            s.tasks.insert(task_id, task.clone());
+        });
+        self.state.emit(UiEvent::TaskCreated { task });
+        let quickfix_result = self
+            .run_quickfix_loop(task_id, node_id, stage, kind, &wt.path)
+            .await;
+        // After quickfix, re-check gate on the worktree.
+        let post_outcome = match quickfix_result {
+            Ok(()) => {
+                let _guard = self.cargo_lock.lock().await;
+                crate::gate::run_gate(&wt.path, kind).await?
+            }
+            Err(e) => {
+                let _ = self.worktrees.clone().abandon(wt).await;
+                return Err(e);
+            }
+        };
+        if post_outcome.passed {
+            // Apply the owned files from the worktree back to main.
+            let owned: Vec<std::path::PathBuf> = {
+                let g = self.graph.lock();
+                let nn = g.get(node_id).unwrap();
+                render::files_owned_by_stage(&g, nn, stage, self.layout)
+            };
+            let merge_msg = format!("integrator: {stage} {node_name}");
+            self.worktrees
+                .clone()
+                .apply_to_main(wt.clone(), &owned, &merge_msg)
+                .await?;
+            // Re-verify on main (just to be safe).
+            let recheck = {
+                let _guard = self.cargo_lock.lock().await;
+                crate::gate::run_gate(&self.workdir, kind).await?
+            };
+            if recheck.passed {
+                self.state.write(|s| {
+                    if let Some(t) = s.tasks.get_mut(&task_id) {
+                        t.status = TaskStatus::Done;
+                        t.finished_at = Some(Utc::now());
+                    }
+                });
+                self.state.emit(UiEvent::TaskStatusChanged {
+                    id: task_id,
+                    status: TaskStatus::Done,
+                });
+                self.note(format!(
+                    "integrator: post-merge gate fixed for `{node_name}` {stage}"
+                ));
+                return Ok(());
+            } else {
+                let recheck_summary = self.summarize_errors(&recheck.errors, 5);
+                let _ = self.worktrees.clone().abandon(wt).await;
+                let msg = format!(
+                    "integrator: post-merge gate still broken on main after quickfix \
+                     for `{node_name}` {stage}:\n{recheck_summary}"
+                );
+                self.state.write(|s| {
+                    if let Some(t) = s.tasks.get_mut(&task_id) {
+                        t.status = TaskStatus::Failed;
+                        t.finished_at = Some(Utc::now());
+                        t.error = Some(msg.clone());
+                    }
+                });
+                self.state.emit(UiEvent::TaskStatusChanged {
+                    id: task_id,
+                    status: TaskStatus::Failed,
+                });
+                return Err(anyhow!(msg));
+            }
+        } else {
+            let post_summary = self.summarize_errors(&post_outcome.errors, 5);
+            let _ = self.worktrees.clone().abandon(wt).await;
+            let msg = format!(
+                "integrator: quickfix exhausted for `{node_name}` {stage}; tree still broken:\n\
+                 {post_summary}"
+            );
+            self.state.write(|s| {
+                if let Some(t) = s.tasks.get_mut(&task_id) {
+                    t.status = TaskStatus::Failed;
+                    t.finished_at = Some(Utc::now());
+                    t.error = Some(msg.clone());
+                }
+            });
+            self.state.emit(UiEvent::TaskStatusChanged {
+                id: task_id,
+                status: TaskStatus::Failed,
+            });
+            return Err(anyhow!(msg));
+        }
+    }
+
+    /// Quickfix inner loop. Run the cargo gate; if it passes, return.
+    /// Otherwise feed the failing diagnostics back to the model via the
+    /// `QuickFixer` role (with read/write/patch tools), let it edit,
+    /// and re-check. Repeat up to `max_quickfix_iters` times. Returns
+    /// `Ok(())` whether the gate ends up passing or not — the final
+    /// gate check in the caller decides whether the stage attempt
+    /// failed. (We don't propagate the failure here so the critic/judge
+    /// cycle can still try its own fix.)
+    async fn run_quickfix_loop(
+        self: &Arc<Self>,
+        task_id: Uuid,
+        node_id: NodeId,
+        stage: Stage,
+        kind: crate::gate::GateKind,
+        task_workdir: &Path,
+    ) -> Result<()> {
+        let max_iters = self.config.toml.limits.max_quickfix_iters;
+        if max_iters == 0 {
+            return Ok(());
+        }
+        for iter in 1..=max_iters {
+            // Run the gate. Short-circuit on pass.
+            let outcome = {
+                let _guard = self.cargo_lock.lock().await;
+                crate::gate::run_gate(task_workdir, kind).await?
+            };
+            if outcome.passed {
+                if iter > 1 {
+                    self.note(format!(
+                        "task {task_id} stage {stage}: quickfix succeeded after {} iter(s)",
+                        iter - 1
+                    ));
+                }
+                return Ok(());
+            }
+            let summary = self.summarize_errors(&outcome.errors, 12);
+            self.note(format!(
+                "task {task_id} stage {stage}: quickfix iter {iter}/{max_iters} — gate failed:\n{summary}"
+            ));
+            // Run the quickfixer.
+            let _ = self
+                .run_role(
+                    task_id,
+                    node_id,
+                    stage,
+                    Role::QuickFixer,
+                    Some(CycleExtras {
+                        round: iter,
+                        quickfix_gate_output: Some(summary),
+                        quickfix_iter: Some((iter, max_iters - iter)),
+                        ..Default::default()
+                    }),
+                    task_workdir,
+                )
+                .await?;
+        }
+        // One last gate check — if it now passes, log it.
+        let outcome = {
+            let _guard = self.cargo_lock.lock().await;
+            crate::gate::run_gate(task_workdir, kind).await?
+        };
+        if outcome.passed {
+            self.note(format!(
+                "task {task_id} stage {stage}: quickfix passed on final check"
+            ));
+        } else {
+            self.note(format!(
+                "task {task_id} stage {stage}: quickfix exhausted {max_iters} iter(s); \
+                 escalating to critic"
+            ));
+        }
+        Ok(())
+    }
+
     fn summarize_errors(&self, errors: &[crate::gate::CompilerError], max: usize) -> String {
         if errors.is_empty() {
             return "(no errors recorded)".into();
@@ -923,6 +1220,17 @@ impl Engine {
             // section.
             let mut cyc = String::new();
             cyc.push_str(&format!("Round {}\n\n", ex.round));
+            if let Some((iter, remaining)) = ex.quickfix_iter {
+                cyc.push_str(&format!(
+                    "## Quickfix iteration {iter} ({remaining} remaining)\n\n"
+                ));
+            }
+            if let Some(out) = &ex.quickfix_gate_output {
+                cyc.push_str("## ⚠ Failing cargo gate — fix these\n\n");
+                cyc.push_str("```\n");
+                cyc.push_str(out);
+                cyc.push_str("\n```\n\n");
+            }
             if !ex.prior_failed_tools.is_empty() {
                 // Surface failed tool calls FIRST and prominently — these
                 // are the most important thing for the next role to act on,
@@ -1145,9 +1453,12 @@ impl Engine {
         }
         // Drain verdict.
         let verdict = ctx.verdict.lock().take();
+        // Drain critique (only set when role == Critic).
+        let critique = ctx.critique.lock().take();
         // Drain fs events.
         let fs_events: Vec<PathBuf> = ctx.fs_events.lock().drain(..).collect();
 
+        let transcript_cap = self.config.toml.limits.task_transcript_cap;
         self.state.write(|s| {
             if let Some(t) = s.tasks.get_mut(&task_id) {
                 t.transcript.extend(ctx_entries.iter().cloned());
@@ -1156,6 +1467,7 @@ impl Engine {
                 if matches!(role, Role::Judge) {
                     t.final_verdict = verdict.clone();
                 }
+                crate::state::cap_transcript(t, transcript_cap);
                 s.total_cost.add(&usage);
                 s.estimated_cost_usd = compute_total_cost(s);
             }
@@ -1188,6 +1500,7 @@ impl Engine {
         Ok(RoleOutcome {
             text: resp.output,
             failed_tools,
+            critique,
         })
     }
 }
@@ -1201,6 +1514,10 @@ impl Engine {
 struct RoleOutcome {
     text: String,
     failed_tools: Vec<(String, String, String)>,
+    /// Set when this role is Critic and `submit_critique` was called.
+    /// `None` otherwise (and treated as "critic skipped the tool call",
+    /// which the cycle treats conservatively as needs-revision).
+    critique: Option<Critique>,
 }
 
 /// Returns true if the (node, stage) combination is ready to run right now.
@@ -1338,7 +1655,7 @@ fn stage_is_ready(graph: &NodeGraph, id: NodeId, stage: Stage) -> bool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct CycleExtras {
     round: u32,
     prior_actor_text: Option<String>,
@@ -1348,6 +1665,13 @@ struct CycleExtras {
     /// surfaced to the critic and the next reviser so they're not lost.
     /// Each entry: (tool_name, args_json, error_msg).
     prior_failed_tools: Vec<(String, String, String)>,
+    /// For the QuickFixer role: a rendered summary of the failing cargo
+    /// gate output. Pre-formatted with one entry per error / failing
+    /// test so the model doesn't have to parse cargo's JSON.
+    quickfix_gate_output: Option<String>,
+    /// For the QuickFixer role: which iteration we're on (1-based) and
+    /// how many remain. Lets the model pace itself.
+    quickfix_iter: Option<(u32, u32)>,
 }
 
 /// Scan a slice of transcript entries and return UNRESOLVED tool failures —
@@ -1498,7 +1822,11 @@ async fn run_rig_agent(
                 .await?
         }
         (Stage::Spec, Role::Critic) => {
-            base.build().prompt(user_prompt).extended_details().await?
+            base.tool(SubmitCritiqueTool { ctx })
+                .build()
+                .prompt(user_prompt)
+                .extended_details()
+                .await?
         }
         (Stage::Spec, Role::Judge) => {
             base.tool(SubmitVerdictTool { ctx })
@@ -1518,7 +1846,8 @@ async fn run_rig_agent(
                 .await?
         }
         (Stage::Iface, Role::Critic) => {
-            base.tool(CargoCheckTool { ctx })
+            base.tool(CargoCheckTool { ctx: ctx.clone() })
+                .tool(SubmitCritiqueTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1544,7 +1873,8 @@ async fn run_rig_agent(
         }
         (Stage::Tests, Role::Critic) => {
             base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestNoRunTool { ctx })
+                .tool(CargoTestNoRunTool { ctx: ctx.clone() })
+                .tool(SubmitCritiqueTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1573,7 +1903,8 @@ async fn run_rig_agent(
         (Stage::Impl, Role::Critic) => {
             base.tool(CargoCheckTool { ctx: ctx.clone() })
                 .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx })
+                .tool(CargoClippyTool { ctx: ctx.clone() })
+                .tool(SubmitCritiqueTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1602,7 +1933,8 @@ async fn run_rig_agent(
         }
         (Stage::Debug, Role::Critic) => {
             base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx })
+                .tool(CargoTestTool { ctx: ctx.clone() })
+                .tool(SubmitCritiqueTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1628,7 +1960,8 @@ async fn run_rig_agent(
         }
         (Stage::Opt, Role::Critic) => {
             base.tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx })
+                .tool(CargoClippyTool { ctx: ctx.clone() })
+                .tool(SubmitCritiqueTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1637,6 +1970,50 @@ async fn run_rig_agent(
         (Stage::Opt, Role::Judge) => {
             base.tool(CargoTestTool { ctx: ctx.clone() })
                 .tool(SubmitVerdictTool { ctx })
+                .build()
+                .prompt(user_prompt)
+                .extended_details()
+                .await?
+        }
+
+        // QuickFixer — same shape of tools regardless of stage; the gate's
+        // diagnostic tool varies. The loop only fires for stages with a
+        // cargo gate; Architect/Spec branches are kept for exhaustiveness.
+        (Stage::Spec, Role::QuickFixer) => {
+            base.build().prompt(user_prompt).extended_details().await?
+        }
+        (Stage::Iface, Role::QuickFixer) => {
+            base.tool(ReadFileTool { ctx: ctx.clone() })
+                .tool(WriteFileTool { ctx: ctx.clone() })
+                .tool(WriteFileRangeTool { ctx: ctx.clone() })
+                .tool(ApplyPatchTool { ctx: ctx.clone() })
+                .tool(CargoCheckTool { ctx })
+                .build()
+                .prompt(user_prompt)
+                .extended_details()
+                .await?
+        }
+        (Stage::Tests, Role::QuickFixer) => {
+            base.tool(ReadFileTool { ctx: ctx.clone() })
+                .tool(WriteFileTool { ctx: ctx.clone() })
+                .tool(WriteFileRangeTool { ctx: ctx.clone() })
+                .tool(ApplyPatchTool { ctx: ctx.clone() })
+                .tool(CargoCheckTool { ctx: ctx.clone() })
+                .tool(CargoTestNoRunTool { ctx })
+                .build()
+                .prompt(user_prompt)
+                .extended_details()
+                .await?
+        }
+        (Stage::Impl, Role::QuickFixer)
+        | (Stage::Debug, Role::QuickFixer)
+        | (Stage::Opt, Role::QuickFixer) => {
+            base.tool(ReadFileTool { ctx: ctx.clone() })
+                .tool(WriteFileTool { ctx: ctx.clone() })
+                .tool(WriteFileRangeTool { ctx: ctx.clone() })
+                .tool(ApplyPatchTool { ctx: ctx.clone() })
+                .tool(CargoCheckTool { ctx: ctx.clone() })
+                .tool(CargoTestTool { ctx })
                 .build()
                 .prompt(user_prompt)
                 .extended_details()
@@ -1897,11 +2274,15 @@ current node's already-authored slots.\n\n\
         (Stage::Spec, Role::Critic) => {
             "# SPEC · CRITIC\n\
             \n\
-            Read the writer's spec. Bullet-list concrete problems: missing \
+            Read the writer's spec. Identify CONCRETE problems: missing \
             sections, vague invariants, scope creep, decomposition that \
             doesn't match the project mission, child names that aren't \
-            snake_case. If the spec is fine, output exactly \
-            `No issues found.` Don't pad. Don't restate the spec."
+            snake_case. Report via `submit_critique` exactly once. Each \
+            issue's `description` should be one actionable sentence the \
+            reviser can act on directly. If the spec is fine, call \
+            `submit_critique` with an EMPTY `issues` list — that signals \
+            the framework to skip the reviser and judge. Don't pad. \
+            Don't restate the spec. Don't list cosmetic preferences."
                 .to_string()
         }
         (Stage::Spec, Role::Judge) => judge_block(Stage::Spec),
@@ -1926,6 +2307,26 @@ current node's already-authored slots.\n\n\
             3. Run `cargo_check` to verify, then end with a one-line \
                summary.\n\
             \n\
+            ## CRITICAL — unimplemented functions go in TRAITS, not modules\n\
+            \n\
+            Rust has NO concept of a \"function prototype\" or \"forward \
+            declaration\". Writing `pub fn foo() -> Bar;` (signature \
+            followed by a semicolon) inside a module is a SYNTAX ERROR \
+            — it's not valid Rust and `cargo check` will reject it.\n\
+            \n\
+            If you want to declare a function whose implementation \
+            lives elsewhere (or is not yet written), put it inside a \
+            `pub trait`:\n\
+            ```rust\n\
+            pub trait Foo {{\n\
+                fn bar(&self) -> Bar;          // OK — trait method\n\
+            }}\n\
+            ```\n\
+            This is the ONLY way to express an unimplemented function \
+            in Rust's public surface. Free functions in modules MUST \
+            have a body — even if it's `todo!()` (but `todo!()` belongs \
+            in `private.rs`, not `public.rs`).\n\
+            \n\
             ## Module-path rules in `private.rs`\n\
             \n\
             - For your OWN public types: `use super::public::*;` — NEVER \
@@ -1945,11 +2346,16 @@ current node's already-authored slots.\n\n\
         (Stage::Iface, Role::Critic) => {
             "# IFACE · CRITIC\n\
             \n\
-            Use `cargo_check` to verify the iface compiles. Bullet-list \
-            problems: forbidden items in `public.rs`, missing `impl` stubs \
-            in `private.rs`, mismatch between trait signatures and the \
-            spec's API section, undeclared dep imports. If clean, say \
-            exactly `No issues found.`"
+            Use `cargo_check` to verify the iface compiles. Identify \
+            concrete problems: forbidden items in `public.rs`, missing \
+            `impl` stubs in `private.rs`, mismatch between trait \
+            signatures and the spec's API section, undeclared dep \
+            imports. Report via `submit_critique` exactly once. Each \
+            issue's `description` is one actionable sentence with a \
+            `file:line` `location` if you can identify one. If clean, \
+            call `submit_critique` with an EMPTY `issues` list. The \
+            quickfix loop already ran for mechanical compile fixes — \
+            don't re-litigate compile errors that are already gone."
                 .to_string()
         }
         (Stage::Iface, Role::Judge) => judge_block(Stage::Iface),
@@ -1966,7 +2372,8 @@ current node's already-authored slots.\n\n\
             Workflow:\n\
             1. Import the node's public surface with `use \
                super::public::*;` (NEVER `use crate::TypeName`).\n\
-            2. Cover the spec's invariants and edge cases.\n\
+            2. Cover the spec's invariants and edge cases — see the \
+               scope and triviality rules below.\n\
             3. Run `cargo_test_no_run` to verify the file compiles.\n\
             4. End with a one-line summary.\n\
             \n\
@@ -1974,6 +2381,33 @@ current node's already-authored slots.\n\n\
             `private.rs` has `todo!()` stubs satisfying the trait at the \
             type level — they FAIL at runtime, which is expected. The \
             next stage replaces the stubs and the same tests pass.\n\
+            \n\
+            ## What to test\n\
+            \n\
+            Test the FUNCTIONAL CONTRACT this node's spec promises. \
+            Tests should fail if the implementation violates an \
+            invariant, edge case, or behaviour described in the spec.\n\
+            \n\
+            ## What NOT to test (these are wasted tokens)\n\
+            \n\
+            - **Things the language guarantees**: don't test that a \
+              constructor returns a struct of the right type, that a \
+              `Vec` is empty after `clear()`, that `Default::default()` \
+              produces a default value, that an enum's variants \
+              destructure correctly. The compiler proves these for you.\n\
+            - **Implementation details**: don't test private internals \
+              you happen to know exist. Test through the public surface.\n\
+            - **Other nodes' contracts**: tests for node X test X's \
+              public interface ONLY. Do NOT write project-level tests \
+              that depend on other nodes existing, `tests::fixture_files_exist`, \
+              `tests::all_binary_entry_points_exist`, etc. — these belong \
+              in dedicated integration-test nodes if at all, and they \
+              break every other node's gate when they fail. Stay in scope.\n\
+            - **Trivially-true assertions**: `assert_eq!(2 + 2, 4)`-style \
+              filler. If a test would pass for any non-empty struct of \
+              the right shape, don't write it.\n\
+            \n\
+            ## Module-path rules\n\
             \n\
             `use crate::<X>::...` rule same as `private.rs`: X must be a \
             declared dep / ancestor / own child. Don't write integration \
@@ -1983,11 +2417,16 @@ current node's already-authored slots.\n\n\
         (Stage::Tests, Role::Critic) => {
             "# TESTS · CRITIC\n\
             \n\
-            Use `cargo_test_no_run` to confirm tests compile. Bullet-list \
-            problems: tests that don't actually exercise the spec, tests \
-            that import via `crate::TypeName` instead of \
-            `super::public::*`, missing edge-case coverage. If clean, \
-            `No issues found.`"
+            Use `cargo_test_no_run` to confirm tests compile. Identify \
+            concrete problems: tests that don't actually exercise the \
+            spec, tests that import via `crate::TypeName` instead of \
+            `super::public::*`, missing edge-case coverage, OR tests \
+            that test things the language already guarantees (e.g. \
+            \"a struct's constructor returns a struct\", \"a `Vec` \
+            is empty after `clear()`\" — these are wasted tokens; flag \
+            them for deletion). Report via `submit_critique` exactly \
+            once with an actionable `description` per issue. If clean, \
+            call `submit_critique` with an EMPTY `issues` list."
                 .to_string()
         }
         (Stage::Tests, Role::Judge) => judge_block(Stage::Tests),
@@ -2012,10 +2451,13 @@ current node's already-authored slots.\n\n\
         (Stage::Impl, Role::Critic) => {
             "# IMPL · CRITIC\n\
             \n\
-            Run `cargo_test`. Bullet-list failing tests, lints with \
-            obvious correctness implications, and any `unsafe` or \
-            `unwrap()` smell that the spec didn't sanction. If green, \
-            `No issues found.`"
+            Run `cargo_test`. Identify concrete problems: failing tests, \
+            lints with obvious correctness implications, any `unsafe` or \
+            `unwrap()` smell that the spec didn't sanction. Report via \
+            `submit_critique` exactly once with one actionable issue per \
+            entry. If green and clean, call `submit_critique` with an \
+            EMPTY `issues` list. The quickfix loop already ran for \
+            mechanical fixes; don't re-litigate them."
                 .to_string()
         }
         (Stage::Impl, Role::Judge) => judge_block(Stage::Impl),
@@ -2034,9 +2476,10 @@ current node's already-authored slots.\n\n\
         (Stage::Debug, Role::Critic) => {
             "# DEBUG · CRITIC\n\
             \n\
-            Run `cargo_test`. Are tests green? Bullet-list anything \
-            still failing or any test that was loosened to make impl \
-            pass. If clean, `No issues found.`"
+            Run `cargo_test`. Identify anything still failing or any \
+            test that was loosened to make impl pass. Report via \
+            `submit_critique` exactly once. If clean, call \
+            `submit_critique` with an EMPTY `issues` list."
                 .to_string()
         }
         (Stage::Debug, Role::Judge) => judge_block(Stage::Debug),
@@ -2054,13 +2497,67 @@ current node's already-authored slots.\n\n\
             "# OPT · CRITIC\n\
             \n\
             Run `cargo_test` and `cargo_clippy`. If anything regressed \
-            or was made worse, bullet it. Otherwise `No issues found.`"
+            or was made worse, report via `submit_critique`. Otherwise \
+            call `submit_critique` with an EMPTY `issues` list."
                 .to_string()
         }
         (Stage::Opt, Role::Judge) => judge_block(Stage::Opt),
+
+        // QuickFixer — same preamble for every stage; the specific gate
+        // and the errors to address come from the cycle context block.
+        (_, Role::QuickFixer) => quickfix_preamble(stage),
     };
 
     format!("{common}\n\n{role_block}")
+}
+
+fn quickfix_preamble(stage: Stage) -> String {
+    let gate = match stage {
+        Stage::Iface => "`cargo_check`",
+        Stage::Tests => "`cargo_check` and `cargo_test_no_run`",
+        Stage::Impl | Stage::Debug | Stage::Opt => "`cargo_check` and `cargo_test`",
+        Stage::Architect | Stage::Spec => "(no gate)",
+    };
+    format!(
+        "# QUICKFIX · {stage}\n\
+        \n\
+        The previous writer/reviser turn left the build in a FAILED state. \
+        Your job is to fix the compile / test errors directly — not to \
+        redesign, not to second-guess the spec, just to make the build \
+        green. The errors are listed in the cycle-context section below.\n\
+        \n\
+        ## Workflow\n\
+        \n\
+        1. Read the errors. Each has a file path + line number.\n\
+        2. Use `read_file` to inspect surrounding code if you need context.\n\
+        3. Apply the smallest possible fix:\n\
+           - For a localized change (one function body, one signature), \
+             prefer `write_file_range` or `apply_patch`.\n\
+           - For a whole-file rewrite, use `write_file`.\n\
+        4. Re-run {gate} to confirm the fix landed.\n\
+        5. If clean, end your turn with a one-line summary. If errors \
+           remain, iterate.\n\
+        \n\
+        ## Tool rules\n\
+        \n\
+        - You can ONLY edit slots on the CURRENT node: `<src>/public.rs`, \
+          `<src>/private.rs`, `<src>/tests.rs`, `<spec>/public.md`, \
+          `<spec>/private.md`. Auto-generated files (mod.rs, lib.rs, \
+          Cargo.toml) cannot be edited — those are framework-rendered.\n\
+        - If the right fix is in another node's file, end your turn and \
+          explain why — the framework will route that elsewhere.\n\
+        - DO NOT call any submit_* tool from here. The slot edits do the \
+          equivalent of submit_* (validate, update graph, re-render).\n\
+        \n\
+        ## What NOT to do\n\
+        \n\
+        - Don't rewrite the public API to dodge a type error in private — \
+          fix private to honor public.\n\
+        - Don't delete failing tests. If a test is wrong, that's a \
+          test-stage problem; flag it and stop.\n\
+        - Don't add panics, todos, or unimplemented!() to make code \
+          compile — the cargo_test gate will still catch you."
+    )
 }
 
 fn judge_block(stage: Stage) -> String {
@@ -2142,7 +2639,9 @@ fn role_user_prompt(stage: Stage, role: Role) -> String {
              summary."
         ),
         (s, Role::Critic) => format!(
-            "Critique the writer's {s}-stage output. Bullet list. Empty list = `No issues found.`"
+            "Critique the writer's {s}-stage output. Call submit_critique exactly once with a \
+             concrete `issues` list (empty list = nothing to fix, the framework will skip the \
+             reviser and judge)."
         ),
         (s, Role::Reviser) => format!(
             "Address each critic point for the {s} stage. End with a one-line summary of the changes."
@@ -2151,6 +2650,10 @@ fn role_user_prompt(stage: Stage, role: Role) -> String {
             "Verify the reviser addressed each critic point for the {s} stage. Call \
              submit_verdict exactly once."
         ),
+        (_, Role::QuickFixer) => "Fix the compile / test errors listed in the system prompt. \
+             Use read_file / write_file / write_file_range / apply_patch, re-check with the \
+             cargo_* tool, and stop as soon as the gate passes."
+            .to_string(),
     }
 }
 

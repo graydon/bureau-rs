@@ -27,7 +27,8 @@ use crate::engine::{DriveParams, DriveResponse, LlmDriver};
 use crate::graph::Stage;
 use crate::state::TokenUsage;
 use crate::tools::{
-    self, Role, SubmitRustArgs, SubmitSpecArgs, SubmitVerdictArgs, TaskCtx,
+    self, CritiqueIssue, Role, SubmitCritiqueArgs, SubmitRustArgs, SubmitSpecArgs,
+    SubmitVerdictArgs, TaskCtx,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -54,6 +55,9 @@ pub enum ScriptedCall {
     SubmitPrivate(String),
     SubmitTests(String),
     SubmitVerdict { satisfactory: bool, reason: String },
+    /// Structured critic submission. Empty `issues` triggers the
+    /// fast-path that skips reviser + judge for the round.
+    SubmitCritique { issues: Vec<CritiqueIssue> },
 }
 
 impl ScriptedCall {
@@ -113,6 +117,21 @@ impl ScriptedCall {
         Self::SubmitVerdict {
             satisfactory: false,
             reason: reason.into(),
+        }
+    }
+    /// Convenience: critic says "no issues" via empty list — triggers
+    /// the engine's fast path that skips reviser + judge.
+    pub fn critique_clean() -> Self {
+        Self::SubmitCritique { issues: vec![] }
+    }
+    /// Convenience: critic raises one issue with the given description.
+    pub fn critique_one(description: impl Into<String>) -> Self {
+        Self::SubmitCritique {
+            issues: vec![CritiqueIssue {
+                description: description.into(),
+                location: None,
+                severity: None,
+            }],
         }
     }
 }
@@ -282,6 +301,14 @@ async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
             })
             .await
             .map_err(|e| anyhow!("submit_verdict: {e}"))?;
+        }
+        SubmitCritique { issues } => {
+            let tool = tools::SubmitCritiqueTool { ctx: ctx.clone() };
+            tool.call(SubmitCritiqueArgs {
+                issues: issues.clone(),
+            })
+            .await
+            .map_err(|e| anyhow!("submit_critique: {e}"))?;
         }
     }
     Ok(())

@@ -324,8 +324,36 @@ async function load() {
   refreshFiles(); refreshGit(); refreshIssues();
 }
 
+// Indexes rebuilt once per render() so the recursive node/stage walk
+// doesn't go quadratic. Without these, `findTaskFor` was O(all-tasks)
+// per stage-pill (×6 pills × N nodes per render) and the children
+// lookup was O(all-nodes) per parent. Under load (many nodes, thousands
+// of tasks) those dominated each render's CPU.
+let _taskIndex = null;       // Map "<node_id>|<stage>" -> latest task
+let _childIndex = null;      // Map parent_id -> [child_node, ...]
+
+function rebuildIndexes() {
+  _taskIndex = new Map();
+  for (const t of Object.values(state.tasks || {})) {
+    const key = t.node_id + '|' + t.stage;
+    const cur = _taskIndex.get(key);
+    if (!cur || (t.started_at || '') > (cur.started_at || '')) {
+      _taskIndex.set(key, t);
+    }
+  }
+  _childIndex = new Map();
+  for (const n of Object.values(state.graph?.nodes || {})) {
+    if (n.parent != null) {
+      let bucket = _childIndex.get(n.parent);
+      if (!bucket) { bucket = []; _childIndex.set(n.parent, bucket); }
+      bucket.push(n);
+    }
+  }
+}
+
 function render() {
   if (!state) return;
+  rebuildIndexes();
   document.getElementById('sched').textContent = state.scheduler;
   const nodeCount = Object.keys(state.graph?.nodes || {}).length;
   const taskCount = Object.keys(state.tasks || {}).length;
@@ -353,19 +381,14 @@ function renderGraph() {
 // Find the task that ran for (node_id, stage). If none yet, returns null.
 // Picks the most recently-started one (later attempts override earlier).
 function findTaskFor(nodeId, stage) {
-  let best = null;
-  for (const t of Object.values(state.tasks || {})) {
-    if (t.node_id === nodeId && t.stage === stage) {
-      if (!best || (t.started_at || '') > (best.started_at || '')) best = t;
-    }
-  }
-  return best;
+  if (!_taskIndex) return null;
+  return _taskIndex.get(nodeId + '|' + stage) || null;
 }
 
 function renderNodeRecursive(parent, nodeId) {
   const n = state.graph.nodes[nodeId];
   if (!n) return;
-  const children = Object.values(state.graph.nodes).filter(c => c.parent === nodeId);
+  const children = (_childIndex && _childIndex.get(nodeId)) || [];
   const isCollapsed = !!nodeCollapsed[nodeId];
   const div = document.createElement('div');
   div.className = 'node';
@@ -418,7 +441,7 @@ function renderNodeRecursive(parent, nodeId) {
     pill.onclick = (e) => {
       e.stopPropagation();
       const t = findTaskFor(pill.dataset.nodeId, pill.dataset.stage);
-      if (t) { selectedTaskId = t.id; render(); }
+      if (t) { selectTask(t.id); }
     };
   }
   parent.appendChild(div);
@@ -446,7 +469,7 @@ function renderTasks() {
       <span class="phase">${t.stage}</span>
       <span class="status ${t.status}">${t.status}</span>
       <span class="muted">${(t.cost?.input_tokens||0)+(t.cost?.output_tokens||0)} tok</span>`;
-    div.onclick = () => { selectedTaskId = t.id; render(); };
+    div.onclick = () => { selectTask(t.id); };
     el.appendChild(div);
   }
 }
@@ -471,6 +494,30 @@ function kindLabel(kind) {
     case 'error':            return 'error';
     default:                 return kind?.type || 'note';
   }
+}
+
+// Select a task and lazily fetch its transcript (which /api/state no
+// longer ships, to keep the polled state-payload small). The SSE
+// `transcript_appended` handler keeps the in-memory copy live after the
+// initial fetch.
+async function selectTask(id, after) {
+  selectedTaskId = id;
+  // Render once immediately so the selection highlight and task header
+  // update without waiting on the fetch.
+  render();
+  if (id) {
+    try {
+      const transcript = await api('/api/task_transcript?id=' + encodeURIComponent(id));
+      const t = state.tasks?.[id];
+      if (t && Array.isArray(transcript)) {
+        t.transcript = transcript;
+        render();
+      }
+    } catch (e) {
+      console.error('fetch task transcript failed', e);
+    }
+  }
+  if (typeof after === 'function') after();
 }
 
 function renderTranscript() {
@@ -533,8 +580,22 @@ function renderTranscript() {
       </div>
       ${inner}`;
     div.querySelector('.h').onclick = () => {
-      collapsed[key] = !isCollapsed;
-      renderTranscript();
+      // Toggle the class directly instead of doing a full transcript
+      // re-render. For 500+ entries that re-render was visibly janky.
+      const nowCollapsed = !div.classList.contains('collapsed');
+      div.classList.toggle('collapsed', nowCollapsed);
+      collapsed[key] = nowCollapsed;
+      // Periodic sweep: if `collapsed` has grown large, drop entries
+      // whose task is no longer selected (they can't be referenced
+      // again until the user re-selects that task, at which point
+      // their default state is fine).
+      const keyCount = Object.keys(collapsed).length;
+      if (keyCount > CLIENT_COLLAPSED_CAP) {
+        const prefix = selectedTaskId + '-';
+        for (const k of Object.keys(collapsed)) {
+          if (!k.startsWith(prefix)) delete collapsed[k];
+        }
+      }
     };
     el.appendChild(div);
   });
@@ -622,12 +683,10 @@ async function refreshIssues() {
       </div>
       <div class="imsg">${escapeHtml(it.message)}</div>`;
     div.onclick = () => {
-      selectedTaskId = it.task_id;
-      render();
-      setTimeout(() => {
+      selectTask(it.task_id, () => {
         const target = document.querySelector(`[data-entry-key="${selectedTaskId}-${it.entry_index}"]`);
         if (target) target.scrollIntoView({behavior:'smooth', block:'center'});
-      }, 0);
+      });
     };
     el.appendChild(div);
   }
@@ -653,6 +712,19 @@ async function openFile(path) {
   document.getElementById('preview').textContent = t;
 }
 
+// Maximum entries to retain on the SELECTED task's transcript in browser
+// memory. The server caps its copy at 500 (configurable); after the
+// initial fetch the client extends via SSE without bound, so we cap
+// independently. On overflow we drop the oldest half (the head, since
+// the most recent activity is what the operator usually wants to see).
+const CLIENT_TRANSCRIPT_CAP = 1500;
+// Cap state.history; the engine emits a HistoryAppended for every
+// `note()` call, which gets noisy under high concurrency.
+const CLIENT_HISTORY_CAP = 500;
+// Cap `collapsed` keys. Toggling expanders never compacts this on its
+// own; we sweep when it grows past this size.
+const CLIENT_COLLAPSED_CAP = 5000;
+
 function applyEvent(ev) {
   if (!state) return;
   switch (ev.type) {
@@ -667,9 +739,22 @@ function applyEvent(ev) {
       state.tasks[ev.task.id] = ev.task;
       break;
     case 'transcript_appended':
-      // role lives on the entry now, not the event.
-      const t = state.tasks?.[ev.task_id];
-      if (t) { t.transcript = t.transcript || []; t.transcript.push(ev.entry); }
+      // Only retain the transcript for the SELECTED task in browser
+      // memory. Unselected tasks' transcripts can be fetched fresh
+      // via /api/task_transcript if/when the user clicks them — keeping
+      // them all in memory grows the heap without bound during long
+      // runs (the source of the client-side memory pressure).
+      if (ev.task_id === selectedTaskId) {
+        const t = state.tasks?.[ev.task_id];
+        if (t) {
+          t.transcript = t.transcript || [];
+          t.transcript.push(ev.entry);
+          // Cap selected-task transcript: drop oldest half on overflow.
+          if (t.transcript.length > CLIENT_TRANSCRIPT_CAP) {
+            t.transcript.splice(0, t.transcript.length - CLIENT_TRANSCRIPT_CAP / 2);
+          }
+        }
+      }
       break;
     case 'task_cost':
       const tc = state.tasks?.[ev.task_id];
@@ -678,7 +763,11 @@ function applyEvent(ev) {
       state.estimated_cost_usd = ev.estimated_usd;
       break;
     case 'history_appended':
-      state.history = state.history || []; state.history.push(ev.entry);
+      state.history = state.history || [];
+      state.history.push(ev.entry);
+      if (state.history.length > CLIENT_HISTORY_CAP) {
+        state.history.splice(0, state.history.length - CLIENT_HISTORY_CAP);
+      }
       break;
     case 'file_changed':
       scheduleRefresh();
@@ -687,7 +776,21 @@ function applyEvent(ev) {
       // Defer to periodic state poll for now.
       break;
   }
-  render();
+  scheduleRender();
+}
+
+// Coalesce render calls via requestAnimationFrame. With high engine
+// concurrency the SSE stream can deliver dozens of events per frame;
+// calling render() for each was burning the main thread on redundant
+// DOM rebuilds and was the dominant lockup symptom under load.
+let _renderPending = false;
+function scheduleRender() {
+  if (_renderPending) return;
+  _renderPending = true;
+  requestAnimationFrame(() => {
+    _renderPending = false;
+    render();
+  });
 }
 
 let _refTimer;
@@ -696,17 +799,43 @@ function scheduleRefresh() {
   _refTimer = setTimeout(() => { refreshFiles(); refreshIssues(); }, 250);
 }
 
+let _es = null;
 function connectSse() {
+  // Close any existing connection BEFORE creating a new one. Previously
+  // the order was inverted (schedule reconnect, then close), so under
+  // flaky network conditions multiple EventSource instances could
+  // accumulate, each leaking its handler closures.
+  if (_es) { try { _es.close(); } catch (_) {} _es = null; }
   const es = new EventSource('/api/events');
+  _es = es;
   es.onmessage = e => { try { applyEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
-  es.onerror = () => { setTimeout(connectSse, 2000); es.close(); };
+  es.onerror = () => {
+    try { es.close(); } catch (_) {}
+    if (_es === es) _es = null;
+    setTimeout(connectSse, 2000);
+  };
 }
 
 initSections(); initSplitters(); load(); connectSse();
 setInterval(refreshFiles, 4000);
 setInterval(refreshGit, 5000);
 setInterval(refreshIssues, 4000);
-setInterval(async () => { state = await api('/api/state'); render(); }, 8000);
+// Periodic state sync. /api/state ships a SLIM snapshot with each
+// task's transcript empty (the wire payload is dominated by transcripts
+// otherwise — see snapshot_slim in src/state.rs). Naively replacing
+// `state` would clobber the in-memory transcript of the selected task
+// on every poll; we preserve it here so the transcript view doesn't
+// flash empty every 8 seconds.
+setInterval(async () => {
+  const prev = selectedTaskId && state
+    ? state.tasks?.[selectedTaskId]?.transcript
+    : null;
+  state = await api('/api/state');
+  if (prev && selectedTaskId && state.tasks?.[selectedTaskId]) {
+    state.tasks[selectedTaskId].transcript = prev;
+  }
+  render();
+}, 8000);
 </script>
 </body>
 </html>

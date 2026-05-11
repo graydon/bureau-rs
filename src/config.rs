@@ -91,6 +91,9 @@ impl ModelConfig {
             crate::tools::Role::Critic => &self.critic,
             crate::tools::Role::Reviser => &self.reviser,
             crate::tools::Role::Judge => &self.judge,
+            // QuickFixer is a writer-class role (it edits code); fall
+            // through to writer's override before hitting `default`.
+            crate::tools::Role::QuickFixer => &self.writer,
         };
         if let Some(s) = role_override.as_deref() {
             return s;
@@ -144,6 +147,24 @@ pub struct Limits {
     pub max_node_depth: usize,
     #[serde(default)]
     pub cost_cap_usd: Option<f64>,
+    /// Quickfix iterations per writer/reviser turn. The framework runs
+    /// the relevant cargo gate after the writer (and after the reviser)
+    /// submits content; if the gate fails, the quickfix loop kicks in:
+    /// the model sees the compile errors and is given read/write/patch
+    /// tools to fix them, iterating up to this many times before
+    /// escalating to the critic (or the outer stage retry). Default 5.
+    #[serde(default = "default_max_quickfix_iters")]
+    pub max_quickfix_iters: u32,
+    /// Per-task transcript cap. The engine appends entries to each task's
+    /// transcript on every system prompt, tool call, tool result, and
+    /// assistant message. With critique cycles and quickfix loops a
+    /// single task can produce 50-200 entries — small per task, but
+    /// thousands of tasks per long run dominate state-memory growth.
+    /// On overflow the engine keeps the head + tail and replaces the
+    /// middle with a single elision marker. Default 500. Set 0 to
+    /// disable.
+    #[serde(default = "default_task_transcript_cap")]
+    pub task_transcript_cap: usize,
 }
 
 fn default_max_file_lines() -> usize {
@@ -176,6 +197,12 @@ fn default_max_nodes() -> usize {
 fn default_max_node_depth() -> usize {
     5
 }
+fn default_max_quickfix_iters() -> u32 {
+    5
+}
+fn default_task_transcript_cap() -> usize {
+    500
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -191,6 +218,8 @@ impl Default for Limits {
             max_nodes: default_max_nodes(),
             max_node_depth: default_max_node_depth(),
             cost_cap_usd: None,
+            max_quickfix_iters: default_max_quickfix_iters(),
+            task_transcript_cap: default_task_transcript_cap(),
         }
     }
 }

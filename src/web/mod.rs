@@ -70,7 +70,14 @@ async fn ui_index() -> impl IntoResponse {
 }
 
 async fn api_state(State(s): State<AppState>) -> Json<crate::state::EngineState> {
-    Json(s.state.snapshot())
+    // Slim snapshot: same shape as the full state but with each task's
+    // transcript omitted. The transcript is the bulk of state memory,
+    // and shipping it on every poll (every 8s by default) dominates
+    // both the time spent holding the inner mutex (which blocks engine
+    // writes — that's the UI-lockup symptom) and the JSON payload
+    // size. Clients fetch individual task transcripts on demand via
+    // `/api/task_transcript`.
+    Json(s.state.snapshot_slim())
 }
 
 async fn api_events(

@@ -104,6 +104,9 @@ pub struct TaskCtx {
     pub recent_calls: Mutex<VecDeque<(String, u64)>>,
     /// Filled by `submit_verdict` (judge stage only).
     pub verdict: Mutex<Option<JudgeVerdict>>,
+    /// Filled by `submit_critique` (critic stage only). The reviser and
+    /// fast-path detection both read this instead of fuzzy-parsing prose.
+    pub critique: Mutex<Option<Critique>>,
     /// Transcript callback for recording tool calls / results.
     pub transcript: Mutex<Vec<TranscriptEntry>>,
     /// File changes queued for the orchestrator to broadcast over SSE.
@@ -220,6 +223,7 @@ impl TaskCtx {
             max_node_depth,
             recent_calls: Mutex::new(VecDeque::new()),
             verdict: Mutex::new(None),
+            critique: Mutex::new(None),
             transcript: Mutex::new(Vec::new()),
             fs_events: Mutex::new(Vec::new()),
             cargo_lock,
@@ -1102,6 +1106,135 @@ fn is_valid_ident(s: &str) -> bool {
 }
 
 // --------------------------------------------------------------------------
+// submit_critique
+// --------------------------------------------------------------------------
+//
+// The critic emits a structured list of issues via this tool instead of
+// writing free-form prose for the engine to fuzzy-match on. Empty
+// `issues` list = nothing to fix = engine skips reviser + judge for
+// the round. Each issue carries a `description` (REQUIRED) and an
+// optional `location` (path:line as the model best knows it) and
+// `severity` ("error" | "warning" | "nit"). The reviser sees the
+// rendered list as its critique context.
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CritiqueIssue {
+    /// Short concrete description of the problem. The reviser reads
+    /// these one-by-one as its task list; this is the *content*, not
+    /// just a label.
+    pub description: String,
+    /// Optional `file:line` (or just `file`) the issue points at.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Optional severity: "error", "warning", or "nit". Defaults to
+    /// "warning" if absent.
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Critique {
+    pub issues: Vec<CritiqueIssue>,
+}
+
+impl Critique {
+    pub fn is_clean(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    /// Render the issues list as a markdown bullet list for the reviser's
+    /// critique-cycle context.
+    pub fn render(&self) -> String {
+        if self.issues.is_empty() {
+            return "(critic reported no issues)".to_string();
+        }
+        let mut s = String::new();
+        for (i, issue) in self.issues.iter().enumerate() {
+            let sev = issue.severity.as_deref().unwrap_or("warning");
+            let loc = issue
+                .location
+                .as_deref()
+                .map(|l| format!(" ({l})"))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "{n}. [{sev}]{loc} {desc}\n",
+                n = i + 1,
+                desc = issue.description.trim()
+            ));
+        }
+        s
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SubmitCritiqueArgs {
+    /// Zero or more concrete issues with the writer's output. Empty
+    /// list = nothing to fix = the framework will skip reviser + judge
+    /// for the round.
+    #[serde(default)]
+    pub issues: Vec<CritiqueIssue>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SubmitCritiqueOk {
+    pub recorded: bool,
+    pub issue_count: usize,
+}
+
+pub struct SubmitCritiqueTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for SubmitCritiqueTool {
+    const NAME: &'static str = "submit_critique";
+    type Error = ToolFailure;
+    type Args = SubmitCritiqueArgs;
+    type Output = SubmitCritiqueOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "location": {"type": "string"},
+                                "severity": {
+                                    "type": "string",
+                                    "enum": ["error", "warning", "nit"]
+                                }
+                            },
+                            "required": ["description"]
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<SubmitCritiqueOk, _>(e));
+        }
+        let issue_count = args.issues.len();
+        let r: Result<SubmitCritiqueOk, ToolFailure> = {
+            *self.ctx.critique.lock() = Some(Critique { issues: args.issues });
+            Ok(SubmitCritiqueOk {
+                recorded: true,
+                issue_count,
+            })
+        };
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+// --------------------------------------------------------------------------
 // submit_verdict
 // --------------------------------------------------------------------------
 
@@ -1497,6 +1630,515 @@ fn collect_filters(args: &CargoTestArgs) -> Vec<String> {
 }
 
 // --------------------------------------------------------------------------
+// File-editing tools — used in the quickfix loop to let the writer iterate
+// on compile / test failures by reading and editing the files it just
+// authored, rather than escalating to the critic/reviser cycle for what
+// are usually mechanical fixes.
+//
+// These tools operate via the graph slot for managed files: read_file
+// reads from disk; write_file / write_file_range / apply_patch resolve
+// the target path to a node-slot (public.rs / private.rs / tests.rs /
+// spec markdown), update that slot, and re-render — same code path as
+// the submit_* tools, so the model can't accidentally desync the
+// rendered tree from the graph.
+// --------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ReadFileArgs {
+    /// Path relative to the workdir root. No absolute paths, no `..`.
+    pub path: String,
+    /// 1-based line number to start reading at. Optional; defaults to 1.
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    /// 1-based inclusive line number to stop reading at. Optional;
+    /// defaults to end of file.
+    #[serde(default)]
+    pub end_line: Option<usize>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ReadFileOk {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+pub struct ReadFileTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+const READ_FILE_MAX_BYTES: usize = 64 * 1024;
+
+impl Tool for ReadFileTool {
+    const NAME: &'static str = "read_file";
+    type Error = ToolFailure;
+    type Args = ReadFileArgs;
+    type Output = ReadFileOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<ReadFileOk, _>(e));
+        }
+        let r: Result<ReadFileOk, ToolFailure> = (|| {
+            let abs = scoped_path(&self.ctx.workdir, &args.path)?;
+            let content = std::fs::read_to_string(&abs).map_err(|e| {
+                ToolFailure::Other(format!("read {}: {e}", args.path))
+            })?;
+            let total = content.lines().count();
+            let start = args.start_line.unwrap_or(1).max(1);
+            let end = args.end_line.unwrap_or(total).min(total);
+            let slice: String = if start > total {
+                String::new()
+            } else {
+                content
+                    .lines()
+                    .skip(start - 1)
+                    .take(end.saturating_sub(start) + 1)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let truncated = slice.len() > READ_FILE_MAX_BYTES;
+            let slice = if truncated {
+                let mut cut = READ_FILE_MAX_BYTES;
+                while cut > 0 && !slice.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                slice[..cut].to_string()
+            } else {
+                slice
+            };
+            Ok(ReadFileOk {
+                path: args.path,
+                start_line: start,
+                end_line: end,
+                total_lines: total,
+                content: slice,
+                truncated,
+            })
+        })();
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WriteFileArgs {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct WriteFileOk {
+    pub path: String,
+    pub bytes: u64,
+    pub lines: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_change: bool,
+}
+
+pub struct WriteFileTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for WriteFileTool {
+    const NAME: &'static str = "write_file";
+    type Error = ToolFailure;
+    type Args = WriteFileArgs;
+    type Output = WriteFileOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<WriteFileOk, _>(e));
+        }
+        let r = apply_slot_edit(&self.ctx, &args.path, args.content.clone(), Self::NAME);
+        self.ctx.finish(Self::NAME, r.map(|(bytes, lines, no_change)| WriteFileOk {
+            path: args.path,
+            bytes,
+            lines,
+            no_change,
+        }))
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WriteFileRangeArgs {
+    pub path: String,
+    /// 1-based inclusive start line of the range to replace.
+    pub start_line: usize,
+    /// 1-based inclusive end line of the range to replace.
+    pub end_line: usize,
+    /// Replacement content (may be multi-line, may be empty to delete).
+    pub content: String,
+}
+
+pub struct WriteFileRangeTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for WriteFileRangeTool {
+    const NAME: &'static str = "write_file_range";
+    type Error = ToolFailure;
+    type Args = WriteFileRangeArgs;
+    type Output = WriteFileOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "start_line", "end_line", "content"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<WriteFileOk, _>(e));
+        }
+        let r: Result<WriteFileOk, ToolFailure> = (|| {
+            let current = read_slot_content(&self.ctx, &args.path)?;
+            let lines: Vec<&str> = current.lines().collect();
+            if args.start_line == 0 || args.end_line < args.start_line {
+                return Err(ToolFailure::Other(format!(
+                    "write_file_range: invalid range [{},{}] (must be 1-based, end>=start)",
+                    args.start_line, args.end_line
+                )));
+            }
+            let total = lines.len();
+            let end = args.end_line.min(total);
+            let start = args.start_line.min(total + 1);
+            let mut new_content = String::new();
+            for line in &lines[..start - 1] {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            if !args.content.is_empty() {
+                new_content.push_str(&args.content);
+                if !args.content.ends_with('\n') {
+                    new_content.push('\n');
+                }
+            }
+            for line in &lines[end..] {
+                new_content.push_str(line);
+                new_content.push('\n');
+            }
+            let (bytes, line_count, no_change) =
+                apply_slot_edit(&self.ctx, &args.path, new_content, Self::NAME)?;
+            Ok(WriteFileOk {
+                path: args.path.clone(),
+                bytes,
+                lines: line_count,
+                no_change,
+            })
+        })();
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ApplyPatchArgs {
+    /// A unified-diff patch (`--- a/file\n+++ b/file\n@@ ...`) or a
+    /// markdown code block containing one. Multi-file patches are
+    /// supported; mpatch detects the format automatically and applies
+    /// each hunk with fuzzy matching.
+    pub patch: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ApplyPatchOk {
+    pub files_changed: Vec<String>,
+    pub hunks_applied: usize,
+    pub hunks_failed: usize,
+}
+
+pub struct ApplyPatchTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for ApplyPatchTool {
+    const NAME: &'static str = "apply_patch";
+    type Error = ToolFailure;
+    type Args = ApplyPatchArgs;
+    type Output = ApplyPatchOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<ApplyPatchOk, _>(e));
+        }
+        let r = apply_patch_inner(&self.ctx, &args.patch);
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+fn apply_patch_inner(ctx: &Arc<TaskCtx>, patch_text: &str) -> Result<ApplyPatchOk, ToolFailure> {
+    let patches = mpatch::parse_auto(patch_text).map_err(|e| {
+        ToolFailure::Other(format!("apply_patch: parse failed: {e}"))
+    })?;
+    if patches.is_empty() {
+        return Err(ToolFailure::Other(
+            "apply_patch: parsed zero patches (no recognizable diff in input)".into(),
+        ));
+    }
+    let opts = mpatch::ApplyOptions::new();
+    let mut files_changed: Vec<String> = Vec::new();
+    let mut hunks_applied = 0usize;
+    let mut hunks_failed = 0usize;
+    for patch in &patches {
+        // The Patch struct exposes its target file via `Display`'d header
+        // or via fields. We use the most reliable: serialize the patch
+        // and extract the `+++ b/<path>` line.
+        let header_text = format!("{patch}");
+        let path = extract_target_path(&header_text).ok_or_else(|| {
+            ToolFailure::Other(
+                "apply_patch: could not determine target path from patch header".into(),
+            )
+        })?;
+        let current = read_slot_content(ctx, &path)?;
+        // Reconstruct a single-patch string and apply via patch_content_str.
+        let single = header_text;
+        match mpatch::patch_content_str(&single, Some(&current), &opts) {
+            Ok(new_content) => {
+                let (_b, _l, no_change) =
+                    apply_slot_edit(ctx, &path, new_content, ApplyPatchTool::NAME)?;
+                if !no_change {
+                    files_changed.push(path);
+                    hunks_applied += patch.hunks.len();
+                }
+            }
+            Err(e) => {
+                hunks_failed += patch.hunks.len();
+                tracing::warn!("apply_patch: hunk(s) failed on {path}: {e}");
+            }
+        }
+    }
+    if files_changed.is_empty() && hunks_failed > 0 {
+        return Err(ToolFailure::Other(format!(
+            "apply_patch: all {hunks_failed} hunk(s) failed to apply (no fuzzy match)"
+        )));
+    }
+    Ok(ApplyPatchOk {
+        files_changed,
+        hunks_applied,
+        hunks_failed,
+    })
+}
+
+fn extract_target_path(patch_text: &str) -> Option<String> {
+    for line in patch_text.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            // Strip a trailing tab+timestamp if present.
+            let p = p.split('\t').next().unwrap_or(p);
+            if !p.is_empty() && p != "/dev/null" {
+                return Some(p.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `path` to its graph slot, fetch the current slot content (or
+/// the on-disk rendered fallback for the slot's default placeholder).
+fn read_slot_content(ctx: &TaskCtx, path: &str) -> Result<String, ToolFailure> {
+    let rel = std::path::PathBuf::from(path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ToolFailure::Other(format!(
+            "path '{path}' must be a relative path with no parent-dir traversal"
+        )));
+    }
+    let g = ctx.graph.lock();
+    let resolved = render::resolve_path_to_slot(&g, &rel, ctx.layout);
+    if let Some((node_id, slot)) = resolved {
+        let n = g
+            .get(node_id)
+            .ok_or_else(|| ToolFailure::Other(format!("node {node_id} missing")))?;
+        let s = match slot {
+            render::NodeSlot::PublicRs => n.public_rs.clone().unwrap_or_default(),
+            render::NodeSlot::PrivateRs => n.private_rs.clone().unwrap_or_default(),
+            render::NodeSlot::TestsRs => n.tests_rs.clone().unwrap_or_default(),
+            render::NodeSlot::SpecPublicMd => n.spec_public_md.clone().unwrap_or_default(),
+            render::NodeSlot::SpecPrivateMd => n.spec_private_md.clone().unwrap_or_default(),
+        };
+        return Ok(s);
+    }
+    drop(g);
+    // Fall through: read from disk (may be a managed file that hasn't
+    // been authored yet — its rendered placeholder is on disk).
+    let abs = ctx.workdir.join(&rel);
+    std::fs::read_to_string(&abs).map_err(|e| {
+        ToolFailure::Other(format!("read {path}: {e}"))
+    })
+}
+
+/// Apply an edit to the slot identified by `path`. Validates the content
+/// using the same per-slot validator as the corresponding `submit_*`
+/// tool, then updates the graph and re-renders. Returns
+/// `(bytes, lines, no_change)`.
+fn apply_slot_edit(
+    ctx: &Arc<TaskCtx>,
+    path: &str,
+    content: String,
+    tool_name: &'static str,
+) -> Result<(u64, usize, bool), ToolFailure> {
+    let rel = std::path::PathBuf::from(path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ToolFailure::Other(format!(
+            "path '{path}' must be a relative path with no parent-dir traversal"
+        )));
+    }
+    let line_count = content.lines().count();
+    if line_count > ctx.max_file_lines {
+        return Err(ToolFailure::FileTooLarge(line_count, ctx.max_file_lines));
+    }
+    let resolved = {
+        let g = ctx.graph.lock();
+        render::resolve_path_to_slot(&g, &rel, ctx.layout)
+    };
+    let (node_id, slot) = resolved.ok_or_else(|| {
+        ToolFailure::Other(format!(
+            "{tool_name}: path '{path}' is not a managed slot (allowed slots: \
+             <src>/public.rs, <src>/private.rs, <src>/tests.rs, \
+             <spec>/public.md, <spec>/private.md). Auto-generated files \
+             (mod.rs, lib.rs, Cargo.toml) cannot be edited."
+        ))
+    })?;
+    if node_id != ctx.node_id {
+        return Err(ToolFailure::Other(format!(
+            "{tool_name}: path '{path}' belongs to another node — you can \
+             only edit files in your own node's slots"
+        )));
+    }
+    // Per-slot validation (mirrors the submit_* tools).
+    {
+        let g = ctx.graph.lock();
+        let n = g.get(node_id).ok_or_else(|| {
+            ToolFailure::Other(format!("node {node_id} missing"))
+        })?;
+        match slot {
+            render::NodeSlot::PublicRs => {
+                node_validate::validate_public(&content)?;
+            }
+            render::NodeSlot::PrivateRs | render::NodeSlot::TestsRs => {
+                node_validate::validate_private(&content, n, &g)?;
+            }
+            render::NodeSlot::SpecPublicMd | render::NodeSlot::SpecPrivateMd => {
+                // Spec is freeform markdown; no content validator beyond
+                // the line cap we already enforced above (using
+                // max_file_lines — spec markdown has a separate cap, but
+                // the per-line cap is the safer of the two).
+            }
+        }
+    }
+    let no_change;
+    {
+        let mut g = ctx.graph.lock();
+        let n = g.get_mut(node_id).ok_or_else(|| {
+            ToolFailure::Other(format!("node {node_id} missing"))
+        })?;
+        let cur: Option<&String> = match slot {
+            render::NodeSlot::PublicRs => n.public_rs.as_ref(),
+            render::NodeSlot::PrivateRs => n.private_rs.as_ref(),
+            render::NodeSlot::TestsRs => n.tests_rs.as_ref(),
+            render::NodeSlot::SpecPublicMd => n.spec_public_md.as_ref(),
+            render::NodeSlot::SpecPrivateMd => n.spec_private_md.as_ref(),
+        };
+        no_change = cur.map(|s| s == &content).unwrap_or(false);
+        if !no_change {
+            match slot {
+                render::NodeSlot::PublicRs => n.public_rs = Some(content.clone()),
+                render::NodeSlot::PrivateRs => n.private_rs = Some(content.clone()),
+                render::NodeSlot::TestsRs => n.tests_rs = Some(content.clone()),
+                render::NodeSlot::SpecPublicMd => n.spec_public_md = Some(content.clone()),
+                render::NodeSlot::SpecPrivateMd => n.spec_private_md = Some(content.clone()),
+            }
+            n.updated_at = Utc::now();
+        }
+    }
+    if !no_change {
+        ctx.render_after_write()?;
+    }
+    Ok((content.len() as u64, line_count, no_change))
+}
+
+/// Resolve `path` against `workdir`, rejecting absolute paths and any
+/// component that would escape the workdir.
+fn scoped_path(workdir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, ToolFailure> {
+    let rel = std::path::PathBuf::from(path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ToolFailure::Other(format!(
+            "path '{path}' must be a relative path with no parent-dir traversal"
+        )));
+    }
+    Ok(workdir.join(&rel))
+}
+
+// --------------------------------------------------------------------------
 // Tool catalogs by stage and role.
 // --------------------------------------------------------------------------
 
@@ -1507,6 +2149,12 @@ pub enum Role {
     Critic,
     Reviser,
     Judge,
+    /// Inner-loop role that runs after writer/reviser whenever the cargo
+    /// gate fails. Sees the failing compiler/test output and gets
+    /// read_file/write_file/apply_patch tools to iterate on fixes
+    /// directly, instead of escalating to the critic for what's usually
+    /// a mechanical fix-it-up cycle.
+    QuickFixer,
 }
 
 impl Role {
@@ -1516,6 +2164,7 @@ impl Role {
             Role::Critic => "critic",
             Role::Reviser => "reviser",
             Role::Judge => "judge",
+            Role::QuickFixer => "quickfixer",
         }
     }
 }
@@ -1645,6 +2294,15 @@ addressed every critic point (or there were no points), or \
 point(s). When in doubt: `satisfactory: true`. Call exactly once."
             .to_string(),
 
+        "submit_critique" => "Record the critic's structured list of issues. Each issue has a \
+required `description` (a concrete, actionable problem with the writer's output — \
+not a restatement of what's good) and optional `location` (file:line if known) and \
+`severity` (`error` | `warning` | `nit`). Pass an EMPTY `issues` list if the writer's \
+output has no actionable problems — the framework will skip the reviser and judge \
+for this round. Call exactly once. Do NOT include cosmetic praise, style preferences \
+that aren't in the spec/style guide, or rephrasings of fine output."
+            .to_string(),
+
         "cargo_check" => "Run `cargo check` on the workspace and return structured diagnostics \
 (file:line + message). Use mid-task to verify what you wrote compiles \
 before finishing. Capped at ~8 errors + 2KB stderr per call. Optional \
@@ -1664,6 +2322,45 @@ narrows to one crate."
 
         "cargo_clippy" => "Run `cargo clippy` and return lint warnings. Optional `package` narrows \
 to one crate. Returns warnings up to a small cap."
+            .to_string(),
+
+        "read_file" => format!(
+            "Read a file from the workspace. `path` is relative to the workdir \
+            root (no absolute paths, no `..`). Optional `start_line` / `end_line` \
+            (1-based, inclusive) narrow the slice; default reads the whole file. \
+            Returns up to {kb} KB of content; longer reads are truncated. Use \
+            this in the quickfix loop to inspect surrounding code when fixing \
+            compile / test errors.",
+            kb = READ_FILE_MAX_BYTES / 1024
+        ),
+
+        "write_file" => format!(
+            "Replace the whole content of a managed file. `path` must point at \
+            one of THIS node's slots: `<src>/public.rs`, `<src>/private.rs`, \
+            `<src>/tests.rs`, `<spec>/public.md`, `<spec>/private.md`. \
+            Auto-generated files (`mod.rs`, `lib.rs`, `Cargo.toml`) cannot be \
+            edited — those are framework-rendered. Hard cap: {max_file} lines. \
+            Validation runs (same as `submit_*`); on success the graph slot is \
+            updated and the workspace is re-rendered."
+        ),
+
+        "write_file_range" => format!(
+            "Replace lines `[start_line, end_line]` (1-based, inclusive) in a \
+            managed file with `content`. Same scope and slot rules as \
+            `write_file`. Use this for localized edits — e.g. fixing one \
+            function's body — without re-sending the whole file. To DELETE \
+            a range, pass empty `content`. To INSERT before a line, pass \
+            `start_line == end_line == line_number_to_insert_at` and put the \
+            inserted lines + the original line in `content`. After-edit cap \
+            still applies: total {max_file} lines."
+        ),
+
+        "apply_patch" => "Apply a unified diff (or markdown code block containing one) to \
+managed files. `patch` may contain multiple files; mpatch detects the \
+format automatically and uses fuzzy matching so slightly stale context \
+still applies. Same slot rules as `write_file`: only THIS node's slots \
+can be edited. Returns the list of files changed and a per-hunk \
+applied/failed count."
             .to_string(),
 
         _ => "(no description registered)".to_string(),
@@ -1690,6 +2387,13 @@ pub fn tool_definitions_for(
 pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
     use Role::*;
     use Stage::*;
+    // QuickFixer always gets the file-edit tools plus the gate's diagnostic
+    // tool. The toolset is the same regardless of which stage triggered it
+    // — the model's job is "fix the compiler/test errors", and which gate
+    // those came from is communicated via the preamble.
+    if matches!(role, QuickFixer) {
+        return quickfix_tools_for(stage);
+    }
     match (stage, role) {
         // Architect runs single-shot — only Writer; no critic/reviser/judge.
         (Architect, Writer) => vec![SubmitArchitectureTool::NAME],
@@ -1698,7 +2402,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
         (Spec, Writer) | (Spec, Reviser) => {
             vec![SubmitSpecTool::NAME]
         }
-        (Spec, Critic) => vec![],
+        (Spec, Critic) => vec![SubmitCritiqueTool::NAME],
         (Spec, Judge) => vec![SubmitVerdictTool::NAME],
 
         (Iface, Writer) | (Iface, Reviser) => vec![
@@ -1706,7 +2410,7 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             SubmitPrivateTool::NAME, // initial scaffold; impl stage will refine
             CargoCheckTool::NAME,
         ],
-        (Iface, Critic) => vec![CargoCheckTool::NAME],
+        (Iface, Critic) => vec![CargoCheckTool::NAME, SubmitCritiqueTool::NAME],
         (Iface, Judge) => vec![CargoCheckTool::NAME, SubmitVerdictTool::NAME],
 
         (Tests, Writer) | (Tests, Reviser) => vec![
@@ -1714,7 +2418,11 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             CargoCheckTool::NAME,
             CargoTestNoRunTool::NAME,
         ],
-        (Tests, Critic) => vec![CargoCheckTool::NAME, CargoTestNoRunTool::NAME],
+        (Tests, Critic) => vec![
+            CargoCheckTool::NAME,
+            CargoTestNoRunTool::NAME,
+            SubmitCritiqueTool::NAME,
+        ],
         (Tests, Judge) => vec![
             CargoCheckTool::NAME,
             CargoTestNoRunTool::NAME,
@@ -1727,7 +2435,12 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             CargoTestTool::NAME,
             CargoClippyTool::NAME,
         ],
-        (Impl, Critic) => vec![CargoCheckTool::NAME, CargoTestTool::NAME, CargoClippyTool::NAME],
+        (Impl, Critic) => vec![
+            CargoCheckTool::NAME,
+            CargoTestTool::NAME,
+            CargoClippyTool::NAME,
+            SubmitCritiqueTool::NAME,
+        ],
         (Impl, Judge) => vec![
             CargoCheckTool::NAME,
             CargoTestTool::NAME,
@@ -1741,7 +2454,11 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             CargoTestTool::NAME,
             CargoClippyTool::NAME,
         ],
-        (Debug, Critic) => vec![CargoCheckTool::NAME, CargoTestTool::NAME],
+        (Debug, Critic) => vec![
+            CargoCheckTool::NAME,
+            CargoTestTool::NAME,
+            SubmitCritiqueTool::NAME,
+        ],
         (Debug, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
 
         (Opt, Writer) | (Opt, Reviser) => vec![
@@ -1749,9 +2466,47 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
             CargoTestTool::NAME,
             CargoClippyTool::NAME,
         ],
-        (Opt, Critic) => vec![CargoTestTool::NAME, CargoClippyTool::NAME],
+        (Opt, Critic) => vec![
+            CargoTestTool::NAME,
+            CargoClippyTool::NAME,
+            SubmitCritiqueTool::NAME,
+        ],
         (Opt, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
+
+        // QuickFixer was handled at the top of the function.
+        (_, QuickFixer) => unreachable!(),
     }
+}
+
+/// Tool set for the quickfix inner loop. Same shape for every stage:
+/// read/write/patch on the node's slots, plus the gate's diagnostic
+/// tool so the model can re-check after each edit without having to
+/// guess whether the fix worked.
+fn quickfix_tools_for(stage: Stage) -> Vec<&'static str> {
+    use Stage::*;
+    let mut v = vec![
+        ReadFileTool::NAME,
+        WriteFileTool::NAME,
+        WriteFileRangeTool::NAME,
+        ApplyPatchTool::NAME,
+    ];
+    match stage {
+        Architect | Spec => {
+            // No cargo gate at these stages — quickfix shouldn't be
+            // triggered for them. Return the editing tools anyway so
+            // the catalog is total; callers gate on whether to invoke.
+        }
+        Iface => v.push(CargoCheckTool::NAME),
+        Tests => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestNoRunTool::NAME);
+        }
+        Impl | Debug | Opt => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -2158,8 +2913,25 @@ mod tests {
         assert!(tool_names_for(Stage::Impl, Role::Judge).contains(&"submit_verdict"));
         // Critic gets diagnostics in coding stages but no verdict tool.
         assert!(!tool_names_for(Stage::Impl, Role::Critic).contains(&"submit_verdict"));
-        // Spec critic has no tools (it just reads the inlined context).
-        assert!(tool_names_for(Stage::Spec, Role::Critic).is_empty());
+        // Spec critic now has the submit_critique tool (and only that).
+        assert_eq!(
+            tool_names_for(Stage::Spec, Role::Critic),
+            vec!["submit_critique"]
+        );
+        // Every critic gets submit_critique.
+        for stage in [
+            Stage::Spec,
+            Stage::Iface,
+            Stage::Tests,
+            Stage::Impl,
+            Stage::Debug,
+            Stage::Opt,
+        ] {
+            assert!(
+                tool_names_for(stage, Role::Critic).contains(&"submit_critique"),
+                "stage {stage} critic missing submit_critique"
+            );
+        }
     }
 
     #[test]
@@ -2285,5 +3057,217 @@ mod tests {
             };
             assert_eq!(e.speaker(), expected, "wrong speaker for {:?}", e.kind);
         }
+    }
+
+    // ---- New tool tests: read_file / write_file / write_file_range / apply_patch ----
+
+    #[tokio::test]
+    async fn write_file_replaces_managed_slot_and_renders() {
+        let (tmp, graph, root, ctx) = fixture(Stage::Iface);
+        let tool = WriteFileTool { ctx };
+        // public.rs lives at src/public.rs for the root node in single-crate mode.
+        let r = tool
+            .call(WriteFileArgs {
+                path: "src/public.rs".into(),
+                content: "pub trait Foo {}\n".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!r.no_change);
+        assert_eq!(
+            graph.lock().get(root).unwrap().public_rs.as_deref(),
+            Some("pub trait Foo {}\n")
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
+        assert!(on_disk.contains("pub trait Foo"));
+    }
+
+    #[tokio::test]
+    async fn write_file_no_change_when_content_matches() {
+        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let tool = WriteFileTool { ctx };
+        tool.call(WriteFileArgs {
+            path: "src/public.rs".into(),
+            content: "pub trait Foo {}\n".into(),
+        })
+        .await
+        .unwrap();
+        let r = tool
+            .call(WriteFileArgs {
+                path: "src/public.rs".into(),
+                content: "pub trait Foo {}\n".into(),
+            })
+            .await
+            .unwrap();
+        assert!(r.no_change);
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_unmanaged_path() {
+        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let tool = WriteFileTool { ctx };
+        let err = tool
+            .call(WriteFileArgs {
+                path: "Cargo.toml".into(),
+                content: "[package]\n".into(),
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not a managed slot"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_other_nodes_slots() {
+        // Add a sibling child whose public.rs belongs to it, not root.
+        let (_tmp, graph, _root, ctx) = fixture(Stage::Iface);
+        let _child = graph
+            .lock()
+            .add_child(ctx.node_id, Node::new("helper", "helper"))
+            .unwrap();
+        // re-render with the new child
+        crate::render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        let tool = WriteFileTool { ctx };
+        let err = tool
+            .call(WriteFileArgs {
+                path: "src/helper/public.rs".into(),
+                content: "pub trait X {}\n".into(),
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("another node"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn read_file_slices_by_line_range() {
+        let (tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        std::fs::write(
+            tmp.path().join("src/public.rs"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        let tool = ReadFileTool { ctx };
+        let r = tool
+            .call(ReadFileArgs {
+                path: "src/public.rs".into(),
+                start_line: Some(2),
+                end_line: Some(4),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.content, "line2\nline3\nline4");
+        assert_eq!(r.start_line, 2);
+        assert_eq!(r.end_line, 4);
+        assert_eq!(r.total_lines, 5);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_parent_dir_traversal() {
+        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let tool = ReadFileTool { ctx };
+        let err = tool
+            .call(ReadFileArgs {
+                path: "../escape".into(),
+                start_line: None,
+                end_line: None,
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("parent-dir"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn write_file_range_inserts_between_existing_lines() {
+        let (_tmp, graph, root, ctx) = fixture(Stage::Iface);
+        // Seed public.rs with three lines.
+        graph.lock().get_mut(root).unwrap().public_rs =
+            Some("pub trait A {}\npub trait B {}\npub trait C {}\n".into());
+        render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        let tool = WriteFileRangeTool { ctx };
+        // Replace line 2 ("pub trait B {}") with two new lines.
+        tool.call(WriteFileRangeArgs {
+            path: "src/public.rs".into(),
+            start_line: 2,
+            end_line: 2,
+            content: "pub trait B {}\npub trait B_inserted {}\n".into(),
+        })
+        .await
+        .unwrap();
+        let final_content = graph.lock().get(root).unwrap().public_rs.clone().unwrap();
+        assert_eq!(
+            final_content,
+            "pub trait A {}\npub trait B {}\npub trait B_inserted {}\npub trait C {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_applies_unified_diff() {
+        let (_tmp, graph, root, ctx) = fixture(Stage::Iface);
+        graph.lock().get_mut(root).unwrap().public_rs =
+            Some("pub trait Old {}\n".into());
+        render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        let patch = "--- a/src/public.rs\n+++ b/src/public.rs\n@@ -1 +1 @@\n-pub trait Old {}\n+pub trait New {}\n";
+        let tool = ApplyPatchTool { ctx };
+        let r = tool
+            .call(ApplyPatchArgs {
+                patch: patch.into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.files_changed, vec!["src/public.rs".to_string()]);
+        let after = graph.lock().get(root).unwrap().public_rs.clone().unwrap();
+        assert!(after.contains("New"));
+        assert!(!after.contains("Old"));
+    }
+
+    #[tokio::test]
+    async fn critique_render_empty_says_no_issues() {
+        let c = Critique { issues: vec![] };
+        assert!(c.is_clean());
+        assert!(c.render().contains("no issues"));
+    }
+
+    #[tokio::test]
+    async fn critique_render_lists_issues_with_severity() {
+        let c = Critique {
+            issues: vec![
+                CritiqueIssue {
+                    description: "missing edge case".into(),
+                    location: Some("src/foo.rs:42".into()),
+                    severity: Some("error".into()),
+                },
+                CritiqueIssue {
+                    description: "typo".into(),
+                    location: None,
+                    severity: None,
+                },
+            ],
+        };
+        assert!(!c.is_clean());
+        let r = c.render();
+        assert!(r.contains("missing edge case"));
+        assert!(r.contains("src/foo.rs:42"));
+        assert!(r.contains("[error]"));
+        assert!(r.contains("[warning]"));
+    }
+
+    #[tokio::test]
+    async fn submit_critique_sets_ctx_critique() {
+        let (_tmp, _g, _root, ctx) = fixture(Stage::Spec);
+        let tool = SubmitCritiqueTool { ctx: ctx.clone() };
+        tool.call(SubmitCritiqueArgs {
+            issues: vec![CritiqueIssue {
+                description: "vague".into(),
+                location: None,
+                severity: None,
+            }],
+        })
+        .await
+        .unwrap();
+        let stored = ctx.critique.lock().clone();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().issues.len(), 1);
     }
 }

@@ -215,6 +215,61 @@ pub fn node_spec_dir(graph: &NodeGraph, node: &Node) -> PathBuf {
 ///
 /// Iface / impl / debug / opt: own node's source files in `src/...`,
 /// plus its containing crate's `Cargo.toml`.
+/// Which graph slot on a node corresponds to a given file path.
+///
+/// The quickfix tools (`write_file`, `apply_patch`, etc.) operate on file
+/// paths, but for files the framework manages (per-node `public.rs`,
+/// `private.rs`, `tests.rs`, `spec/<node>/public.md`, `private.md`) the
+/// real source of truth is the graph. Editing the file on disk directly
+/// would be reverted by the next `render_after_write`. So instead the
+/// tools map path → slot, update the slot, and re-render.
+///
+/// Returns `None` for unmanaged paths (the model shouldn't edit those —
+/// generated Cargo.toml, mod.rs, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeSlot {
+    PublicRs,
+    PrivateRs,
+    TestsRs,
+    SpecPublicMd,
+    SpecPrivateMd,
+}
+
+/// Map a workspace-relative path back to a (node, slot) pair. Walks every
+/// node in the graph looking for one whose src_dir / spec_dir is a parent
+/// of `rel` and whose file name matches one of the managed filenames.
+///
+/// Returns `None` if the path isn't a managed slot — auto-rendered files
+/// (`mod.rs`, `lib.rs`, `Cargo.toml`) and arbitrary paths both yield None.
+pub fn resolve_path_to_slot(
+    graph: &NodeGraph,
+    rel: &Path,
+    layout: Layout,
+) -> Option<(NodeId, NodeSlot)> {
+    let filename = rel.file_name().and_then(|s| s.to_str())?;
+    let parent = rel.parent()?;
+    for n in graph.iter() {
+        let src = node_src_dir(graph, n, layout);
+        if parent == src {
+            match filename {
+                "public.rs" => return Some((n.id, NodeSlot::PublicRs)),
+                "private.rs" => return Some((n.id, NodeSlot::PrivateRs)),
+                "tests.rs" => return Some((n.id, NodeSlot::TestsRs)),
+                _ => {}
+            }
+        }
+        let spec = node_spec_dir(graph, n);
+        if parent == spec {
+            match filename {
+                "public.md" => return Some((n.id, NodeSlot::SpecPublicMd)),
+                "private.md" => return Some((n.id, NodeSlot::SpecPrivateMd)),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 pub fn files_owned_by_stage(
     graph: &NodeGraph,
     node: &Node,
