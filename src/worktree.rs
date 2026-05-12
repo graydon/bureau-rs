@@ -78,6 +78,30 @@ impl Workspace {
         }))
     }
 
+    /// Read main's current HEAD commit id. Returned as a value caller
+    /// can later pass to `reset_main_hard` to roll back to this point.
+    pub fn head_commit_id(&self) -> Result<git2::Oid> {
+        let repo = Repository::open(&self.root).context("open main repo")?;
+        Ok(repo.head()?.peel_to_commit()?.id())
+    }
+
+    /// Hard-reset main back to the given commit. Discards any work tree
+    /// changes and commits after that point. Used by the integrator
+    /// after a post-merge gate has been observed to fail and the
+    /// quickfix loop couldn't fix it — we don't want a broken commit
+    /// to remain on main where downstream tasks would inherit it.
+    pub fn reset_main_hard(&self, target: git2::Oid) -> Result<()> {
+        let repo = Repository::open(&self.root).context("open main repo")?;
+        let commit = repo
+            .find_commit(target)
+            .with_context(|| format!("find target commit {target}"))?;
+        let mut co = CheckoutBuilder::new();
+        co.force();
+        repo.reset(commit.as_object(), git2::ResetType::Hard, Some(&mut co))
+            .context("reset main to pre-apply commit")?;
+        Ok(())
+    }
+
     /// Stage everything in the main workdir and commit if anything changed.
     /// Returns true if a commit was made.
     pub fn commit_main(&self, message: &str) -> Result<bool> {

@@ -498,6 +498,111 @@ impl Engine {
         }
     }
 
+    /// After a stage exhausts its retries, run the gate one more time
+    /// in a fresh worktree (rendered from the canonical graph) to see
+    /// what's broken. If every failing error is in OTHER nodes' files,
+    /// reset those upstream nodes' content and post-architect stages
+    /// so the scheduler re-runs them; return the names of the reset
+    /// nodes. The caller marks this stage NotStarted (instead of
+    /// Failed) so it'll retry once upstream is fixed.
+    ///
+    /// Returns `None` when the failure isn't routable — at least one
+    /// error is in our own files (or we can't tell), so the operator
+    /// has to intervene.
+    async fn maybe_reroute_to_upstream(
+        self: &Arc<Self>,
+        node_id: NodeId,
+        stage: Stage,
+    ) -> Option<Vec<String>> {
+        let gate_kind = match stage {
+            Stage::Architect | Stage::Spec => return None, // no gate
+            Stage::Iface => crate::gate::GateKind::Check,
+            Stage::Tests => crate::gate::GateKind::TestNoRun,
+            Stage::Impl | Stage::Debug | Stage::Opt => crate::gate::GateKind::Test,
+        };
+        let probe_wt = self.worktrees.allocate(Uuid::new_v4()).await.ok()?;
+        // Render canonical state into the probe worktree. Snapshot the
+        // graph so the lock isn't held across the cargo gate's await.
+        let g_snap = self.graph.lock().clone();
+        if render::render_graph(&probe_wt.path, &g_snap, self.layout).is_err() {
+            let _ = self.worktrees.clone().abandon(probe_wt).await;
+            return None;
+        }
+        // Run the gate.
+        let outcome = {
+            let _guard = self.cargo_lock.lock().await;
+            match crate::gate::run_gate(&probe_wt.path, gate_kind).await {
+                Ok(o) => o,
+                Err(_) => {
+                    let _ = self.worktrees.clone().abandon(probe_wt).await;
+                    return None;
+                }
+            }
+        };
+        let _ = self.worktrees.clone().abandon(probe_wt).await;
+        if outcome.passed {
+            return None; // Mysteriously passing now; let the caller mark Failed and move on.
+        }
+        let classification = classify_errors_by_owner(
+            &outcome.errors,
+            node_id,
+            &g_snap,
+            self.layout,
+        );
+        if classification.mine_or_unknown() {
+            // We own at least one error — operator needs to intervene
+            // (or the model needs to write better code). Don't reset
+            // upstream blindly.
+            return None;
+        }
+        // All errors are in upstream nodes' files. Reset them so the
+        // scheduler re-runs them; clear their content slots so they
+        // author from scratch rather than starting from broken state.
+        let names = self.reset_upstream_after_integrator_failure(&classification);
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
+    }
+
+    /// When the integrator's quickfix can't fix a broken post-merge
+    /// state, the failing errors are usually in OTHER nodes' files —
+    /// the current node's quickfix scope is limited to its own slots,
+    /// so cross-node fixes are out of reach. Resetting those upstream
+    /// nodes' post-architect stages routes the failure back to where
+    /// it can actually be fixed; the scheduler will re-run them, and
+    /// the current stage (which was just rolled back on main) will
+    /// retry once they're done. Also clears the upstream nodes'
+    /// content slots so they author from scratch rather than starting
+    /// from the broken state.
+    ///
+    /// Returns the names of the nodes that were reset.
+    fn reset_upstream_after_integrator_failure(
+        &self,
+        classification: &ErrorClassification,
+    ) -> Vec<String> {
+        let mut reset_names: Vec<String> = Vec::new();
+        if classification.upstream.is_empty() {
+            return reset_names;
+        }
+        let mut g = self.graph.lock();
+        for upstream_id in classification.upstream.keys() {
+            let Some(n) = g.get_mut(*upstream_id) else { continue };
+            n.stages.reset_post_architect();
+            // Clear content slots so the upstream re-authors from
+            // scratch instead of starting from its broken state.
+            n.public_rs = None;
+            n.private_rs = None;
+            n.tests_rs = None;
+            // Spec slots stay — the architect-time spec is presumably
+            // still the design intent; only iface/impl content is
+            // suspect.
+            reset_names.push(n.name.clone());
+        }
+        reset_names
+    }
+
     /// Re-render main from the current canonical graph state, then
     /// commit if anything changed. Used after restoring graph slots
     /// to ensure main's on-disk state and the next downstream
@@ -598,6 +703,15 @@ impl Engine {
                     };
                     match canonical_render {
                         Ok(_) => {
+                            // Capture main's HEAD BEFORE we commit
+                            // anything for this stage. If the
+                            // post-land integrator can't fix the
+                            // resulting state, we roll main back to
+                            // this commit so broken state never
+                            // persists. Downstream tasks that branch
+                            // off main later will always see a clean
+                            // tree.
+                            let pre_apply_head = self.workspace.head_commit_id().ok();
                             let result = if stage == Stage::Architect {
                                 self.land_architect_to_main(&worktree, &merge_msg).await
                             } else {
@@ -622,11 +736,28 @@ impl Engine {
                                 // state), allocate a fresh worktree and
                                 // run quickfix on it, copying any fixed
                                 // owned files back to main on success.
-                                // If quickfix exhausts, halt.
+                                // If quickfix exhausts, roll main back
+                                // to pre-apply HEAD and auto-reset the
+                                // implicated upstream nodes so the
+                                // scheduler re-runs them.
                                 if let Err(e) = self
                                     .integrator_check(node_id, stage, &node_name)
                                     .await
                                 {
+                                    if let Some(head) = pre_apply_head {
+                                        if let Err(re) =
+                                            self.workspace.reset_main_hard(head)
+                                        {
+                                            tracing::error!(
+                                                "rollback failed for {node_name} {stage}: {re:#}"
+                                            );
+                                        } else {
+                                            self.note(format!(
+                                                "rolled main back to {head} after \
+                                                 integrator failure on `{node_name}` {stage}"
+                                            ));
+                                        }
+                                    }
                                     last_err = Some(e);
                                     succeeded = false;
                                     break;
@@ -680,8 +811,7 @@ impl Engine {
             // in the graph. Subsequent renders (including for downstream
             // tasks branching off main) read from the graph — so without
             // this restore, downstream worktrees end up with broken
-            // content even though main itself is fine. Re-render main
-            // to match the restored slots.
+            // content even though main itself is fine.
             self.restore_stage_slots(node_id, stage, pre_stage_slots);
             if let Err(e) = self.render_and_commit_main(
                 stage,
@@ -695,8 +825,37 @@ impl Engine {
             return Ok(());
         }
 
-        // Out of attempts. Mark Failed; some stages can recover via Debug
-        // stage on the same node, which the scheduler will pick up next.
+        // Before marking the stage Failed, classify the failure: if it's
+        // predominantly errors in OTHER nodes' files (which our writer
+        // can't touch from this scope), route the failure back to the
+        // implicated upstream nodes by resetting them, and queue THIS
+        // stage for retry (NotStarted) rather than failing the
+        // pipeline. The scheduler will re-run the upstream nodes and
+        // this stage will become ready again afterward.
+        let routed = self
+            .maybe_reroute_to_upstream(node_id, stage)
+            .await;
+        if let Some(upstream_names) = routed {
+            self.graph
+                .lock()
+                .get_mut(node_id)
+                .unwrap()
+                .stages
+                .set(stage, StageState::NotStarted);
+            self.sync_graph_to_state();
+            self.note(format!(
+                "node `{}` stage `{}` blocked on upstream — reset [{}] and queued this stage \
+                 for retry once upstream re-runs",
+                self.graph.lock().get(node_id).unwrap().name,
+                stage,
+                upstream_names.join(", ")
+            ));
+            return Ok(());
+        }
+
+        // Truly failed (errors weren't routable). Mark Failed; some
+        // stages can recover via Debug stage on the same node, which
+        // the scheduler will pick up next.
         self.graph
             .lock()
             .get_mut(node_id)
@@ -1124,10 +1283,34 @@ impl Engine {
             }
         } else {
             let post_summary = self.summarize_errors(&post_outcome.errors, 5);
+            // Classify by ownership so we can route the failure back to
+            // the right node(s). When the integrator's quickfix exhausts
+            // without fixing, it's almost always because the fix needs
+            // to be in another node — the current node's writer can't
+            // touch upstream code from its scope. We auto-reset the
+            // implicated upstream nodes' post-architect stages so the
+            // scheduler re-runs them; the caller will also roll main
+            // back to its pre-apply HEAD.
+            let classification = classify_errors_by_owner(
+                &post_outcome.errors,
+                node_id,
+                &self.graph.lock(),
+                self.layout,
+            );
+            let reset_names = self.reset_upstream_after_integrator_failure(&classification);
             let _ = self.worktrees.clone().abandon(wt).await;
+            let upstream_note = if !reset_names.is_empty() {
+                format!(
+                    "\nResetting upstream node(s) [{}] back to spec stage so they re-run; \
+                     this stage will retry once they're done.",
+                    reset_names.join(", ")
+                )
+            } else {
+                String::new()
+            };
             let msg = format!(
                 "integrator: quickfix exhausted for `{node_name}` {stage}; tree still broken:\n\
-                 {post_summary}"
+                 {post_summary}{upstream_note}"
             );
             self.state.write(|s| {
                 if let Some(t) = s.tasks.get_mut(&task_id) {
@@ -2512,24 +2695,71 @@ current node's already-authored slots.\n\n\
             Tests should fail if the implementation violates an \
             invariant, edge case, or behaviour described in the spec.\n\
             \n\
-            ## What NOT to test (these are wasted tokens)\n\
+            ## What NOT to test (these are wasted tokens AND the framework will REJECT trivial tests)\n\
             \n\
-            - **Things the language guarantees**: don't test that a \
-              constructor returns a struct of the right type, that a \
-              `Vec` is empty after `clear()`, that `Default::default()` \
-              produces a default value, that an enum's variants \
-              destructure correctly. The compiler proves these for you.\n\
-            - **Implementation details**: don't test private internals \
-              you happen to know exist. Test through the public surface.\n\
+            The single most common failure mode: writing tests that \
+            construct a struct with specific field values and then \
+            assert the same fields equal those values. That's \
+            CONSTRUCTOR-AS-IDENTITY testing — it proves NOTHING about \
+            behaviour, only that Rust's `=` operator works. DO NOT \
+            DO THIS. Concrete examples of FORBIDDEN tests:\n\
+            \n\
+            ```\n\
+            // WRONG: testing field access\n\
+            let s = Foo {{ name: \"x\".into(), n: 42 }};\n\
+            assert_eq!(s.name, \"x\");\n\
+            assert_eq!(s.n, 42);\n\
+            \n\
+            // WRONG: testing default\n\
+            let d = Foo::default();\n\
+            assert_eq!(d, Foo::default());\n\
+            \n\
+            // WRONG: testing constructor returns its type\n\
+            let s: Foo = Foo::new();\n\
+            assert!(matches!(s, Foo {{ .. }}));\n\
+            \n\
+            // WRONG: round-tripping a getter\n\
+            let s = Foo::with_n(5);\n\
+            assert_eq!(s.get_n(), 5);\n\
+            ```\n\
+            \n\
+            What these have in common: they would pass even if the \
+            implementation does NOTHING useful. The type system and \
+            constructors already guarantee them.\n\
+            \n\
+            Tests that PROVE something:\n\
+            \n\
+            ```\n\
+            // GOOD: tests an invariant from the spec\n\
+            let parsed = Config::parse(\"[section]\\nkey=val\")?;\n\
+            assert_eq!(parsed.get(\"section\", \"key\"), Some(\"val\"));\n\
+            \n\
+            // GOOD: tests an edge case\n\
+            assert!(Config::parse(\"[\").is_err()); // unterminated section\n\
+            \n\
+            // GOOD: tests a stated guarantee (e.g. idempotence)\n\
+            let s = Session::open();\n\
+            s.close();\n\
+            s.close(); // spec says close is idempotent — verify\n\
+            ```\n\
+            \n\
+            Rule of thumb: if the test would pass against an \
+            implementation that just returns `Default::default()` or \
+            stores values without ever using them, the test is \
+            useless. Write tests where you can plausibly imagine an \
+            implementation that COMPILES but FAILS the test.\n\
+            \n\
+            Other things NOT to test:\n\
+            \n\
             - **Other nodes' contracts**: tests for node X test X's \
               public interface ONLY. Do NOT write project-level tests \
-              that depend on other nodes existing, `tests::fixture_files_exist`, \
-              `tests::all_binary_entry_points_exist`, etc. — these belong \
-              in dedicated integration-test nodes if at all, and they \
-              break every other node's gate when they fail. Stay in scope.\n\
+              like `tests::fixture_files_exist`, \
+              `tests::all_binary_entry_points_exist`, etc. — these \
+              break every other node's gate when they fail.\n\
             - **Trivially-true assertions**: `assert_eq!(2 + 2, 4)`-style \
-              filler. If a test would pass for any non-empty struct of \
-              the right shape, don't write it.\n\
+              filler.\n\
+            - **Implementation details**: don't test private internals \
+              you happen to know exist. Test through the public surface.\n\
             \n\
             ## Module-path rules\n\
             \n\
@@ -2542,15 +2772,33 @@ current node's already-authored slots.\n\n\
             "# TESTS · CRITIC\n\
             \n\
             Use `cargo_test_no_run` to confirm tests compile. Identify \
-            concrete problems: tests that don't actually exercise the \
-            spec, tests that import via `crate::TypeName` instead of \
-            `super::public::*`, missing edge-case coverage, OR tests \
-            that test things the language already guarantees (e.g. \
-            \"a struct's constructor returns a struct\", \"a `Vec` \
-            is empty after `clear()`\" — these are wasted tokens; flag \
-            them for deletion). Report via `submit_critique` exactly \
-            once with an actionable `description` per issue. If clean, \
-            call `submit_critique` with an EMPTY `issues` list."
+            concrete problems via `submit_critique`. Flag for DELETION \
+            any of these (this is your primary job):\n\
+            \n\
+            - **Constructor-as-identity tests**: `let s = Foo {{ a: 1 }}; \
+              assert_eq!(s.a, 1)`. The test proves nothing — it would \
+              pass against any impl that just stores fields. Common \
+              variants: `Foo::new(x); assert!(_.x == x)`, \
+              `Foo::default(); assert_eq!(_, Foo::default())`, \
+              `Foo::with_n(5); assert_eq!(_.get_n(), 5)`.\n\
+            - **Tests that would pass against a `todo!()` impl** — if \
+              an impl that returns `Default::default()` or empty \
+              collections would pass the test, the test is useless.\n\
+            - **Tests of language guarantees**: that an enum variant \
+              destructures, that `Vec` is empty after `clear()`, that \
+              a type implements `Send`. The compiler proves these.\n\
+            - **Cross-node tests**: `tests::fixture_files_exist`, \
+              `tests::all_binary_entry_points_exist`, anything that \
+              depends on the project's overall structure rather than \
+              this node's spec.\n\
+            - **Wrong imports**: `use crate::TypeName` instead of \
+              `use super::public::*;` for own types.\n\
+            \n\
+            Report each issue's `description` as one actionable \
+            sentence (e.g. \"delete `test_field_access` — it only \
+            verifies field assignment\"). If the tests genuinely \
+            cover the spec's invariants and edge cases, call \
+            `submit_critique` with an EMPTY `issues` list."
                 .to_string()
         }
         (Stage::Tests, Role::Judge) => judge_block(Stage::Tests),
@@ -2565,6 +2813,47 @@ current node's already-authored slots.\n\n\
             the contract). `submit_private` replaces the WHOLE file; cap \
             {max_file} lines.\n\
             \n\
+            ## FORBIDDEN: placeholder / lazy implementations\n\
+            \n\
+            DO NOT write code that 'satisfies the type system but \
+            does nothing'. This is a hard constraint. Specifically \
+            FORBIDDEN:\n\
+            \n\
+            - Phrases like `// In a real implementation we'd ...`, \
+              `// For simplicity, we just ...`, `// TODO: actually \
+              do X`, `// In production this would ...`, `// We'll \
+              skip the real logic here`, `// Placeholder`. The word \
+              'real' or 'production' or 'simplicity' appearing in a \
+              code comment that justifies NOT doing something is a \
+              giant red flag.\n\
+            - Functions whose body is just `Ok(())`, `vec![]`, \
+              `String::new()`, `Default::default()`, `Self::default()`, \
+              or `unimplemented!()` (unless the spec explicitly says \
+              this is a no-op).\n\
+            - Returning a constant where computation is required by \
+              the spec.\n\
+            - Hard-coding an empty result for a function that's \
+              supposed to look something up, parse something, fetch \
+              something.\n\
+            - Catching errors and silently swallowing them when the \
+              spec says to propagate.\n\
+            \n\
+            If the test ASSERTS specific behaviour, your code must \
+            actually PRODUCE that behaviour through computation — not \
+            return a constant that happens to match. (The framework \
+            now flags trivial tests that would pass against \
+            placeholder impls; but YOU are responsible for the impl \
+            actually working.)\n\
+            \n\
+            ## What 'making the tests pass' means\n\
+            \n\
+            The spec describes WHAT the code does; the tests \
+            instantiate that description. Your impl must satisfy the \
+            spec, with the tests as the executable contract. If a \
+            test fails because the spec is ambiguous, write the impl \
+            that makes the most defensible reading of the spec true; \
+            don't change the test to make a wrong impl pass.\n\
+            \n\
             Module-path rules same as iface: `use super::public::*;` for \
             own types; copy the `import as ...` line from each Dependency \
             section verbatim for declared deps; never invent a dep.\n\
@@ -2575,13 +2864,30 @@ current node's already-authored slots.\n\n\
         (Stage::Impl, Role::Critic) => {
             "# IMPL · CRITIC\n\
             \n\
-            Run `cargo_test`. Identify concrete problems: failing tests, \
-            lints with obvious correctness implications, any `unsafe` or \
-            `unwrap()` smell that the spec didn't sanction. Report via \
-            `submit_critique` exactly once with one actionable issue per \
-            entry. If green and clean, call `submit_critique` with an \
-            EMPTY `issues` list. The quickfix loop already ran for \
-            mechanical fixes; don't re-litigate them."
+            Run `cargo_test`. Identify concrete problems via \
+            `submit_critique`. Specifically scan for and flag:\n\
+            \n\
+            - **Placeholder / lazy impls** — phrases like `// in a real \
+              implementation`, `// for simplicity`, `// we'll skip`, \
+              `// TODO`, `// production would`, or comments that \
+              justify not doing the thing the spec asks for. Function \
+              bodies that just return `Ok(())`, `vec![]`, \
+              `String::new()`, `Default::default()`, or `unimplemented!()` \
+              without the spec sanctioning that no-op.\n\
+            - **Constant returns where computation is required** — if \
+              the spec says \"parse the config\" and the impl returns \
+              a hard-coded empty Config, that's wrong.\n\
+            - **Silent error-swallowing** — `let _ = result;`, \
+              `if let Ok(x) = ...` that discards the Err branch when \
+              the spec says to propagate errors.\n\
+            - **Failing tests** that point to genuine bugs.\n\
+            - **Unsafe / unwrap()** the spec didn't sanction.\n\
+            \n\
+            Report each issue's `description` as a one-sentence \
+            actionable problem. If the impl genuinely does the work \
+            the spec asks for AND tests pass, call `submit_critique` \
+            with an EMPTY `issues` list. The quickfix loop already \
+            ran for mechanical fixes; don't re-litigate them."
                 .to_string()
         }
         (Stage::Impl, Role::Judge) => judge_block(Stage::Impl),
