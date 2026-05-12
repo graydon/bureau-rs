@@ -1,5 +1,5 @@
 //! Per-task git worktrees. Each parallel task does its work on its own
-//! branch in its own worktree, then merges back to main on success.
+//! branch in its own worktree, then rebases + ff-merges back to main.
 //!
 //! Why: parallel tasks each render the workspace and run cargo. With a
 //! single shared workdir, parallel cargos contend for `target/` and
@@ -7,12 +7,14 @@
 //! each task has its own checkout (linked to the same `.git`) and its
 //! own `target/`, so they truly run in parallel.
 //!
-//! The framework renders the "spine" deterministically from the shared
-//! graph, so two parallel tasks rendering at adjacent moments produce
-//! mostly-identical output for nodes neither of them owns. The engine
-//! re-renders each worktree from the canonical shared graph just before
-//! merging, which makes git's three-way merge clean: any node already
-//! landed on main has identical content on both sides.
+//! Landing model: rebase the task branch onto current main HEAD, re-gate
+//! on the rebased state, then fast-forward main. The rebase is what
+//! resolves the "two tasks rendered the workspace at different snapshots"
+//! problem: instead of a three-way merge (which conflicts when both sides
+//! happened to author the same `.bureau/nodes/x.json`), the second-lander
+//! simply re-applies its diff atop the first-lander's tip and re-runs the
+//! gate. If the rebase conflicts, the branch is abandoned and the task
+//! retries from scratch.
 //!
 //! All git operations go through `git2` (libgit2 bindings) — no
 //! subprocess calls. Repositories are opened per-operation rather than
@@ -20,7 +22,7 @@
 
 use anyhow::{Context, Result};
 use git2::{
-    BranchType, IndexAddOption, Repository, RepositoryInitOptions, Signature,
+    BranchType, IndexAddOption, RebaseOptions, Repository, RepositoryInitOptions, Signature,
     WorktreeAddOptions, WorktreePruneOptions, build::CheckoutBuilder,
 };
 use parking_lot::Mutex as ParkingMutex;
@@ -68,7 +70,6 @@ impl Workspace {
             let sig = bureau_signature();
             repo.commit(Some("HEAD"), &sig, &sig, "scaffold", &tree, &[])?;
         } else {
-            // Existing repo: still ensure config + .gitignore are sane.
             let repo = Repository::open(root).context("open existing repo")?;
             configure_repo(&repo)?;
             ensure_gitignore(root)?;
@@ -78,18 +79,15 @@ impl Workspace {
         }))
     }
 
-    /// Read main's current HEAD commit id. Returned as a value caller
-    /// can later pass to `reset_main_hard` to roll back to this point.
+    /// Read main's current HEAD commit id.
     pub fn head_commit_id(&self) -> Result<git2::Oid> {
         let repo = Repository::open(&self.root).context("open main repo")?;
         Ok(repo.head()?.peel_to_commit()?.id())
     }
 
-    /// Hard-reset main back to the given commit. Discards any work tree
-    /// changes and commits after that point. Used by the integrator
-    /// after a post-merge gate has been observed to fail and the
-    /// quickfix loop couldn't fix it — we don't want a broken commit
-    /// to remain on main where downstream tasks would inherit it.
+    /// Hard-reset main back to the given commit. Kept around as a
+    /// reasonable primitive even though the new engine flow doesn't use
+    /// it — operators may still need it for recovery.
     pub fn reset_main_hard(&self, target: git2::Oid) -> Result<()> {
         let repo = Repository::open(&self.root).context("open main repo")?;
         let commit = repo
@@ -98,12 +96,12 @@ impl Workspace {
         let mut co = CheckoutBuilder::new();
         co.force();
         repo.reset(commit.as_object(), git2::ResetType::Hard, Some(&mut co))
-            .context("reset main to pre-apply commit")?;
+            .context("reset main")?;
         Ok(())
     }
 
     /// Stage everything in the main workdir and commit if anything changed.
-    /// Returns true if a commit was made.
+    /// Used at scaffold time only. Returns true if a commit was made.
     pub fn commit_main(&self, message: &str) -> Result<bool> {
         let repo = Repository::open(&self.root).context("open main repo")?;
         let mut idx = repo.index()?;
@@ -125,15 +123,142 @@ impl Workspace {
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
         Ok(true)
     }
+
+    /// Rebase `branch_name` onto current `main` HEAD. On conflict the
+    /// rebase is aborted (the branch is left at its original tip) and Err
+    /// returns. On success the branch's tip is a linear descendant of
+    /// main's HEAD AND the working tree at `worktree_path` (which is
+    /// checked out on `branch_name`) reflects the rebased state.
+    ///
+    /// We open the worktree's repo handle so libgit2 can update its
+    /// working tree as it replays each commit — that's exactly what we
+    /// need before running the post-rebase gate.
+    pub fn rebase_branch_onto_main(
+        &self,
+        worktree_path: &Path,
+        branch_name: &str,
+    ) -> Result<()> {
+        let repo = Repository::open(worktree_path).context("open worktree repo")?;
+        let main_tip = {
+            // Peel the main branch by name; the worktree's HEAD is on
+            // `branch_name`, so we have to ask by ref rather than by HEAD.
+            let main_ref = repo
+                .find_branch("main", BranchType::Local)
+                .context("find main branch")?;
+            main_ref.into_reference().peel_to_commit()?
+        };
+        let branch_ref_obj = repo
+            .find_branch(branch_name, BranchType::Local)
+            .with_context(|| format!("find branch {branch_name}"))?
+            .into_reference();
+        let branch_tip = branch_ref_obj.peel_to_commit()?;
+        if branch_tip.id() == main_tip.id() {
+            // Branch is already at main's tip — nothing to rebase.
+            return Ok(());
+        }
+        // Common ancestor = where the branch was originally created.
+        let base = repo
+            .merge_base(branch_tip.id(), main_tip.id())
+            .context("find merge base")?;
+        if base == main_tip.id() {
+            // Branch already descends from main — fast-forward case, nothing
+            // to do.
+            return Ok(());
+        }
+        // IMPORTANT: build the branch annotated commit from the REFERENCE,
+        // not from the bare OID. Libgit2 uses the ref name (carried by the
+        // annotated commit) to know which branch to update on finish; if
+        // we pass `find_annotated_commit(oid)` instead, finish updates
+        // HEAD but leaves the branch ref pointing at the old tip.
+        let branch_ac = repo.reference_to_annotated_commit(&branch_ref_obj)?;
+        let upstream_ac = repo.find_annotated_commit(base)?;
+        let onto_ac = repo.find_annotated_commit(main_tip.id())?;
+        let mut opts = RebaseOptions::new();
+        let mut rebase = repo
+            .rebase(Some(&branch_ac), Some(&upstream_ac), Some(&onto_ac), Some(&mut opts))
+            .context("rebase init")?;
+        let sig = bureau_signature();
+        loop {
+            match rebase.next() {
+                None => break,
+                Some(Err(e)) => {
+                    let _ = rebase.abort();
+                    return Err(anyhow::anyhow!("rebase step: {e}"));
+                }
+                Some(Ok(_op)) => {
+                    // After each pick, libgit2 has staged the patch into
+                    // the worktree's index. If there are conflicts, the
+                    // commit will fail; we abort and bail.
+                    if repo.index()?.has_conflicts() {
+                        let _ = rebase.abort();
+                        return Err(anyhow::anyhow!(
+                            "rebase of {branch_name} onto main hit conflicts"
+                        ));
+                    }
+                    if let Err(e) = rebase.commit(None, &sig, None) {
+                        let _ = rebase.abort();
+                        return Err(anyhow::anyhow!("rebase commit: {e}"));
+                    }
+                }
+            }
+        }
+        rebase.finish(Some(&sig)).context("rebase finish")?;
+        Ok(())
+    }
+
+    /// Move `main` to point at `branch_name`'s tip. Pre-condition: the
+    /// branch must already be a descendant of main (i.e., rebased).
+    /// Errors if it isn't.
+    pub fn fast_forward_main(&self, branch_name: &str) -> Result<()> {
+        let repo = Repository::open(&self.root).context("open main repo")?;
+        let main_ref = repo.find_branch("main", BranchType::Local)?;
+        let main_tip = main_ref.into_reference().peel_to_commit()?;
+        let branch_ref = repo
+            .find_branch(branch_name, BranchType::Local)
+            .with_context(|| format!("find branch {branch_name}"))?;
+        let branch_tip = branch_ref.into_reference().peel_to_commit()?;
+        if branch_tip.id() == main_tip.id() {
+            return Ok(());
+        }
+        // Confirm branch descends from main.
+        let base = repo.merge_base(main_tip.id(), branch_tip.id())?;
+        if base != main_tip.id() {
+            anyhow::bail!(
+                "fast_forward_main: branch {branch_name} is not a descendant of main \
+                 (base {base} != main tip {})",
+                main_tip.id()
+            );
+        }
+        // Update the main branch ref. We modify the ref directly rather
+        // than going through HEAD because main isn't HEAD here — the
+        // main workdir's HEAD is `main`, but `repo.head()` only matters
+        // for ref name; what we're updating is the `main` branch itself.
+        let mut main_branch = repo.find_branch("main", BranchType::Local)?;
+        main_branch
+            .get_mut()
+            .set_target(branch_tip.id(), "ff-merge from task branch")?;
+        // Check out the new tree into the main working directory so the
+        // files match HEAD.
+        let new_commit = repo.find_commit(branch_tip.id())?;
+        let new_tree = new_commit.tree()?;
+        let mut co = CheckoutBuilder::new();
+        co.force();
+        repo.checkout_tree(new_tree.as_object(), Some(&mut co))?;
+        // Move HEAD to the updated main branch ref.
+        repo.set_head("refs/heads/main")?;
+        Ok(())
+    }
 }
 
-/// Manages worktree allocation, merge-back, and cleanup.
+/// Manages worktree allocation and cleanup. Land-time serialization is
+/// achieved via `main_lock()` — callers hold it across rebase + ff-merge.
 pub struct WorktreePool {
     pub workspace: Arc<Workspace>,
     pub scratch_root: PathBuf,
-    /// Serializes operations that need exclusive access to the main
-    /// repo's working tree — worktree-add, merge, branch ops. Held only
-    /// for the duration of those calls.
+    /// Serializes the rebase + ff-merge cycle so that only one branch is
+    /// landing at a time. Callers acquire this BEFORE rebasing onto main
+    /// so that no other land can move main's HEAD between the rebase and
+    /// the fast-forward.
     main_lock: tokio::sync::Mutex<()>,
     /// Live record of currently-allocated worktrees (UI introspection).
     active: ParkingMutex<Vec<Worktree>>,
@@ -169,6 +294,13 @@ impl WorktreePool {
         self.active.lock().clone()
     }
 
+    /// The serialization lock on landing. Callers hold this across the
+    /// rebase + re-gate + ff-merge sequence so main only advances under
+    /// exclusive access.
+    pub fn main_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.main_lock
+    }
+
     /// Allocate a worktree branched from the current main HEAD. The
     /// branch is named `task/<task-id>`; the worktree lives at
     /// `<workdir>/.bureau/worktrees/<task-id>/`.
@@ -176,29 +308,22 @@ impl WorktreePool {
         let _guard = self.main_lock.lock().await;
         let id_str = task_id.to_string();
         let path = self.scratch_root.join(&id_str);
-        // Clear any stale dir from a prior crashed run.
         if path.exists() {
             let _ = std::fs::remove_dir_all(&path);
         }
         let branch_name = format!("task/{id_str}");
         let repo = Repository::open(&self.workspace.root)?;
-        // Drop any stale branch with this name (force).
         if let Ok(mut b) = repo.find_branch(&branch_name, BranchType::Local) {
             let _ = b.delete();
         }
-        // Create the branch from current HEAD.
         let head_commit = repo.head()?.peel_to_commit()?;
         let branch = repo.branch(&branch_name, &head_commit, false)?;
         let branch_ref = branch.into_reference();
-        // Create the worktree pointing at the branch.
         let mut opts = WorktreeAddOptions::new();
         opts.reference(Some(&branch_ref));
         let _wt = repo
             .worktree(&id_str, &path, Some(&opts))
             .context("Repository::worktree")?;
-        // Inherit our config knobs (gpgsign etc.) into the worktree's
-        // local config; libgit2 normally points worktrees at the parent
-        // repo's config but commit signing depends on local fallback.
         if let Ok(wt_repo) = Repository::open(&path) {
             let _ = configure_repo(&wt_repo);
         }
@@ -212,139 +337,11 @@ impl WorktreePool {
         Ok(wt)
     }
 
-    /// Commit the worktree's state and merge it into main. The CALLER
-    /// is responsible for re-rendering the worktree from the canonical
-    /// shared graph state before invoking this — that's what makes the
-    /// merge clean. With every task's pre-merge tree reflecting the same
-    /// shared graph state, the three-way merge resolves cleanly: any
-    /// node already landed on main has identical content on both sides;
-    /// only the truly-new content from this task is the diff.
-    ///
-    /// We deliberately do NOT use a "favor task" or "favor main" merge
-    /// strategy — if the merge has real conflicts, that's a render
-    /// determinism bug and we want to surface it as a task failure.
-    pub async fn merge_and_release(&self, wt: Worktree, message: &str) -> Result<()> {
-        if let Err(e) = commit_in_worktree(&wt.path, message) {
-            tracing::warn!("commit in worktree {}: {e:#}", wt.path.display());
-        }
-        let _guard = self.main_lock.lock().await;
-        let result = self.do_merge(&wt, message);
-        self.cleanup(&wt);
-        result
-    }
-
-    fn do_merge(&self, wt: &Worktree, message: &str) -> Result<()> {
-        let repo = Repository::open(&self.workspace.root)?;
-        let main_tip = repo.head()?.peel_to_commit()?;
-        let task_branch = repo.find_branch(&wt.branch, BranchType::Local)?;
-        let task_tip = task_branch.into_reference().peel_to_commit()?;
-        if main_tip.id() == task_tip.id() {
-            // Branch and main point at the same commit — nothing to merge.
-            return Ok(());
-        }
-        // In-memory three-way merge.
-        let mut idx = repo.merge_commits(&main_tip, &task_tip, None)?;
-        if idx.has_conflicts() {
-            anyhow::bail!(
-                "merge of branch {} into main has conflicts — refusing to land \
-                 (likely a render-determinism bug; the task is failed)",
-                wt.branch
-            );
-        }
-        let tree_id = idx.write_tree_to(&repo)?;
-        let tree = repo.find_tree(tree_id)?;
-        let sig = bureau_signature();
-        let merge_commit_id = repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &[&main_tip, &task_tip],
-        )?;
-        // Update main's working tree to match the new HEAD.
-        let merge_commit = repo.find_commit(merge_commit_id)?;
-        let merge_tree = merge_commit.tree()?;
-        let mut co = CheckoutBuilder::new();
-        co.force();
-        repo.checkout_tree(merge_tree.as_object(), Some(&mut co))?;
-        Ok(())
-    }
-
-    /// Apply only specific files from the worktree to main, skipping the
-    /// three-way merge entirely. This is the path the engine uses when
-    /// it knows EXACTLY which files this task owns (e.g. spec stage
-    /// owns its node's spec/<path>/public.md, etc.) — copying just
-    /// those files onto main avoids the "two tasks rendered the same
-    /// node's file at different snapshots and now conflict" problem
-    /// that plagues full-tree merges.
-    ///
-    /// `owned_paths` are paths relative to the workdir root. Files that
-    /// don't exist in the worktree are silently skipped.
-    pub async fn apply_to_main(
-        &self,
-        wt: Worktree,
-        owned_paths: &[PathBuf],
-        message: &str,
-    ) -> Result<()> {
-        let _guard = self.main_lock.lock().await;
-        self.copy_owned_and_commit(&wt, owned_paths, message)?;
-        self.cleanup(&wt);
-        Ok(())
-    }
-
-    /// Take the main-repo serialization lock. Held only by the caller
-    /// (this returns the guard). Used by the engine for the atomic
-    /// "re-render + gate + commit" cycle at land time so that no broken
-    /// commit can reach main: while we hold this, no other task can
-    /// land, and we re-gate the rendered worktree against the latest
-    /// canonical graph state before copying anything into main.
-    pub async fn lock_main(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.main_lock.lock().await
-    }
-
-    /// Copy `owned_paths` from worktree to main, then commit. The caller
-    /// must already hold `main_lock`. Returns whether a commit was
-    /// actually created (no-op if the tree is identical to HEAD).
-    pub fn copy_owned_and_commit(
-        &self,
-        wt: &Worktree,
-        owned_paths: &[PathBuf],
-        message: &str,
-    ) -> Result<bool> {
-        for rel in owned_paths {
-            // Defensive: reject absolute / parent-dir-traversing paths.
-            if rel.is_absolute()
-                || rel
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                continue;
-            }
-            let src = wt.path.join(rel);
-            let dst = self.workspace.root.join(rel);
-            if !src.exists() {
-                continue;
-            }
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("creating parent of {}", dst.display())
-                })?;
-            }
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
-        }
-        let made_commit = self.workspace.commit_main(message)?;
-        Ok(made_commit)
-    }
-
-    /// Cleanup helper exposed so callers (like the engine's gated-land
-    /// path) can abandon the worktree without going through one of the
-    /// apply paths. The caller must already hold (or not need)
-    /// `main_lock` — this only touches the worktree's own files and
-    /// the libgit2 worktree admin record, not the main working tree.
-    pub fn cleanup_worktree(&self, wt: &Worktree) {
-        self.cleanup(wt);
+    /// Stage everything in the worktree and commit on its branch. No-op
+    /// if the tree matches HEAD. Used by the engine before landing so
+    /// the model's edits are captured as a commit on the branch.
+    pub fn commit_in_worktree(&self, wt: &Worktree, message: &str) -> Result<()> {
+        commit_in_worktree(&wt.path, message)
     }
 
     /// Drop a worktree without merging — used on task failure.
@@ -355,9 +352,7 @@ impl WorktreePool {
     }
 
     fn cleanup(&self, wt: &Worktree) {
-        // Remove on-disk working dir first (force).
         let _ = std::fs::remove_dir_all(&wt.path);
-        // Prune the worktree admin record + delete the branch.
         if let Ok(repo) = Repository::open(&self.workspace.root) {
             if let Ok(wt_handle) = repo.find_worktree(&wt.name) {
                 let mut o = WorktreePruneOptions::new();
@@ -372,10 +367,7 @@ impl WorktreePool {
     }
 }
 
-/// Stage everything in the worktree and commit on its branch. If the
-/// tree matches HEAD's tree (nothing to commit), we silently no-op —
-/// `do_merge` will then short-circuit because main and the branch tip
-/// are equal.
+/// Stage everything in the worktree and commit on its branch.
 fn commit_in_worktree(path: &Path, message: &str) -> Result<()> {
     let repo = Repository::open(path).context("open worktree as repo")?;
     let mut idx = repo.index()?;
@@ -398,10 +390,6 @@ fn commit_in_worktree(path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build a `bureau-rs` signature. We use `Signature::now` (which carries
-/// `'static` lifetime) regardless of the repo's signature() — `configure_repo`
-/// already sets the repo's user.name/user.email to `bureau-rs`/`bureau-rs@local`,
-/// so this is consistent.
 fn bureau_signature() -> Signature<'static> {
     Signature::now("bureau-rs", "bureau-rs@local").expect("static signature")
 }
@@ -414,16 +402,13 @@ fn configure_repo(repo: &Repository) -> Result<()> {
     if cfg.get_string("user.email").is_err() {
         cfg.set_str("user.email", "bureau-rs@local")?;
     }
-    // Disable GPG signing locally — bureau-rs commits are bookkeeping,
-    // and if the user's global config has signing on but the env can't
-    // sign (e.g. devcontainer without the key), commits would fail.
     cfg.set_bool("commit.gpgsign", false)?;
     cfg.set_bool("tag.gpgsign", false)?;
     Ok(())
 }
 
 fn ensure_gitignore(root: &Path) -> Result<()> {
-    const REQUIRED: &[&str] = &["/.bureau/", "/target/", "**/target/"];
+    const REQUIRED: &[&str] = &["/target/", "**/target/", "/.bureau/worktrees/"];
     let path = root.join(".gitignore");
     let mut existing = if path.exists() {
         std::fs::read_to_string(&path)?
@@ -477,22 +462,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_and_release_lands_changes_on_main_and_cleans_up() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = Workspace::init(tmp.path()).unwrap();
-        let pool = WorktreePool::new(ws.clone()).unwrap();
-        let wt = pool.allocate(Uuid::new_v4()).await.unwrap();
-        fs::write(wt.path.join("hello.txt"), "hi from task\n").unwrap();
-        let wt_clone = wt.clone();
-        pool.merge_and_release(wt, "spec: thing").await.unwrap();
-        assert!(!wt_clone.path.exists());
-        assert!(ws.root.join("hello.txt").exists());
-        assert_eq!(pool.active_worktrees().len(), 0);
-        let repo = Repository::open(&ws.root).unwrap();
-        assert!(repo.find_branch(&wt_clone.branch, BranchType::Local).is_err());
-    }
-
-    #[tokio::test]
     async fn abandon_drops_worktree_without_merging() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Workspace::init(tmp.path()).unwrap();
@@ -506,38 +475,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_parallel_worktrees_merge_back_independently() {
+    async fn rebase_onto_main_when_branch_unchanged_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Workspace::init(tmp.path()).unwrap();
-        let pool = Arc::new(WorktreePool::new(ws.clone()).unwrap());
-        let wta = pool.allocate(Uuid::new_v4()).await.unwrap();
-        let wtb = pool.allocate(Uuid::new_v4()).await.unwrap();
-        fs::write(wta.path.join("a.txt"), "from a\n").unwrap();
-        fs::write(wtb.path.join("b.txt"), "from b\n").unwrap();
-        pool.merge_and_release(wta, "spec: a").await.unwrap();
-        pool.merge_and_release(wtb, "spec: b").await.unwrap();
-        assert!(ws.root.join("a.txt").exists());
-        assert!(ws.root.join("b.txt").exists());
+        let pool = WorktreePool::new(ws.clone()).unwrap();
+        let wt = pool.allocate(Uuid::new_v4()).await.unwrap();
+        ws.rebase_branch_onto_main(&wt.path, &wt.branch).unwrap();
     }
 
     #[tokio::test]
-    async fn conflicting_merge_is_rejected_not_silently_resolved() {
-        // Both worktrees write the SAME file with different content.
-        // Their merge should hit a real conflict — and we should reject,
-        // not silently pick a side.
+    async fn rebase_then_ff_merge_lands_non_conflicting_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = Workspace::init(tmp.path()).unwrap();
-        let pool = Arc::new(WorktreePool::new(ws.clone()).unwrap());
+        let pool = WorktreePool::new(ws.clone()).unwrap();
+        // Branch A writes file_a.
         let wta = pool.allocate(Uuid::new_v4()).await.unwrap();
-        fs::write(wta.path.join("contested.txt"), "version A\n").unwrap();
+        fs::write(wta.path.join("file_a.txt"), "A\n").unwrap();
+        pool.commit_in_worktree(&wta, "add a").unwrap();
+        // Land A: rebase (no-op since main hasn't moved), then ff-merge.
+        ws.rebase_branch_onto_main(&wta.path, &wta.branch).unwrap();
+        ws.fast_forward_main(&wta.branch).unwrap();
+        assert!(ws.root.join("file_a.txt").exists());
+        pool.abandon(wta).await.unwrap();
+        // Branch B was allocated from OLD main; needs rebase to land.
         let wtb = pool.allocate(Uuid::new_v4()).await.unwrap();
-        fs::write(wtb.path.join("contested.txt"), "version B\n").unwrap();
-        pool.merge_and_release(wta, "spec: a").await.unwrap();
-        let err = pool.merge_and_release(wtb, "spec: b").await.unwrap_err();
-        assert!(format!("{err:#}").contains("conflicts"));
-        // After failure, main is left at version A (the first merge),
-        // and B's worktree is cleaned up.
-        let on_main = fs::read_to_string(ws.root.join("contested.txt")).unwrap();
-        assert_eq!(on_main, "version A\n");
+        fs::write(wtb.path.join("file_b.txt"), "B\n").unwrap();
+        pool.commit_in_worktree(&wtb, "add b").unwrap();
+        // Allocate ran from current main (which now has file_a) so the
+        // rebase is also a no-op in this ordering. To get a non-trivial
+        // rebase, write to main directly after allocate.
+        fs::write(ws.root.join("file_c.txt"), "C\n").unwrap();
+        ws.commit_main("add c on main").unwrap();
+        ws.rebase_branch_onto_main(&wtb.path, &wtb.branch).unwrap();
+        ws.fast_forward_main(&wtb.branch).unwrap();
+        assert!(ws.root.join("file_a.txt").exists());
+        assert!(ws.root.join("file_b.txt").exists());
+        assert!(ws.root.join("file_c.txt").exists());
+        // Branch B's worktree now reflects the rebased state (file_c is there too).
+        assert!(wtb.path.join("file_c.txt").exists());
+        pool.abandon(wtb).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebase_with_conflict_returns_err_and_aborts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::init(tmp.path()).unwrap();
+        let pool = WorktreePool::new(ws.clone()).unwrap();
+        // Branch A writes contested.txt with one content; commit.
+        let wta = pool.allocate(Uuid::new_v4()).await.unwrap();
+        fs::write(wta.path.join("contested.txt"), "from A\n").unwrap();
+        pool.commit_in_worktree(&wta, "A version").unwrap();
+        // Meanwhile main writes contested.txt with DIFFERENT content.
+        fs::write(ws.root.join("contested.txt"), "from main\n").unwrap();
+        ws.commit_main("main version").unwrap();
+        // Now rebase A onto main — should conflict.
+        let err = ws
+            .rebase_branch_onto_main(&wta.path, &wta.branch)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("conflict") || msg.contains("rebase"), "got: {msg}");
+        pool.abandon(wta).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_forward_main_rejects_non_descendant_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Workspace::init(tmp.path()).unwrap();
+        let pool = WorktreePool::new(ws.clone()).unwrap();
+        let wt = pool.allocate(Uuid::new_v4()).await.unwrap();
+        fs::write(wt.path.join("a.txt"), "a\n").unwrap();
+        pool.commit_in_worktree(&wt, "add a").unwrap();
+        // Move main forward independently so the branch is no longer a
+        // descendant.
+        fs::write(ws.root.join("b.txt"), "b\n").unwrap();
+        ws.commit_main("add b on main").unwrap();
+        let err = ws.fast_forward_main(&wt.branch).unwrap_err();
+        assert!(format!("{err:#}").contains("not a descendant"));
+        pool.abandon(wt).await.unwrap();
     }
 }
