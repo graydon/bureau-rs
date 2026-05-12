@@ -15,10 +15,12 @@
 //! opt) tracked per-node so the scheduler can run independent stages in
 //! parallel and dep-order anything that needs to compile.
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -660,6 +662,111 @@ fn validate_name(name: &str) -> Result<(), GraphError> {
     Ok(())
 }
 
+// --------------------------------------------------------------------------
+// On-disk persistence.
+// --------------------------------------------------------------------------
+//
+// The graph lives in `<workdir>/.bureau/`:
+//   - `graph.json`       — topology pointer: root id + list of node files
+//   - `nodes/<name>.json` — one file per node (full Node, pretty-printed)
+//
+// This makes the worktree's branch the source of truth for graph state:
+// concurrent worktrees each mutate their own copy; landing rebases + ff-
+// merges those changes onto main. No in-memory shared state to drift.
+
+const BUREAU_DIR: &str = ".bureau";
+const NODES_SUBDIR: &str = "nodes";
+const GRAPH_FILE: &str = "graph.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphIndex {
+    root: Option<NodeId>,
+    /// Filenames inside `.bureau/nodes/` — `<name>.json` for each node.
+    /// Order is the canonical insertion order so reads reconstruct it.
+    node_files: Vec<String>,
+}
+
+fn bureau_dir(workdir: &Path) -> PathBuf {
+    workdir.join(BUREAU_DIR)
+}
+
+fn nodes_dir(workdir: &Path) -> PathBuf {
+    bureau_dir(workdir).join(NODES_SUBDIR)
+}
+
+fn index_path(workdir: &Path) -> PathBuf {
+    bureau_dir(workdir).join(GRAPH_FILE)
+}
+
+fn node_file_path(workdir: &Path, name: &str) -> PathBuf {
+    nodes_dir(workdir).join(format!("{name}.json"))
+}
+
+/// Load the graph from disk. Returns an empty graph if `.bureau/graph.json`
+/// doesn't exist (fresh workdir).
+pub fn load(workdir: &Path) -> Result<NodeGraph> {
+    let idx_path = index_path(workdir);
+    if !idx_path.exists() {
+        return Ok(NodeGraph::new());
+    }
+    let idx_raw = std::fs::read_to_string(&idx_path)
+        .with_context(|| format!("reading {}", idx_path.display()))?;
+    let idx: GraphIndex = serde_json::from_str(&idx_raw)
+        .with_context(|| format!("parsing {}", idx_path.display()))?;
+    let mut g = NodeGraph::new();
+    g.root = idx.root;
+    for fname in &idx.node_files {
+        let p = nodes_dir(workdir).join(fname);
+        let raw = std::fs::read_to_string(&p)
+            .with_context(|| format!("reading {}", p.display()))?;
+        let n: Node = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        g.nodes.insert(n.id, n);
+    }
+    Ok(g)
+}
+
+/// Save the graph to disk. Writes one JSON file per node into
+/// `.bureau/nodes/<name>.json` plus the topology index at
+/// `.bureau/graph.json`. Removes any stale per-node files (renamed or
+/// deleted nodes).
+pub fn save(workdir: &Path, g: &NodeGraph) -> Result<()> {
+    let nodes_d = nodes_dir(workdir);
+    std::fs::create_dir_all(&nodes_d)
+        .with_context(|| format!("creating {}", nodes_d.display()))?;
+    let mut node_files: Vec<String> = Vec::with_capacity(g.len());
+    let mut keep: HashSet<String> = HashSet::new();
+    for n in g.iter() {
+        let fname = format!("{}.json", n.name);
+        let p = node_file_path(workdir, &n.name);
+        let raw = serde_json::to_string_pretty(n)
+            .with_context(|| format!("serializing node {}", n.name))?;
+        std::fs::write(&p, raw.as_bytes())
+            .with_context(|| format!("writing {}", p.display()))?;
+        node_files.push(fname.clone());
+        keep.insert(fname);
+    }
+    // Prune stale per-node files left over from renames or deletions.
+    if let Ok(rd) = std::fs::read_dir(&nodes_d) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if s.ends_with(".json") && !keep.contains(s.as_ref()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let idx = GraphIndex {
+        root: g.root,
+        node_files,
+    };
+    let idx_raw = serde_json::to_string_pretty(&idx).context("serializing graph index")?;
+    let idx_path = index_path(workdir);
+    std::fs::write(&idx_path, idx_raw.as_bytes())
+        .with_context(|| format!("writing {}", idx_path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,5 +1089,59 @@ mod tests {
         assert_eq!(g2.len(), 3);
         assert_eq!(g2.get(root).unwrap().spec_public_md.as_deref(), Some("# spec"));
         assert_eq!(g2.get(a).unwrap().deps, vec![b]);
+    }
+
+    #[test]
+    fn load_on_empty_workdir_returns_empty_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = load(tmp.path()).unwrap();
+        assert_eq!(g.len(), 0);
+        assert!(g.root.is_none());
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(node("app")).unwrap();
+        let a = g.add_child(root, node("alpha")).unwrap();
+        let _b = g.add_child(root, node("beta")).unwrap();
+        g.add_dep(a, root).unwrap();
+        g.get_mut(a).unwrap().spec_public_md = Some("# alpha spec".into());
+        g.get_mut(a).unwrap().stages.spec = StageState::Done;
+
+        save(tmp.path(), &g).unwrap();
+        // Per-node files exist.
+        assert!(tmp.path().join(".bureau/nodes/app.json").exists());
+        assert!(tmp.path().join(".bureau/nodes/alpha.json").exists());
+        assert!(tmp.path().join(".bureau/nodes/beta.json").exists());
+        assert!(tmp.path().join(".bureau/graph.json").exists());
+
+        let g2 = load(tmp.path()).unwrap();
+        assert_eq!(g2.len(), 3);
+        assert_eq!(g2.root, Some(root));
+        assert_eq!(
+            g2.get(a).unwrap().spec_public_md.as_deref(),
+            Some("# alpha spec")
+        );
+        assert_eq!(g2.get(a).unwrap().stages.spec, StageState::Done);
+    }
+
+    #[test]
+    fn save_prunes_stale_node_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Initial save with two nodes.
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(node("app")).unwrap();
+        let _x = g.add_child(root, node("xx")).unwrap();
+        save(tmp.path(), &g).unwrap();
+        assert!(tmp.path().join(".bureau/nodes/xx.json").exists());
+
+        // Build a fresh graph without `xx`; save should remove its file.
+        let mut g2 = NodeGraph::new();
+        let _ = g2.insert_root(node("app")).unwrap();
+        save(tmp.path(), &g2).unwrap();
+        assert!(!tmp.path().join(".bureau/nodes/xx.json").exists());
+        assert!(tmp.path().join(".bureau/nodes/app.json").exists());
     }
 }

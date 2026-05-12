@@ -45,7 +45,9 @@ pub struct RenderReport {
 }
 
 /// Render the entire graph to `workdir`. Existing files are overwritten only
-/// if their content would change.
+/// if their content would change. Also persists the graph as JSON under
+/// `.bureau/` so the worktree's branch carries the graph state as files —
+/// see `graph::save`.
 pub fn render_graph(workdir: &Path, graph: &NodeGraph, layout: Layout) -> Result<RenderReport> {
     let Some(root_id) = graph.root else {
         // Nothing to render; that's OK.
@@ -61,6 +63,10 @@ pub fn render_graph(workdir: &Path, graph: &NodeGraph, layout: Layout) -> Result
     for node in graph.iter() {
         render_node(workdir, graph, node, layout, &mut report)?;
     }
+
+    // 3. Persist the graph as JSON under .bureau/ — that's how the worktree
+    //    branch carries the graph state.
+    crate::graph::save(workdir, graph)?;
 
     Ok(report)
 }
