@@ -8,8 +8,6 @@ use bureau_rs::state::{EngineState, EngineTask, StateHandle, TaskStatus, TokenUs
 use bureau_rs::tools::{TranscriptEntry, TranscriptKind};
 use bureau_rs::web::{router, AppState};
 use chrono::Utc;
-use parking_lot::Mutex;
-use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -37,10 +35,10 @@ async fn fetch_issues(workdir: std::path::PathBuf, tasks: Vec<EngineTask>) -> se
             st.tasks.insert(t.id, t.clone());
         }
     });
+    let _ = graph;
     let r = router(AppState {
         state,
         workdir,
-        graph: Arc::new(Mutex::new(graph)),
         worktrees: None,
     });
     let resp = r

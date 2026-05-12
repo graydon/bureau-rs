@@ -301,20 +301,17 @@ async fn workspace_with_cross_crate_dep_compiles() {
     );
 }
 
-/// Regression: two parallel worktrees both rendering the full graph
-/// in their own scratch dirs should both successfully land their
-/// per-task changes on main without conflict. The previous code did a
-/// three-way merge and tripped on "both branches modified the same
-/// file with different content" (because each worktree's full-tree
-/// render included other nodes' content at slightly different graph
-/// snapshots). The fix: only land each task's OWNED files via
-/// `apply_to_main`.
+/// Regression: two parallel worktrees both authoring different nodes'
+/// spec content should both land successfully on main. Under the new
+/// rebase + ff-merge model the second-lander rebases its branch atop
+/// the first-lander's tip (which brings in the first task's
+/// `.bureau/nodes/alpha.json` cleanly since the second task didn't
+/// touch it) and re-runs the gate before fast-forwarding.
 #[tokio::test]
 async fn parallel_tasks_land_without_merge_conflicts() {
     use bureau_rs::worktree::{Workspace, WorktreePool};
     let tmp = tempfile::tempdir().unwrap();
     let workdir = tmp.path().to_path_buf();
-    // Build a tiny workspace: root + two leaf modules.
     let mut g = NodeGraph::new();
     let mut root = Node::new("p", "");
     root.crate_boundary = true;
@@ -325,26 +322,23 @@ async fn parallel_tasks_land_without_merge_conflicts() {
     let workspace = Workspace::init(&workdir).unwrap();
     workspace.commit_main("scaffold: initial render").unwrap();
     let pool = Arc::new(WorktreePool::new(workspace.clone()).unwrap());
-    let graph = Arc::new(Mutex::new(g));
-    // Allocate two worktrees; in each, write spec content for the
-    // task's own node (the bug used to surface here because each
-    // worktree's full-tree render captured the OTHER node's not-yet-
-    // landed spec content from the shared graph).
+    // Each worktree gets its own per-task graph state, loaded fresh
+    // from disk at allocate time.
     let wta = pool.allocate(Uuid::new_v4()).await.unwrap();
     let wtb = pool.allocate(Uuid::new_v4()).await.unwrap();
-    // Task A: spec for alpha. Task B: spec for beta. Apply both via
-    // their own ctx, which renders to their own worktree.
+    let graph_a = Arc::new(Mutex::new(bureau_rs::graph::load(&wta.path).unwrap()));
+    let graph_b = Arc::new(Mutex::new(bureau_rs::graph::load(&wtb.path).unwrap()));
     let ctx_a = ctx_for(
         wta.path.clone(),
         Layout::SingleCrate,
-        graph.clone(),
+        graph_a.clone(),
         alpha_id,
         Stage::Spec,
     );
     let ctx_b = ctx_for(
         wtb.path.clone(),
         Layout::SingleCrate,
-        graph.clone(),
+        graph_b.clone(),
         beta_id,
         Stage::Spec,
     );
@@ -364,35 +358,22 @@ async fn parallel_tasks_land_without_merge_conflicts() {
         })
         .await
         .unwrap();
-    // Re-render canonical state into both worktrees (mirrors what the
-    // engine does just before landing). Both worktrees now contain
-    // BOTH specs (full-tree render reads the shared graph).
-    {
-        let g_lock = graph.lock();
-        render_graph(&wta.path, &g_lock, Layout::SingleCrate).unwrap();
-        render_graph(&wtb.path, &g_lock, Layout::SingleCrate).unwrap();
-    }
-    // Land just A's owned files first. Then B's. Old code: three-way
-    // merge would trip because both branches added beta's spec.md
-    // (with the same content here, but in real runs the content
-    // differs per snapshot). New code: only A's own files land.
-    let alpha_owned = {
-        let g_lock = graph.lock();
-        let n = g_lock.get(alpha_id).unwrap();
-        bureau_rs::render::files_owned_by_stage(&g_lock, n, Stage::Spec, Layout::SingleCrate)
-    };
-    pool.apply_to_main(wta, &alpha_owned, "spec: alpha")
-        .await
-        .expect("first apply should succeed");
-    let beta_owned = {
-        let g_lock = graph.lock();
-        let n = g_lock.get(beta_id).unwrap();
-        bureau_rs::render::files_owned_by_stage(&g_lock, n, Stage::Spec, Layout::SingleCrate)
-    };
-    pool.apply_to_main(wtb, &beta_owned, "spec: beta")
-        .await
-        .expect("second apply should succeed without conflict");
-    // Both specs should be on main.
+    // Land A first: commit, rebase (no-op — no other landings since
+    // allocate), ff-merge.
+    pool.commit_in_worktree(&wta, "spec: alpha").unwrap();
+    workspace
+        .rebase_branch_onto_main(&wta.path, &wta.branch)
+        .unwrap();
+    workspace.fast_forward_main(&wta.branch).unwrap();
+    pool.abandon(wta).await.unwrap();
+    // Land B: it was allocated from PRE-A main. Rebase brings in A's
+    // changes, then ff-merge.
+    pool.commit_in_worktree(&wtb, "spec: beta").unwrap();
+    workspace
+        .rebase_branch_onto_main(&wtb.path, &wtb.branch)
+        .unwrap();
+    workspace.fast_forward_main(&wtb.branch).unwrap();
+    pool.abandon(wtb).await.unwrap();
     let alpha_md =
         std::fs::read_to_string(workdir.join("spec/p/alpha/public.md")).unwrap();
     assert!(alpha_md.contains("First."));

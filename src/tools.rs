@@ -2079,7 +2079,7 @@ fn apply_slot_edit(
     // Now we restrict edits to exactly the slots this stage owns
     // (matching the submit_* tools' `require_stage` checks).
     {
-        let allowed = crate::engine::slots_owned_by_stage(ctx.stage);
+        let allowed = slots_owned_by_stage(ctx.stage);
         if !allowed.iter().any(|s| *s == slot) {
             return Err(ToolFailure::Other(format!(
                 "{tool_name}: slot {:?} is not writable in stage `{}` — only \
@@ -2500,6 +2500,24 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
 /// read/write/patch on the node's slots, plus the gate's diagnostic
 /// tool so the model can re-check after each edit without having to
 /// guess whether the fix worked.
+/// Slots a given stage is permitted to write to. Used by the quickfix
+/// file-edit tools (`write_file`, `apply_patch`, etc.) to reject edits
+/// outside the stage's scope — without this check, an Iface-stage
+/// quickfix could overwrite `tests.rs` and the change would never go
+/// through the gate.
+pub(crate) fn slots_owned_by_stage(stage: Stage) -> &'static [crate::render::NodeSlot] {
+    use crate::render::NodeSlot::*;
+    match stage {
+        Stage::Architect => &[],
+        Stage::Spec => &[SpecPublicMd, SpecPrivateMd],
+        Stage::Iface => &[PublicRs, PrivateRs],
+        Stage::Tests => &[TestsRs],
+        Stage::Impl => &[PrivateRs],
+        Stage::Debug => &[PrivateRs, TestsRs],
+        Stage::Opt => &[PrivateRs],
+    }
+}
+
 fn quickfix_tools_for(stage: Stage) -> Vec<&'static str> {
     use Stage::*;
     let mut v = vec![

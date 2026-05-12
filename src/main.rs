@@ -77,7 +77,6 @@ async fn main() -> Result<()> {
         let app = web::AppState {
             state: state.clone(),
             workdir: cli.work_dir.clone(),
-            graph: engine.graph.clone(),
             worktrees: Some(engine.worktrees.clone()),
         };
         let port = cli.port;

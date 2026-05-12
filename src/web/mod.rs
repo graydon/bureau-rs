@@ -24,9 +24,6 @@ use uuid::Uuid;
 pub struct AppState {
     pub state: StateHandle,
     pub workdir: PathBuf,
-    /// The engine's authoritative graph. Web mutations (e.g. reset_node)
-    /// must hit this so the running engine sees them immediately.
-    pub graph: std::sync::Arc<parking_lot::Mutex<crate::graph::NodeGraph>>,
     /// Worktree pool — used to surface in-progress work in the files
     /// panel. None when the web UI is started without an engine (e.g.
     /// pure-checkpoint browse mode).
@@ -391,41 +388,42 @@ struct ResetNodeOk {
 
 async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBody>) -> Response {
     use crate::graph::{Stage, StageState};
+    // Load the graph from disk, mutate, save back. The engine will see
+    // the new state on its next pick_next_ready load.
+    let mut g = match crate::graph::load(&s.workdir) {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
     let mut reset_names: Vec<String> = Vec::new();
-    {
-        let mut g = s.graph.lock();
-        // Collect targets: the named node plus (if cascading) every node
-        // whose transitive deps include the named node.
-        let mut targets: std::collections::HashSet<crate::graph::NodeId> =
-            std::collections::HashSet::new();
-        targets.insert(body.node_id);
-        if body.cascade {
-            let ids: Vec<_> = g.nodes.keys().copied().collect();
-            for id in ids {
-                if id != body.node_id && g.dep_reaches(id, body.node_id) {
-                    targets.insert(id);
-                }
-            }
-        }
-        for id in &targets {
-            if let Some(n) = g.get_mut(*id) {
-                for stage in Stage::ALL {
-                    n.stages.set(stage, StageState::NotStarted);
-                }
-                reset_names.push(n.name.clone());
+    let mut targets: std::collections::HashSet<crate::graph::NodeId> =
+        std::collections::HashSet::new();
+    targets.insert(body.node_id);
+    if body.cascade {
+        let ids: Vec<_> = g.nodes.keys().copied().collect();
+        for id in ids {
+            if id != body.node_id && g.dep_reaches(id, body.node_id) {
+                targets.insert(id);
             }
         }
     }
-    // Sync the change into the EngineState so the UI reflects it
-    // immediately rather than waiting for the engine's next sync.
-    let snap = s.graph.lock().clone();
+    for id in &targets {
+        if let Some(n) = g.get_mut(*id) {
+            for stage in Stage::ALL {
+                n.stages.set(stage, StageState::NotStarted);
+            }
+            reset_names.push(n.name.clone());
+        }
+    }
+    if let Err(e) = crate::graph::save(&s.workdir, &g) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+    }
     let msg = format!(
         "reset {} node(s) from web UI: {}",
         reset_names.len(),
         reset_names.join(", ")
     );
     s.state.write(|st| {
-        st.graph = snap;
+        st.graph = g.clone();
         st.note(msg);
     });
     Json(ResetNodeOk { reset: reset_names }).into_response()
