@@ -437,5 +437,3 @@ async fn api_stop(State(s): State<AppState>) -> Response {
     StatusCode::OK.into_response()
 }
 
-// Suppress unused warning when TaskStatus isn't directly referenced.
-fn _force_taskstatus(_: TaskStatus) {}
