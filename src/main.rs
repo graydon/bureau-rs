@@ -97,7 +97,9 @@ async fn main() -> Result<()> {
     if let Ok(p) = checkpoint::save(&snap, &ckpt_dir) {
         tracing::info!("final checkpoint: {}", p.display());
     }
-    let _ = checkpoint::save_latest(&snap, &ckpt_dir);
+    if let Err(e) = checkpoint::save_latest(&snap, &ckpt_dir) {
+        tracing::warn!("save_latest checkpoint failed: {e:#}");
+    }
 
     match &result {
         Ok(_) => tracing::info!("pipeline complete"),

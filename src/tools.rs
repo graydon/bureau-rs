@@ -613,19 +613,19 @@ impl Tool for SubmitPrivateTool {
             if lines > self.ctx.max_file_lines {
                 return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
             }
-            // Need a snapshot of the graph for validation.
-            let validated = {
+            // Validate against the in-place node — no clone needed.
+            // (The previous code cloned the node, ran validate against
+            // the clone, then dropped the clone with `let _ = validated`;
+            // it implied a snapshot semantic that wasn't load-bearing
+            // since TaskCtx::graph is a per-task Mutex with no concurrent
+            // writers.)
+            {
                 let g = self.ctx.graph.lock();
-                let n = g
-                    .get(self.ctx.node_id)
-                    .ok_or_else(|| {
-                        ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-                    })?
-                    .clone();
-                node_validate::validate_private(&args.content, &n, &g)?;
-                n
-            };
-            let _ = validated;
+                let n = g.get(self.ctx.node_id).ok_or_else(|| {
+                    ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
+                })?;
+                node_validate::validate_private(&args.content, n, &g)?;
+            }
             let mut no_change = false;
             {
                 let mut g = self.ctx.graph.lock();
