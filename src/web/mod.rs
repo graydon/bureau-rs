@@ -388,8 +388,21 @@ struct ResetNodeOk {
 
 async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBody>) -> Response {
     use crate::graph::{Stage, StageState};
-    // Load the graph from disk, mutate, save back. The engine will see
-    // the new state on its next pick_next_ready load.
+    // Take `main_lock` for the whole load→mutate→save→commit cycle.
+    // Without it, this races the engine on two axes: (a) a concurrent
+    // `set_stage_on_main` can interleave between our load and save,
+    // and (b) a concurrent `ff-merge` can move HEAD between our save
+    // and our commit, leaving the mutation orphaned on disk (no
+    // commit) so the next worktree allocate (which checks out HEAD)
+    // reverts our reset entirely.
+    let Some(pool) = s.worktrees.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worktree pool unavailable; cannot serialize reset",
+        )
+            .into_response();
+    };
+    let _guard = pool.main_lock().lock().await;
     let mut g = match crate::graph::load(&s.workdir) {
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
@@ -422,6 +435,12 @@ async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBod
         reset_names.len(),
         reset_names.join(", ")
     );
+    // Commit the reset onto main so the next worktree allocate (which
+    // branches from HEAD) actually sees it. Without this commit the
+    // reset is stranded on disk and gets clobbered by the next ff-merge.
+    if let Err(e) = pool.workspace.commit_main(&msg) {
+        tracing::warn!("commit_main after reset: {e:#}");
+    }
     s.state.write(|st| {
         st.graph = g.clone();
         st.note(msg);

@@ -125,7 +125,7 @@ impl Engine {
                 // Mark InProgress eagerly in main's graph so subsequent
                 // picks skip it. Concurrent tasks see this through main's
                 // .bureau/nodes/*.json on their next allocate.
-                self.set_stage_on_main(node_id, stage, StageState::InProgress)?;
+                self.set_stage_on_main(node_id, stage, StageState::InProgress).await?;
                 self.sync_graph_to_state();
                 let this = self.clone();
                 joinset.spawn(async move { this.advance_stage(node_id, stage).await });
@@ -216,12 +216,21 @@ impl Engine {
     /// Set a node's stage state on the MAIN workdir's graph and commit
     /// the change. Used to mark stages InProgress / Done / Failed in
     /// main's view so other tasks see the new state.
-    fn set_stage_on_main(
+    /// Update one (node, stage) in main's graph. Takes `main_lock` so
+    /// it doesn't race with itself (parallel tasks completing) or with
+    /// an in-flight `rebase_branch_onto_main + fast_forward_main`.
+    /// Without the lock, two completions can both load main, mutate
+    /// different stages, save — and the later save's per-node-file
+    /// write would still be correct, BUT the topology index commit
+    /// races with ff-merge's commit and either can clobber the other's
+    /// pending tree.
+    async fn set_stage_on_main(
         &self,
         node_id: NodeId,
         stage: Stage,
         state: StageState,
     ) -> Result<()> {
+        let _guard = self.worktrees.main_lock().lock().await;
         let mut g = graph::load(&self.workdir)?;
         if let Some(n) = g.get_mut(node_id) {
             n.stages.set(stage, state);
@@ -296,7 +305,7 @@ impl Engine {
                 .await
             {
                 Ok(()) => {
-                    self.set_stage_on_main(node_id, stage, StageState::Done)?;
+                    self.set_stage_on_main(node_id, stage, StageState::Done).await?;
                     self.sync_graph_to_state();
                     self.state.emit(UiEvent::NodeChanged { id: node_id });
                     return Ok(());
@@ -315,7 +324,7 @@ impl Engine {
                 }
             }
         }
-        self.set_stage_on_main(node_id, stage, StageState::Failed)?;
+        self.set_stage_on_main(node_id, stage, StageState::Failed).await?;
         self.sync_graph_to_state();
         self.state.emit(UiEvent::NodeChanged { id: node_id });
         // Impl failures get picked up by the Debug stage; don't bubble.

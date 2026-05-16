@@ -345,9 +345,8 @@ pub struct SubmitSpecArgs {
     pub private: Option<String>,
     /// Existing node names that THIS node should depend on. Adds dep
     /// edges from the current node; does NOT create nodes (the architect
-    /// stage already laid out the tree). Adding a NEW dep here triggers
-    /// a cascade-reset of every dependent of this node (their
-    /// iface/tests/impl assumptions may have changed).
+    /// stage already laid out the tree). The dep edge is local to this
+    /// node — other nodes' state is not mutated.
     #[serde(default)]
     pub deps: Vec<String>,
 }
@@ -359,10 +358,6 @@ pub struct SubmitSpecOk {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub private_bytes: Option<u64>,
     pub deps_added: Vec<NodeIdRef>,
-    /// Names of nodes whose post-architect stages were reset because of
-    /// new dep edges added by this submission. The framework will re-run
-    /// spec/iface/etc. for these nodes.
-    pub cascade_reset: Vec<String>,
 }
 
 pub struct SubmitSpecTool {
@@ -401,8 +396,8 @@ impl Tool for SubmitSpecTool {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "OPTIONAL. Names of existing graph nodes that \
-                                        THIS node should depend on. Adding a NEW dep \
-                                        triggers a cascade-reset of dependents."
+                                        THIS node should depend on. Local mutation \
+                                        only — other nodes are not affected."
                     }
                 },
                 "required": ["public"]
@@ -466,7 +461,7 @@ fn submit_spec_apply(
         deps_resolved.push(id);
     }
 
-    // ---- Apply: write spec content, add dep edges, cascade-reset ----
+    // ---- Apply: write spec content, add dep edges ----
     let public_bytes = args.public.len() as u64;
     let private_bytes = args.private.as_ref().map(|p| p.len() as u64);
     {
@@ -479,43 +474,21 @@ fn submit_spec_apply(
         }
         n.updated_at = Utc::now();
     }
-    // Add dep edges. Existing edges are no-ops (add_dep dedupes); new
-    // edges trigger cascade-reset.
-    let prev_deps: HashSet<NodeId> = g
-        .get(self_id)
-        .map(|n| n.deps.iter().copied().collect())
-        .unwrap_or_default();
+    // Add dep edges. Existing edges are no-ops (add_dep dedupes). We
+    // used to cascade-reset dependents here when a new dep was added;
+    // that mutated nodes outside the current task's scope (the "task X
+    // mutating node Y" anti-pattern). Removed: adding a dep doesn't
+    // change THIS node's public surface, so dependents continue to
+    // compile against the same iface. If a spec change DOES alter the
+    // public surface, that's caught at this node's own iface re-run.
     let mut deps_added = Vec::new();
-    let mut new_edges = false;
     for to in &deps_resolved {
-        if !prev_deps.contains(to) {
-            new_edges = true;
-        }
         g.add_dep(self_id, *to)?;
         let n = g.get(*to).unwrap();
         deps_added.push(NodeIdRef {
             id: n.id.to_string(),
             name: n.name.clone(),
         });
-    }
-
-    // Cascade reset: any node that transitively depends on THIS node
-    // gets its post-architect stages reset (their assumptions about
-    // this node's iface may have changed). We DON'T reset this node
-    // itself — its spec stage just succeeded.
-    let mut cascade_reset = Vec::new();
-    if new_edges {
-        let closure = g.reverse_dep_closure(self_id);
-        for id in closure {
-            if id == self_id {
-                continue; // don't undo our own success
-            }
-            let name = g.get(id).map(|n| n.name.clone()).unwrap_or_default();
-            if let Some(n) = g.get_mut(id) {
-                n.stages.reset_post_architect();
-            }
-            cascade_reset.push(name);
-        }
     }
 
     drop(g);
@@ -525,7 +498,6 @@ fn submit_spec_apply(
         public_lines,
         private_bytes,
         deps_added,
-        cascade_reset,
     })
 }
 
@@ -2268,8 +2240,8 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
               see this. NOT a changelog of your edits.\n\
             - `deps` (optional) — names of existing graph nodes that THIS node depends \
               on. Adds dep edges to the graph; cycle-checked at the node AND crate \
-              level. Adding a new dep here will RESET this node's dependents back to \
-              re-spec, since their assumptions about this node may have changed.\n\
+              level. This is a LOCAL mutation — only this node's deps list changes; \
+              dependents are not touched.\n\
             \n\
             (Per-file cap for code is {max_file} lines, for context.)"
         ),
@@ -2633,19 +2605,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_spec_adding_dep_resets_dependents() {
-        // Architect lays out: root -> a, b. b has no deps. After spec
-        // stage on `b` adds a dep on `a`, `a` doesn't get reset (b is
-        // a's dependent, not the other way around). After spec stage
-        // on `a` adds a dep on... actually let me set this up cleanly.
-        //
-        // root -> a, b. Initially no deps. b's iface/impl are Done.
-        // Now spec on `a` adds dep on `b`. Since b depends on... wait,
-        // b does NOT depend on a here. Let me do:
-        //
-        // root -> a, b. b deps on a (set up). a's spec writer adds a
-        // new dep on... uh, root? Hmm, let me just verify: when a node
-        // gains a new dep, its transitive reverse-dependents reset.
+    async fn submit_spec_adding_dep_does_not_mutate_other_nodes() {
+        // Adding a dep edge from THIS node to another is a local
+        // mutation: only this node's `deps` field changes. We
+        // intentionally do NOT cascade-reset dependents — adding a dep
+        // doesn't alter this node's public surface, so dependents
+        // continue to compile against the same iface they already
+        // tested against. If a spec change DOES alter the public
+        // surface, that's caught at this node's own iface re-run.
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().to_path_buf();
         let mut g = NodeGraph::new();
@@ -2663,9 +2630,7 @@ mod tests {
         }
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
         let graph = Arc::new(Mutex::new(g));
-        // Now run a spec stage on `core` that adds a dep on `util`.
-        // `core`'s reverse-deps include `leaf`, so leaf should reset.
-        // `core` itself is NOT reset (its spec just succeeded).
+        // Run a spec stage on `core` that adds a dep on `util`.
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             core,
@@ -2690,13 +2655,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.deps_added.len(), 1);
-        assert!(r.cascade_reset.contains(&"leaf".to_string()));
         let g = graph.lock();
-        // leaf's iface should now be NotStarted.
-        assert_eq!(g.get(leaf).unwrap().stages.iface, StageState::NotStarted);
-        // core's spec stays Done (we just ran it).
-        // util untouched.
+        // leaf's iface MUST stay Done — we don't mutate dependents.
+        assert_eq!(g.get(leaf).unwrap().stages.iface, StageState::Done);
+        assert_eq!(g.get(leaf).unwrap().stages.impl_, StageState::Done);
+        // util's stages also untouched.
         assert_eq!(g.get(util).unwrap().stages.iface, StageState::Done);
+        // core has the new dep.
+        assert!(g.get(core).unwrap().deps.contains(&util));
     }
 
     #[tokio::test]

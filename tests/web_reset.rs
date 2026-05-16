@@ -8,7 +8,22 @@ use axum::http::{Request, StatusCode};
 use bureau_rs::graph::{self, Node, NodeGraph, Stage, StageState};
 use bureau_rs::state::{EngineState, StateHandle};
 use bureau_rs::web::{AppState, router};
+use bureau_rs::worktree::{Workspace, WorktreePool};
+use std::sync::Arc;
 use tower::ServiceExt;
+
+/// Set up a git-initialized workdir with the graph committed on main.
+/// The reset endpoint takes `main_lock` and commits its mutation, so
+/// tests need a real Workspace+WorktreePool rather than just an
+/// untracked directory.
+fn make_workspace_with_graph(g: &NodeGraph) -> (tempfile::TempDir, Arc<WorktreePool>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = Workspace::init(tmp.path()).unwrap();
+    graph::save(tmp.path(), g).unwrap();
+    ws.commit_main("seed").unwrap();
+    let pool = Arc::new(WorktreePool::new(ws).unwrap());
+    (tmp, pool)
+}
 
 fn done_all(g: &mut NodeGraph) {
     for n in g.nodes.values_mut() {
@@ -31,8 +46,7 @@ async fn reset_node_cascades_through_dependents() {
     g.add_dep(app_id, lib_id).unwrap();
     done_all(&mut g);
 
-    let workdir = tempfile::tempdir().unwrap();
-    graph::save(workdir.path(), &g).unwrap();
+    let (workdir, pool) = make_workspace_with_graph(&g);
     let state = StateHandle::new(EngineState::new(
         workdir.path().to_path_buf(),
         workdir.path().to_path_buf(),
@@ -43,7 +57,7 @@ async fn reset_node_cascades_through_dependents() {
     let app = AppState {
         state: state.clone(),
         workdir: workdir.path().to_path_buf(),
-        worktrees: None,
+        worktrees: Some(pool),
     };
     let r = router(app);
 
@@ -106,8 +120,7 @@ async fn reset_node_without_cascade_only_resets_target() {
     g.add_dep(app_id, lib_id).unwrap();
     done_all(&mut g);
 
-    let workdir = tempfile::tempdir().unwrap();
-    graph::save(workdir.path(), &g).unwrap();
+    let (workdir, pool) = make_workspace_with_graph(&g);
     let state = StateHandle::new(EngineState::new(
         workdir.path().to_path_buf(),
         workdir.path().to_path_buf(),
@@ -118,7 +131,7 @@ async fn reset_node_without_cascade_only_resets_target() {
     let r = router(AppState {
         state: state.clone(),
         workdir: workdir.path().to_path_buf(),
-        worktrees: None,
+        worktrees: Some(pool),
     });
 
     let body = serde_json::to_vec(&serde_json::json!({
