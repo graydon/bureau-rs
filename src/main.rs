@@ -105,8 +105,9 @@ async fn main() -> Result<()> {
     }
 
     if !cli.exit_when_done && ui_handle.is_some() {
+        let kind = if result.is_ok() { "complete" } else { "halted" };
         tracing::info!(
-            "pipeline complete — web UI still running at http://0.0.0.0:{}. Press Ctrl+C to exit.",
+            "pipeline {kind} — web UI still running at http://0.0.0.0:{}. Press Ctrl+C to exit.",
             cli.port
         );
         wait_for_shutdown().await;

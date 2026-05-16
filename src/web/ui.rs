@@ -65,6 +65,23 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     background: #4a3f1f; color: #f0d59e; animation: pulse 1.6s infinite;
   }
   .status.resolved { opacity: 0.65; }
+  /* Scheduler banner — sits at the top of the page when the
+     scheduler isn't Running, drawing the eye to "why isn't anything
+     happening". Hidden by default; the renderer toggles its class. */
+  #sched-banner { display: none; padding: 8px 12px; font-weight: 600;
+                  text-align: center; }
+  #sched-banner.visible { display: block; }
+  #sched-banner.stopped, #sched-banner.failed {
+    background: #3a1f1f; color: #ffb0b0;
+  }
+  #sched-banner.done { background: #1f3a2a; color: #b8f0c8; }
+  #sched-banner.paused { background: #4a3f1f; color: #f0d59e; }
+  /* The inline `Sched:` value in the status bar gets the same
+     color treatment so it's findable when scrolled past the banner. */
+  #sched.stopped, #sched.failed { color: #f0a0a0; font-weight: 600; }
+  #sched.done                   { color: #98e3b3; font-weight: 600; }
+  #sched.paused                 { color: #f0d59e; font-weight: 600; }
+  #sched.running                { color: #d4b8ff; }
   /* A combined phase+status pill: phase name in muted text, background
      tinted by status. Used for per-stage badges in the node + task UI. */
   .phase-pill { display: inline-block; padding: 1px 6px; border-radius: 3px;
@@ -164,6 +181,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 </head>
 <body>
 <div id="app">
+<div id="sched-banner"></div>
 <div id="panels">
   <div class="panel col-1">
     <div class="panel-h">Graph + Tasks <span class="muted" id="counts"></span></div>
@@ -226,10 +244,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   <span style="flex:1"></span>
   <span class="muted">Tokens: <span id="tokens">0/0</span></span>
   <span class="muted">USD: <span id="cost">$0.00</span></span>
-  <button onclick="api('/api/pause','POST')">Pause</button>
-  <button onclick="api('/api/resume','POST')">Resume</button>
+  <button onclick="schedAction('/api/pause','paused')">Pause</button>
+  <button onclick="schedAction('/api/resume','running')">Resume</button>
   <button onclick="api('/api/checkpoint','POST').then(r => alert('saved: '+(r.path||'')))">Checkpoint</button>
-  <button onclick="api('/api/stop','POST')">Stop</button>
+  <button onclick="schedAction('/api/stop','stopped')">Stop</button>
 </div>
 </div>
 <script>
@@ -304,6 +322,20 @@ function initSplitters() {
   }
 }
 
+// Optimistic UI for scheduler-state control buttons. Reflect the
+// expected new state locally before the POST returns, so the user sees
+// "click → state changes" without the 2s poll latency. The SSE
+// `scheduler_state_changed` event will confirm (or correct) shortly
+// after.
+async function schedAction(path, expected) {
+  if (state) {
+    state.scheduler = expected;
+    markDirty('header');
+    render();
+  }
+  try { await api(path, 'POST'); } catch (e) { console.error(e); }
+}
+
 async function api(path, method='GET', body=null) {
   const r = await fetch(path, {
     method,
@@ -367,7 +399,24 @@ function render() {
   if (!state) return;
   rebuildIndexes();
   if (dirty.header) {
-    document.getElementById('sched').textContent = state.scheduler;
+    const sched = state.scheduler || 'idle';
+    const schedEl = document.getElementById('sched');
+    schedEl.textContent = sched;
+    schedEl.className = sched;
+    const banner = document.getElementById('sched-banner');
+    if (sched === 'running' || sched === 'idle') {
+      banner.className = '';
+      banner.textContent = '';
+    } else {
+      const msg = ({
+        stopped: 'Pipeline halted — no ready stages remain. Reset a stuck node or restart to continue.',
+        done:    'Pipeline complete.',
+        paused:  'Paused — click Resume to continue.',
+        failed:  'Pipeline failed — check the issues panel.',
+      })[sched] || `Scheduler: ${sched}`;
+      banner.textContent = msg;
+      banner.className = `visible ${sched}`;
+    }
     const nodeCount = Object.keys(state.graph?.nodes || {}).length;
     const taskCount = Object.keys(state.tasks || {}).length;
     document.getElementById('node-count').textContent = nodeCount;
@@ -873,7 +922,8 @@ setInterval(refreshIssues, 4000);
 // otherwise — see snapshot_slim in src/state.rs). Naively replacing
 // `state` would clobber the in-memory transcript of the selected task
 // on every poll; we preserve it here so the transcript view doesn't
-// flash empty every 8 seconds.
+// flash empty every poll. 2s gives a snappy "click pause → see it
+// reflected" response without burning CPU at higher frequencies.
 setInterval(async () => {
   const prev = selectedTaskId && state
     ? state.tasks?.[selectedTaskId]?.transcript
@@ -884,7 +934,7 @@ setInterval(async () => {
   }
   markAllDirty();
   render();
-}, 8000);
+}, 2000);
 </script>
 </body>
 </html>

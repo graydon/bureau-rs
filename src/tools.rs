@@ -15,10 +15,11 @@
 //!
 //! 4. **Verdict** — `submit_verdict`. Judge-only.
 //!
-//! All other tools from the old harness (`read_file`, `write_file`,
-//! `list_files`, `replace_fn_body`, `list_compiler_errors`, `emit_subtasks`,
-//! the spec-section trio) are gone. Reads are pre-loaded into the prompt
-//! by `node_context`; writes go through these slot-fillers.
+//! 5. **Quickfix file-edit tools** — `read_file`, `write_file`,
+//!    `write_file_range`, `apply_patch`. `read_file` is registered on
+//!    every role (it's read-only). The write/patch trio is only
+//!    registered for the QuickFixer role and is scoped to slots owned
+//!    by the current stage.
 
 use crate::graph::{Node, NodeGraph, NodeId, Stage};
 #[cfg(test)]
@@ -987,21 +988,25 @@ fn submit_architecture_apply(
         }
     }
 
-    // 5. External deps: stored on the root node's description tail for
-    //    now (the renderer will pick them up later when crate Cargo.tomls
-    //    learn about external deps). Just count them so the model gets
-    //    feedback.
+    // 5. External crate deps: store as structured data on the root node.
+    //    Renderer reads `root.external_crate_deps` and writes them into
+    //    `[workspace.dependencies]` (workspace layout) or `[dependencies]`
+    //    (single crate). Without this every node that referenced an
+    //    external crate would fail to compile because the crate isn't
+    //    in any Cargo.toml.
     let external_deps = args.external_deps.len();
     if external_deps > 0 {
         let r = g.get_mut(root_id).unwrap();
-        let mut note = String::from("\n\n## External crate deps (architect)\n\n");
-        for dep in &args.external_deps {
-            note.push_str(&format!("- `{}` — {}\n", dep.name, dep.reason));
-        }
-        // Append to spec_private_md so it shows up in private notes
-        // without polluting the public spec.
-        let prev = r.spec_private_md.take().unwrap_or_default();
-        r.spec_private_md = Some(prev + &note);
+        r.external_crate_deps = args
+            .external_deps
+            .into_iter()
+            .map(|d| crate::graph::ExternalCrateDep {
+                name: d.name,
+                version: None,
+                features: d.features,
+                reason: d.reason,
+            })
+            .collect();
     }
 
     drop(g);
@@ -1673,6 +1678,27 @@ impl Tool for ReadFileTool {
         }
         let r: Result<ReadFileOk, ToolFailure> = (|| {
             let abs = scoped_path(&self.ctx.workdir, &args.path)?;
+            let rel = std::path::PathBuf::from(&args.path);
+            // Scope: only allow reads of files this node has a legitimate
+            // need for. Specifically: own slots, declared deps' public
+            // surface, ancestor specs/public, and framework-rendered
+            // metadata (Cargo.toml, mod.rs, lib.rs). Anything else
+            // (sibling private internals, unrelated nodes' tests, etc.)
+            // is rejected — read access has to be scoped or models can
+            // peek at things they shouldn't reason about.
+            {
+                let g = self.ctx.graph.lock();
+                if !is_readable_by_node(&g, self.ctx.node_id, &rel, self.ctx.layout) {
+                    let hint = readable_paths_hint(&g, self.ctx.node_id, self.ctx.layout);
+                    return Err(ToolFailure::Other(format!(
+                        "read_file: path '{}' is not readable from this node's scope. \
+                         Readable: own slots, any node's public surface (public.rs / \
+                         spec/<path>/public.md), ancestor specs, and framework files \
+                         (Cargo.toml, mod.rs, lib.rs).{hint}",
+                        args.path
+                    )));
+                }
+            }
             let content = std::fs::read_to_string(&abs).map_err(|e| {
                 ToolFailure::Other(format!("read {}: {e}", args.path))
             })?;
@@ -2004,6 +2030,88 @@ fn read_slot_content(ctx: &TaskCtx, path: &str) -> Result<String, ToolFailure> {
 /// using the same per-slot validator as the corresponding `submit_*`
 /// tool, then updates the graph and re-renders. Returns
 /// `(bytes, lines, no_change)`.
+/// Build a short, concrete hint listing a few real, readable paths
+/// for the current node. Models frequently call `read_file` with
+/// reasonable INTENT but the WRONG path (workspace layout confusion
+/// is common: writing `src/foo.rs` when the file is at
+/// `crates/<crate>/src/foo/public.rs`). Showing actual readable paths
+/// in the error message cuts down on the trial-and-error storm.
+fn readable_paths_hint(g: &NodeGraph, self_id: NodeId, layout: render::Layout) -> String {
+    let mut samples: Vec<String> = Vec::new();
+    if let Some(self_node) = g.get(self_id) {
+        let src = render::node_src_dir(g, self_node, layout);
+        let spec = render::node_spec_dir(g, self_node);
+        samples.push(format!("{}/public.rs", src.display()));
+        samples.push(format!("{}/private.rs", src.display()));
+        samples.push(format!("{}/public.md", spec.display()));
+    }
+    // Also show one or two sibling/ancestor public.rs paths so the
+    // model has a template for cross-node reads.
+    let mut others: Vec<String> = Vec::new();
+    for n in g.iter().take(8) {
+        if n.id == self_id {
+            continue;
+        }
+        let src = render::node_src_dir(g, n, layout);
+        others.push(format!("{}/public.rs", src.display()));
+        if others.len() >= 3 {
+            break;
+        }
+    }
+    if !others.is_empty() {
+        samples.extend(others);
+    }
+    if samples.is_empty() {
+        String::new()
+    } else {
+        format!("\nExamples of readable paths: {}", samples.join(", "))
+    }
+}
+
+/// Decide whether the current node has a legitimate reason to read
+/// the file at `rel`. The model's reading needs are bounded:
+///   - own node's slots: always
+///   - any node's PUBLIC surface (`public.rs`, `spec/public.md`):
+///     allowed everywhere — these are conceptually the project's
+///     visible API
+///   - ancestors: also their `private.md` (descendants benefit from
+///     ancestor design context)
+///   - framework files (`Cargo.toml`, `mod.rs`, `lib.rs`): always
+/// Denied:
+///   - other nodes' `private.rs`, `tests.rs`, `private.md`: these
+///     are internals or test code that other nodes shouldn't reason
+///     about
+pub(crate) fn is_readable_by_node(
+    g: &NodeGraph,
+    self_id: NodeId,
+    rel: &std::path::Path,
+    layout: render::Layout,
+) -> bool {
+    if let Some(fname) = rel.file_name().and_then(|s| s.to_str()) {
+        if matches!(fname, "Cargo.toml" | "mod.rs" | "lib.rs") {
+            return true;
+        }
+    }
+    let Some((target_id, slot)) = render::resolve_path_to_slot(g, rel, layout) else {
+        return false;
+    };
+    if target_id == self_id {
+        return true;
+    }
+    // Public surface is readable globally — any node's `public.rs` and
+    // `spec/public.md` are conceptually the project's interface.
+    if matches!(
+        slot,
+        render::NodeSlot::PublicRs | render::NodeSlot::SpecPublicMd
+    ) {
+        return true;
+    }
+    // For private slots (`private.rs`, `tests.rs`, `spec/private.md`),
+    // only ancestors are readable.
+    let ancestors = g.ancestors(self_id, false);
+    ancestors.contains(&target_id)
+}
+
 fn apply_slot_edit(
     ctx: &Arc<TaskCtx>,
     path: &str,
@@ -2377,27 +2485,23 @@ pub fn tool_definitions_for(
 pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
     use Role::*;
     use Stage::*;
-    // QuickFixer always gets the file-edit tools plus the gate's diagnostic
-    // tool. The toolset is the same regardless of which stage triggered it
-    // — the model's job is "fix the compiler/test errors", and which gate
-    // those came from is communicated via the preamble.
     if matches!(role, QuickFixer) {
         return quickfix_tools_for(stage);
     }
-    match (stage, role) {
-        // Architect runs single-shot — only Writer; no critic/reviser/judge.
+    // ReadFileTool is registered on the base agent in `llm::run_rig_agent`
+    // for every (stage, role), so it's always in the catalog.
+    let mut v: Vec<&'static str> = vec![ReadFileTool::NAME];
+    let rest: Vec<&'static str> = match (stage, role) {
         (Architect, Writer) => vec![SubmitArchitectureTool::NAME],
         (Architect, _) => vec![],
 
-        (Spec, Writer) | (Spec, Reviser) => {
-            vec![SubmitSpecTool::NAME]
-        }
+        (Spec, Writer) | (Spec, Reviser) => vec![SubmitSpecTool::NAME],
         (Spec, Critic) => vec![SubmitCritiqueTool::NAME],
         (Spec, Judge) => vec![SubmitVerdictTool::NAME],
 
         (Iface, Writer) | (Iface, Reviser) => vec![
             SubmitPublicTool::NAME,
-            SubmitPrivateTool::NAME, // initial scaffold; impl stage will refine
+            SubmitPrivateTool::NAME,
             CargoCheckTool::NAME,
         ],
         (Iface, Critic) => vec![CargoCheckTool::NAME, SubmitCritiqueTool::NAME],
@@ -2463,9 +2567,10 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
         ],
         (Opt, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
 
-        // QuickFixer was handled at the top of the function.
         (_, QuickFixer) => unreachable!(),
-    }
+    };
+    v.extend(rest);
+    v
 }
 
 /// Tool set for the quickfix inner loop. Same shape for every stage:
@@ -2915,10 +3020,10 @@ mod tests {
         assert!(tool_names_for(Stage::Impl, Role::Judge).contains(&"submit_verdict"));
         // Critic gets diagnostics in coding stages but no verdict tool.
         assert!(!tool_names_for(Stage::Impl, Role::Critic).contains(&"submit_verdict"));
-        // Spec critic now has the submit_critique tool (and only that).
+        // Spec critic has submit_critique (plus the universal read_file).
         assert_eq!(
             tool_names_for(Stage::Spec, Role::Critic),
-            vec!["submit_critique"]
+            vec!["read_file", "submit_critique"]
         );
         // Every critic gets submit_critique.
         for stage in [

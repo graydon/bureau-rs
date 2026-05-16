@@ -53,11 +53,43 @@ pub enum GateKind {
 
 impl GateKind {
     pub fn args(self) -> &'static [&'static str] {
+        // `--workspace` is the critical flag: without it cargo only
+        // compiles the root package, which means a workspace's member
+        // crates (under `crates/<name>/`) are never type-checked.
+        // Previously a member crate could have unresolved imports,
+        // type mismatches, missing deps — anything — and the gate
+        // would still report `passed: true` because the root compiled
+        // fine.
+        //
+        // `--all-targets` extends `check`/`build` to also compile
+        // tests, examples and benches: an iface-stage `cargo check`
+        // that misses test-file compile errors only catches half of
+        // what the model could have broken.
         match self {
-            GateKind::Check => &["check", "--message-format=json"],
-            GateKind::Build => &["build", "--message-format=json"],
-            GateKind::Test => &["test", "--message-format=json", "--no-fail-fast"],
-            GateKind::TestNoRun => &["test", "--no-run", "--message-format=json"],
+            GateKind::Check => &[
+                "check",
+                "--workspace",
+                "--all-targets",
+                "--message-format=json",
+            ],
+            GateKind::Build => &[
+                "build",
+                "--workspace",
+                "--all-targets",
+                "--message-format=json",
+            ],
+            GateKind::Test => &[
+                "test",
+                "--workspace",
+                "--message-format=json",
+                "--no-fail-fast",
+            ],
+            GateKind::TestNoRun => &[
+                "test",
+                "--workspace",
+                "--no-run",
+                "--message-format=json",
+            ],
         }
     }
 }

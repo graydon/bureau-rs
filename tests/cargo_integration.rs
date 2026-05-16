@@ -381,3 +381,45 @@ async fn parallel_tasks_land_without_merge_conflicts() {
         std::fs::read_to_string(workdir.join("spec/p/beta/public.md")).unwrap();
     assert!(beta_md.contains("Second."));
 }
+
+/// Regression: the iface-stage gate is `cargo check` on the worktree.
+/// Without `--workspace` cargo only compiles the root package, so a
+/// member crate (under `crates/<name>/`) can have unresolved imports
+/// and the gate still reports `passed = true`. The framework would
+/// mark the stage Done and ff-merge broken code onto main.
+#[tokio::test]
+async fn cargo_check_gate_catches_broken_member_crate() {
+    use bureau_rs::gate::{GateKind, run_gate};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workdir = tmp.path().to_path_buf();
+    // Workspace with one member crate `child`.
+    let mut g = NodeGraph::new();
+    let mut root = Node::new("root", "");
+    root.crate_boundary = true;
+    let root_id = g.insert_root(root).unwrap();
+    let mut child = Node::new("child", "");
+    child.crate_boundary = true;
+    // Make the child's private.rs reference a crate (`nonexistent_crate_xyz`)
+    // that's not in any Cargo.toml — this is exactly the failure mode
+    // the user hit when the model wrote `use hmac::Hmac;` without
+    // declaring hmac as an external dep.
+    child.private_rs =
+        Some("use nonexistent_crate_xyz::Whatever;\npub fn x() -> Whatever { todo!() }\n".into());
+    let _child_id = g.add_child(root_id, child).unwrap();
+    render_graph(&workdir, &g, Layout::Workspace).unwrap();
+    // The root crate compiles fine in isolation. The bug was that the
+    // gate also reported passed for the workspace because it didn't
+    // pass `--workspace`. With the fix, it should fail.
+    let outcome = run_gate(&workdir, GateKind::Check).await.unwrap();
+    assert!(
+        !outcome.passed,
+        "cargo check gate must catch broken member crate; outcome:\n{:#?}",
+        outcome.errors
+    );
+    assert!(
+        !outcome.errors.is_empty(),
+        "expected at least one cargo error; got passed={}",
+        outcome.passed
+    );
+}

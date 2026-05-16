@@ -55,6 +55,13 @@ pub struct Engine {
     pub cargo_lock: Arc<tokio::sync::Mutex<()>>,
     pub workspace: Arc<crate::worktree::Workspace>,
     pub worktrees: Arc<crate::worktree::WorktreePool>,
+    /// If `Some(t)`, every in-flight LLM call sleeps until `t` before
+    /// retrying. Set when ANY driver call surfaces a rate-limit error
+    /// (HTTP 429, "insufficient credits", quota messages); cleared
+    /// when a call succeeds after the deadline elapses. The scheduler
+    /// state is flipped to `Paused` for the duration so the UI banner
+    /// shows what's happening.
+    pub rate_limit_until: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
 }
 
 impl Engine {
@@ -81,6 +88,7 @@ impl Engine {
             cargo_lock: Arc::new(tokio::sync::Mutex::new(())),
             workspace,
             worktrees,
+            rate_limit_until: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -100,20 +108,38 @@ impl Engine {
         let mut total_tasks = 0usize;
         let mut first_error: Option<anyhow::Error> = None;
 
+        // Tracks WHY we broke out of the loop, so the final return can
+        // distinguish "all stages done" (Ok) from "halted on budget"
+        // (Err with a descriptive message). Without this the budget
+        // halt path silently returned Ok and main logged "pipeline
+        // complete" — operators thought work was done when it wasn't.
+        let mut halt_reason: Option<String> = None;
         loop {
             self.sync_graph_to_state();
             if let Some(cap) = self.config.toml.limits.cost_cap_usd {
                 let est = self.state.read(|s| s.estimated_cost_usd);
                 if est >= cap {
-                    self.note(format!("halting: cost cap ${cap:.2} reached at ${est:.4}"));
+                    let msg = format!("halting: cost cap ${cap:.2} reached at ${est:.4}");
+                    self.note(msg.clone());
+                    halt_reason = Some(msg);
+                    self.state.write(|s| s.scheduler = SchedulerState::Stopped);
+                    self.state.emit(UiEvent::SchedulerStateChanged {
+                        state: SchedulerState::Stopped,
+                    });
                     break;
                 }
             }
             if total_tasks >= self.config.toml.limits.max_tasks_total {
-                self.note(format!(
+                let msg = format!(
                     "halting: max_tasks_total ({}) reached",
                     self.config.toml.limits.max_tasks_total
-                ));
+                );
+                self.note(msg.clone());
+                halt_reason = Some(msg);
+                self.state.write(|s| s.scheduler = SchedulerState::Stopped);
+                self.state.emit(UiEvent::SchedulerStateChanged {
+                    state: SchedulerState::Stopped,
+                });
                 break;
             }
 
@@ -141,10 +167,13 @@ impl Engine {
                     });
                     break;
                 }
-                self.note("no ready stages and not done; halting (likely a stuck dep)");
+                let blockers = self.diagnose_stuck();
+                self.note(format!(
+                    "no ready stages and not done; halting. Blockers:\n{blockers}"
+                ));
                 self.state.write(|s| s.scheduler = SchedulerState::Stopped);
                 return Err(first_error.unwrap_or_else(|| {
-                    anyhow!("scheduler stuck — no ready stages remain")
+                    anyhow!("scheduler stuck — no ready stages remain. Blockers:\n{blockers}")
                 }));
             }
 
@@ -173,9 +202,10 @@ impl Engine {
             }
         }
 
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+        match (first_error, halt_reason) {
+            (Some(e), _) => Err(e),
+            (None, Some(reason)) => Err(anyhow!("{reason}")),
+            (None, None) => Ok(()),
         }
     }
 
@@ -232,14 +262,84 @@ impl Engine {
     ) -> Result<()> {
         let _guard = self.worktrees.main_lock().lock().await;
         let mut g = graph::load(&self.workdir)?;
+        let node_name = g.get(node_id).map(|n| n.name.clone()).unwrap_or_default();
         if let Some(n) = g.get_mut(node_id) {
             n.stages.set(stage, state);
         }
         graph::save(&self.workdir, &g)?;
+        let verb = match state {
+            StageState::NotStarted => "reset",
+            StageState::InProgress => "start",
+            StageState::Done => "done",
+            StageState::Failed => "fail",
+            StageState::Skipped => "skip",
+        };
         let _ = self
             .workspace
-            .commit_main(&format!("stage: {stage} = {state:?}"));
+            .commit_main(&format!("{node_name}/{stage}: {verb}"));
         Ok(())
+    }
+
+    /// Describe what's preventing the scheduler from picking a stage.
+    /// Called from the halt path so the operator can see WHICH nodes
+    /// are blocked and on WHAT. Otherwise the "scheduler stuck" message
+    /// gives no useful information.
+    fn diagnose_stuck(&self) -> String {
+        let g = match graph::load(&self.workdir) {
+            Ok(g) => g,
+            Err(e) => return format!("  (could not load graph: {e:#})"),
+        };
+        let mut out = String::new();
+        for n in g.iter() {
+            for stage in [
+                Stage::Architect,
+                Stage::Spec,
+                Stage::Iface,
+                Stage::Tests,
+                Stage::Impl,
+                Stage::Debug,
+                Stage::Opt,
+            ] {
+                let st = n.stages.get(stage);
+                if st == StageState::Done || st == StageState::Skipped {
+                    continue;
+                }
+                if stage_is_ready(&g, n.id, stage) {
+                    continue;
+                }
+                // Stage isn't done and isn't ready — say why.
+                let reason = match st {
+                    StageState::Failed => format!("{stage} is Failed (terminal)"),
+                    StageState::InProgress => format!("{stage} is in flight (task didn't release?)"),
+                    _ => {
+                        // NotStarted but not ready — find the blocker.
+                        let mut blockers: Vec<String> = Vec::new();
+                        for dep in &n.deps {
+                            if let Some(d) = g.get(*dep) {
+                                let dep_stage_done = match stage {
+                                    Stage::Impl | Stage::Debug => d.stages.impl_.is_done(),
+                                    _ => d.stages.iface.is_done(),
+                                };
+                                if !dep_stage_done {
+                                    blockers.push(format!("dep `{}`", d.name));
+                                }
+                            }
+                        }
+                        if blockers.is_empty() {
+                            format!("{stage} waiting on parent/own earlier stages")
+                        } else {
+                            format!("{stage} waiting on {}", blockers.join(", "))
+                        }
+                    }
+                };
+                out.push_str(&format!("  - node `{}`: {reason}\n", n.name));
+            }
+        }
+        if out.is_empty() {
+            "  (no obvious blockers; this might be an empty pipeline)".into()
+        } else {
+            out
+        }
     }
 
     fn pick_next_ready(&self) -> Option<(NodeId, Stage)> {
@@ -657,12 +757,62 @@ impl Engine {
         ctx: Arc<TaskCtx>,
     ) -> Result<DriveResponse> {
         const MAX_TRANSIENT_RETRIES: u32 = 3;
+        const RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         let mut attempt = 0u32;
+        let mut was_paused = false;
         loop {
+            // Honor any in-flight rate-limit pause. Multiple tasks waiting
+            // here all serve as periodic "probes": when one wakes up and
+            // succeeds, the pause clears and the others naturally resume.
+            // Snapshot the deadline out from under the lock before
+            // awaiting (parking_lot MutexGuard isn't Send).
+            let snapshot: Option<std::time::Instant> = *self.rate_limit_until.lock();
+            if let Some(t) = snapshot {
+                let now = std::time::Instant::now();
+                if now < t {
+                    let wait = (t - now).min(std::time::Duration::from_secs(10));
+                    tokio::time::sleep(wait).await;
+                    was_paused = true;
+                    continue;
+                }
+                // Deadline elapsed — clear and probe.
+                *self.rate_limit_until.lock() = None;
+            }
             match self.driver.drive(params.clone(), ctx.clone()).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    if was_paused {
+                        self.note("rate-limit pause cleared — pipeline resuming");
+                        self.state.write(|s| s.scheduler = SchedulerState::Running);
+                        self.state.emit(UiEvent::SchedulerStateChanged {
+                            state: SchedulerState::Running,
+                        });
+                    }
+                    return Ok(resp);
+                }
                 Err(e) => {
                     let msg = format!("{:#}", e);
+                    if is_rate_limited(&msg) {
+                        // Set/extend the global pause, flip the scheduler
+                        // to Paused so the UI shows what's happening.
+                        let until = std::time::Instant::now() + RATE_LIMIT_BACKOFF;
+                        {
+                            let mut l = self.rate_limit_until.lock();
+                            if l.map_or(true, |stored| stored < until) {
+                                *l = Some(until);
+                            }
+                        }
+                        self.state.write(|s| s.scheduler = SchedulerState::Paused);
+                        self.state.emit(UiEvent::SchedulerStateChanged {
+                            state: SchedulerState::Paused,
+                        });
+                        self.note(format!(
+                            "rate-limited ({}): pausing all calls for {}s",
+                            params.model,
+                            RATE_LIMIT_BACKOFF.as_secs()
+                        ));
+                        was_paused = true;
+                        continue;
+                    }
                     if attempt < MAX_TRANSIENT_RETRIES && is_transient(&msg) {
                         attempt += 1;
                         let backoff = 400u64 * (1 << (attempt - 1).min(3));
@@ -1056,7 +1206,29 @@ fn collect_failed_tool_calls(entries: &[TranscriptEntry]) -> Vec<(String, String
     failures.into_iter().map(|(_, t, a, e)| (t, a, e)).collect()
 }
 
+/// HTTP 429 / quota / daily-limit errors. These should NOT count
+/// against per-call retry budgets; the engine pauses all tasks until
+/// the rate-limit window passes, then resumes.
+fn is_rate_limited(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("429")
+        || m.contains("rate limit")
+        || m.contains("rate-limit")
+        || m.contains("rate_limit")
+        || m.contains("too many requests")
+        || m.contains("quota")
+        || m.contains("insufficient credits")
+        || m.contains("daily limit")
+        || m.contains("usage limit")
+        || m.contains("you exceeded your current quota")
+}
+
 fn is_transient(msg: &str) -> bool {
+    // 429 is intentionally NOT here — it belongs to `is_rate_limited`,
+    // which the caller checks first. Rate-limits get a long, shared
+    // pause across the whole engine; mixing 429 into the short
+    // exponential-backoff transient retry would burn the budget
+    // pointlessly.
     msg.contains("no message or tool call")
         || msg.contains("ResponseError")
         || msg.contains("connection reset")
@@ -1067,7 +1239,6 @@ fn is_transient(msg: &str) -> bool {
         || msg.contains("502")
         || msg.contains("503")
         || msg.contains("504")
-        || msg.contains("429")
         || msg.contains("ECONNRESET")
 }
 
@@ -1350,6 +1521,28 @@ mod tests {
         assert!(is_transient("HTTP 502 Bad Gateway"));
         assert!(is_transient("connection reset"));
         assert!(!is_transient("invalid api key"));
+    }
+
+    #[test]
+    fn rate_limit_classifier_catches_common_phrasings() {
+        // OpenRouter and provider variants that should pause the engine.
+        assert!(is_rate_limited(
+            "HTTP 429 Too Many Requests: rate limit exceeded"
+        ));
+        assert!(is_rate_limited("Quota exceeded for this model"));
+        assert!(is_rate_limited("Insufficient credits"));
+        assert!(is_rate_limited("daily limit reached"));
+        assert!(is_rate_limited("rate-limit hit, retry later"));
+        assert!(is_rate_limited(
+            "You exceeded your current quota, please check your plan"
+        ));
+        // Genuine errors that should NOT pause the engine.
+        assert!(!is_rate_limited("HTTP 500 internal server error"));
+        assert!(!is_rate_limited("compile error: type mismatch"));
+        assert!(!is_rate_limited("invalid api key"));
+        // Rate-limit and transient sets are independent — 429 shouldn't
+        // be classified as merely transient.
+        assert!(!is_transient("HTTP 429 Too Many Requests"));
     }
 
     #[test]

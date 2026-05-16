@@ -150,19 +150,38 @@ pub(crate) fn judge_block(stage: Stage) -> String {
         Stage::Debug => "DEBUG",
         Stage::Opt => "OPT",
     };
+    let cargo_tool = match stage {
+        Stage::Iface => "`cargo_check`",
+        Stage::Tests => "`cargo_test_no_run`",
+        Stage::Impl | Stage::Debug | Stage::Opt => "`cargo_test`",
+        Stage::Architect | Stage::Spec => "(no cargo gate)",
+    };
     format!(
         "# {upper} · JUDGE\n\
         \n\
         Coherence check at the end of the writer → critic → reviser \
-        cycle. Confirm the reviser addressed each critic point. You are \
-        NOT a fresh reviewer and you are NOT the cargo gate (it runs \
-        separately).\n\
+        cycle. Two responsibilities, in order:\n\
         \n\
-        For each critic bullet, decide: addressed / deferred-with-good- \
-        reason / ignored. Call `submit_verdict` exactly once: \
-        `satisfactory: true` if all points are addressed (or there were \
-        no points); `satisfactory: false` with a concrete reason quoting \
-        the unaddressed point(s). When in doubt: `satisfactory: true`."
+        1. **Cargo must be green at this stage's gate level.** Run \
+           {cargo_tool} yourself (with `--workspace` semantics — the \
+           tool already passes that flag). If it reports ANY error — \
+           including errors that appear to be \"in another node\", \
+           \"in a dep crate\", \"not my code\" — call \
+           `submit_verdict {{ satisfactory: false }}` with the first \
+           error message as the reason. The cargo failure is the \
+           project's problem, even if it points at code outside the \
+           current node's slots. The framework's gate will reject \
+           non-compiling state regardless, so signing off with \
+           `satisfactory: true` while cargo is red just wastes a \
+           cycle — be honest.\n\
+        2. **Coherence of the critique cycle.** For each critic \
+           bullet, decide: addressed / deferred-with-good-reason / \
+           ignored. Refuse if a non-trivial bullet was ignored.\n\
+        \n\
+        Call `submit_verdict` exactly once. `satisfactory: true` only \
+        when BOTH (1) cargo is clean AND (2) the critic's points are \
+        addressed (or there were no points). When the cargo gate is \
+        red, `satisfactory: false` is the right answer."
     )
 }
 pub(crate) fn quickfix_preamble(stage: Stage) -> String {
@@ -577,6 +596,18 @@ current node's already-authored slots.\n\n\
             Test the FUNCTIONAL CONTRACT this node's spec promises. \
             Tests should fail if the implementation violates an \
             invariant, edge case, or behaviour described in the spec.\n\
+            \n\
+            ## Coverage heuristic\n\
+            \n\
+            You're writing tests BEFORE the implementation exists, so \
+            you can't measure coverage directly. Instead, imagine the \
+            range of plausible implementations that satisfy the spec, \
+            and ask: \"would my test set distinguish a correct impl \
+            from one that gets a key invariant wrong?\". Aim for the \
+            test that covers the LARGEST share of code paths in any \
+            reasonable impl — a single rich test exercising a real \
+            workflow beats a handful of one-line getter/setter tests. \
+            Tests are tokens; spend them where they catch real bugs.\n\
             \n\
             ## What NOT to test (these are wasted tokens AND the framework will REJECT trivial tests)\n\
             \n\

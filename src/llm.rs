@@ -117,12 +117,20 @@ pub(crate) async fn run_rig_agent(
     temperature: f64,
     max_turns: usize,
 ) -> Result<rig::agent::PromptResponse> {
+    // ReadFile is read-only and useful everywhere — register it on the
+    // base. Without this, models in writer/critic/reviser/judge roles
+    // occasionally hallucinate `read_file` (rig training data?) and
+    // rig responds with `ToolNotFoundError: read_file`. Adding it
+    // unconditionally removes the warning storm and gives roles the
+    // option to inspect on-disk source files if their context-bundled
+    // material isn't enough.
     let base = client
         .agent(model)
         .preamble(preamble)
         .max_tokens(max_tokens)
         .temperature(temperature)
-        .default_max_turns(max_turns.max(2));
+        .default_max_turns(max_turns.max(2))
+        .tool(ReadFileTool { ctx: ctx.clone() });
 
     // Branch on (stage, role) to register the right tool set. The catalog
     // in `tools::tool_names_for` is the source of truth for "which tools";

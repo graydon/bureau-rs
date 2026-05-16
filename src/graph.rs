@@ -203,8 +203,33 @@ pub struct Node {
 
     pub stages: NodeStages,
 
+    /// External crates.io deps declared at architect time. Only meaningful
+    /// on the ROOT node. Renderer writes them into the workspace's
+    /// `[workspace.dependencies]` so any member crate can pull them in
+    /// via `name.workspace = true`. Empty on non-root nodes.
+    #[serde(default)]
+    pub external_crate_deps: Vec<ExternalCrateDep>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// crates.io dependency, declared by the architect, rendered into
+/// Cargo.toml at the workspace root. Member crates inherit via
+/// `name.workspace = true`. Mirrors the architect's submission shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalCrateDep {
+    pub name: String,
+    /// Version requirement. If `None`, `"*"` is used at render time —
+    /// good enough for cargo to resolve a recent crates.io release.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Features to enable. Empty means default-only.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Operator note about why this dep was added.
+    #[serde(default)]
+    pub reason: String,
 }
 
 impl Node {
@@ -223,6 +248,7 @@ impl Node {
             private_rs: None,
             tests_rs: None,
             stages: NodeStages::default(),
+            external_crate_deps: Vec::new(),
             created_at: now,
             updated_at: now,
         }

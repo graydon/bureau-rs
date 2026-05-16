@@ -450,7 +450,15 @@ fn render_mod_rs(graph: &NodeGraph, node: &Node, layout: Layout) -> String {
 
 fn render_cross_crate_deps(graph: &NodeGraph, crate_id: NodeId) -> String {
     let targets = cross_crate_dep_targets(graph, crate_id);
-    if targets.is_empty() {
+    // Member crates also inherit all workspace-level external crates so
+    // any node in the member can `use foo::...` without having to know
+    // which Cargo.toml holds the dep.
+    let external = graph
+        .root
+        .and_then(|rid| graph.get(rid))
+        .map(|r| r.external_crate_deps.as_slice())
+        .unwrap_or(&[]);
+    if targets.is_empty() && external.is_empty() {
         return String::new();
     }
     let mut out = String::from("\n[dependencies]\n");
@@ -460,15 +468,40 @@ fn render_cross_crate_deps(graph: &NodeGraph, crate_id: NodeId) -> String {
         // crate lives at the workspace root. Path-deps are relative to the
         // dependent's own Cargo.toml.
         let path_str = if t.parent.is_none() {
-            // Depending on the workspace root crate from a member crate at
-            // `crates/<name>`: relative path is `../..`.
             "../..".to_string()
         } else {
-            // Depending on another member crate `crates/<other>`: relative
-            // path from `crates/<this>` is `../<other>`.
             format!("../{}", t.name)
         };
         out.push_str(&format!("{} = {{ path = \"{}\" }}\n", t.name, path_str));
+    }
+    for d in external {
+        out.push_str(&format!("{} = {{ workspace = true }}\n", d.name));
+    }
+    out
+}
+
+/// Render external crates.io deps as `name = "version"` or the
+/// expanded table form when features are set. Used both in the
+/// workspace root's `[workspace.dependencies]` (workspace layout) and
+/// the single crate's `[dependencies]` (single-crate layout).
+fn render_external_dep_lines(deps: &[crate::graph::ExternalCrateDep]) -> String {
+    let mut out = String::new();
+    for d in deps {
+        let version = d.version.as_deref().unwrap_or("*");
+        if d.features.is_empty() {
+            out.push_str(&format!("{} = \"{}\"\n", d.name, version));
+        } else {
+            let feats = d
+                .features
+                .iter()
+                .map(|f| format!("\"{}\"", f))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{} = {{ version = \"{}\", features = [{}] }}\n",
+                d.name, version, feats
+            ));
+        }
     }
     out
 }
@@ -482,11 +515,19 @@ fn write_root_manifest(
 ) -> Result<()> {
     let root = graph.get(root_id).expect("root in graph");
     let manifest = workdir.join("Cargo.toml");
+    let ext_deps = render_external_dep_lines(&root.external_crate_deps);
     let content = match layout {
-        Layout::SingleCrate => format!(
-            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/mod.rs\"\n",
-            root.name
-        ),
+        Layout::SingleCrate => {
+            let mut s = format!(
+                "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/mod.rs\"\n",
+                root.name
+            );
+            if !ext_deps.is_empty() {
+                s.push_str("\n[dependencies]\n");
+                s.push_str(&ext_deps);
+            }
+            s
+        }
         Layout::Workspace => {
             let mut members: Vec<String> = vec![".".to_string()];
             for n in graph.iter() {
@@ -500,18 +541,30 @@ fn write_root_manifest(
                 .map(|m| format!("    \"{}\"", m))
                 .collect::<Vec<_>>()
                 .join(",\n");
+            // [workspace.dependencies] holds external crates.io deps
+            // declared by the architect. Member crates pull each in via
+            // `name.workspace = true` (see `render_cross_crate_deps`).
+            let workspace_deps_section = if ext_deps.is_empty() {
+                String::new()
+            } else {
+                format!("\n[workspace.dependencies]\n{}", ext_deps)
+            };
             // Root crate may need to depend on member crates if its
-            // descendants declare deps that cross into them. Render those
-            // here as path = "crates/<name>".
+            // descendants declare deps that cross into them. Plus
+            // workspace-inherited external deps for the root's own use.
             let root_deps_section = {
                 let targets = cross_crate_dep_targets(graph, root_id);
-                if targets.is_empty() {
+                let inherited = root
+                    .external_crate_deps
+                    .iter()
+                    .map(|d| format!("{} = {{ workspace = true }}\n", d.name))
+                    .collect::<String>();
+                if targets.is_empty() && inherited.is_empty() {
                     String::new()
                 } else {
                     let mut s = String::from("\n[dependencies]\n");
                     for tid in targets {
                         if let Some(t) = graph.get(tid) {
-                            // Member crates live at crates/<name>.
                             let path = if t.parent.is_none() {
                                 ".".to_string()
                             } else {
@@ -523,11 +576,12 @@ fn write_root_manifest(
                             ));
                         }
                     }
+                    s.push_str(&inherited);
                     s
                 }
             };
             format!(
-                "[workspace]\nresolver = \"2\"\nmembers = [\n{}\n]\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/mod.rs\"\n{root_deps_section}",
+                "[workspace]\nresolver = \"2\"\nmembers = [\n{}\n]\n{workspace_deps_section}\n\n[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/mod.rs\"\n{root_deps_section}",
                 members_list, root.name
             )
         }
@@ -796,11 +850,86 @@ mod tests {
         let _aa = g.add_child(a, Node::new("aa", "")).unwrap();
         render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
         let root_mod = std::fs::read_to_string(tmp.path().join("src/mod.rs")).unwrap();
-        // Root mod should declare `pub mod a;` but NOT `pub mod aa;` (that
-        // belongs in `src/a/mod.rs`).
         assert!(root_mod.contains("pub mod a;"));
         assert!(!root_mod.contains("pub mod aa;"));
         let a_mod = std::fs::read_to_string(tmp.path().join("src/a/mod.rs")).unwrap();
         assert!(a_mod.contains("pub mod aa;"));
+    }
+
+    #[test]
+    fn external_crate_deps_render_into_workspace_cargo_toml() {
+        // The architect declares `hmac` and `digest` as crates.io
+        // deps. They must end up in `[workspace.dependencies]` at the
+        // workspace root AND every member crate's Cargo.toml must
+        // inherit them via `name.workspace = true`. Before the fix
+        // these deps were stored as a markdown note in
+        // `spec_private_md` and never rendered into any Cargo.toml —
+        // models referencing the crates produced unbuildable code.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut g = NodeGraph::new();
+        let mut root = Node::new("app", "");
+        root.crate_boundary = true;
+        root.external_crate_deps = vec![
+            crate::graph::ExternalCrateDep {
+                name: "hmac".into(),
+                version: Some("0.12".into()),
+                features: vec![],
+                reason: "shared HMAC".into(),
+            },
+            crate::graph::ExternalCrateDep {
+                name: "digest".into(),
+                version: None, // → "*"
+                features: vec!["alloc".into()],
+                reason: "trait abstraction".into(),
+            },
+        ];
+        let root_id = g.insert_root(root).unwrap();
+        let mut member = Node::new("crypto", "");
+        member.crate_boundary = true;
+        let _crypto_id = g.add_child(root_id, member).unwrap();
+        render_graph(tmp.path(), &g, Layout::Workspace).unwrap();
+        let root_cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            root_cargo.contains("[workspace.dependencies]"),
+            "missing section:\n{root_cargo}"
+        );
+        assert!(root_cargo.contains("hmac = \"0.12\""));
+        assert!(
+            root_cargo.contains("digest = { version = \"*\", features = [\"alloc\"] }"),
+            "digest with features missing:\n{root_cargo}"
+        );
+        // Member crate inherits both via workspace = true.
+        let member_cargo =
+            std::fs::read_to_string(tmp.path().join("crates/crypto/Cargo.toml")).unwrap();
+        assert!(
+            member_cargo.contains("hmac = { workspace = true }"),
+            "member missing hmac.workspace = true:\n{member_cargo}"
+        );
+        assert!(
+            member_cargo.contains("digest = { workspace = true }"),
+            "member missing digest.workspace = true:\n{member_cargo}"
+        );
+    }
+
+    #[test]
+    fn external_crate_deps_render_into_single_crate_cargo_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut g = NodeGraph::new();
+        let mut root = Node::new("app", "");
+        root.crate_boundary = true;
+        root.external_crate_deps = vec![crate::graph::ExternalCrateDep {
+            name: "serde".into(),
+            version: Some("1".into()),
+            features: vec!["derive".into()],
+            reason: "model serialization".into(),
+        }];
+        let _root_id = g.insert_root(root).unwrap();
+        render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+        let cargo = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("[dependencies]"), "missing section:\n{cargo}");
+        assert!(
+            cargo.contains("serde = { version = \"1\", features = [\"derive\"] }"),
+            "serde line missing:\n{cargo}"
+        );
     }
 }
