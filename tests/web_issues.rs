@@ -3,7 +3,7 @@
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use bureau_rs::graph::{Node, NodeGraph, Stage};
+use bureau_rs::graph::Stage;
 use bureau_rs::state::{EngineState, EngineTask, StateHandle, TaskStatus, TokenUsage};
 use bureau_rs::tools::{TranscriptEntry, TranscriptKind};
 use bureau_rs::web::{router, AppState};
@@ -21,21 +21,16 @@ fn entry(kind: TranscriptKind, content: &str) -> TranscriptEntry {
 }
 
 async fn fetch_issues(workdir: std::path::PathBuf, tasks: Vec<EngineTask>) -> serde_json::Value {
-    let mut graph = NodeGraph::new();
-    let root_id = graph.insert_root(Node::new("p", "umbrella")).unwrap();
-    let _ = root_id;
     let state = StateHandle::new(EngineState::new(
         workdir.clone(),
         workdir.clone(),
         "p".into(),
     ));
     state.write(|st| {
-        st.graph = graph.clone();
         for t in &tasks {
             st.tasks.insert(t.id, t.clone());
         }
     });
-    let _ = graph;
     let r = router(AppState {
         state,
         workdir,

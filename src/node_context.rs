@@ -329,7 +329,6 @@ pub fn build_for_stage(
         Stage::Tests => build_for_tests(graph, node_id),
         Stage::Impl => build_for_impl(graph, node_id),
         Stage::Debug => build_for_debug(graph, node_id),
-        Stage::Opt => build_for_impl(graph, node_id), // same surface as impl
     }
 }
 

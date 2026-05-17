@@ -66,15 +66,27 @@ async fn ui_index() -> impl IntoResponse {
     )
 }
 
-async fn api_state(State(s): State<AppState>) -> Json<crate::state::EngineState> {
+async fn api_state(State(s): State<AppState>) -> Json<serde_json::Value> {
     // Slim snapshot: same shape as the full state but with each task's
-    // transcript omitted. The transcript is the bulk of state memory,
-    // and shipping it on every poll (every 8s by default) dominates
-    // both the time spent holding the inner mutex (which blocks engine
-    // writes — that's the UI-lockup symptom) and the JSON payload
-    // size. Clients fetch individual task transcripts on demand via
+    // transcript omitted. Transcripts dominate state memory; shipping
+    // them every poll (every 8s by default) blocks engine writes on
+    // the inner mutex (UI-lockup symptom) and bloats the payload.
+    // Clients fetch individual task transcripts on demand via
     // `/api/task_transcript`.
-    Json(s.state.snapshot_slim())
+    //
+    // The graph is loaded fresh from `.bureau/` on disk and inlined as
+    // a `graph` field for backwards compatibility with the JS client.
+    // There is no in-memory graph projection to drift.
+    let slim = s.state.snapshot_slim();
+    let mut v = serde_json::to_value(&slim).unwrap_or(serde_json::Value::Null);
+    let g = crate::graph::load(&s.workdir).unwrap_or_default();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "graph".to_string(),
+            serde_json::to_value(&g).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Json(v)
 }
 
 async fn api_events(
@@ -441,10 +453,9 @@ async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBod
     if let Err(e) = pool.workspace.commit_main(&msg) {
         tracing::warn!("commit_main after reset: {e:#}");
     }
-    s.state.write(|st| {
-        st.graph = g.clone();
-        st.note(msg);
-    });
+    s.state.write(|st| st.note(msg));
+    // `g` was committed to disk + main; the next /api/state poll picks
+    // it up via `graph::load`. No in-memory state copy to update.
     Json(ResetNodeOk { reset: reset_names }).into_response()
 }
 

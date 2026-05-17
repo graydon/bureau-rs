@@ -1,6 +1,6 @@
 //! Runtime state shared between engine and web UI.
 
-use crate::graph::{NodeGraph, NodeId, Stage};
+use crate::graph::{NodeId, Stage};
 use crate::tools::{JudgeVerdict, TranscriptEntry};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -45,7 +45,6 @@ pub enum TaskStatus {
     Running,
     Done,
     Failed,
-    Skipped,
 }
 
 /// One unit of orchestrator work — a (node, stage) advancement that runs
@@ -74,6 +73,30 @@ pub struct EngineTask {
     pub retries: u32,
 }
 
+impl EngineTask {
+    /// Clone the task but leave `transcript` empty. Used by the slim
+    /// snapshot path so we never duplicate (often multi-MB) transcripts
+    /// under the state lock — the slim snapshot is the basis for
+    /// /api/state, which polls every few seconds.
+    fn clone_without_transcript(&self) -> Self {
+        Self {
+            id: self.id,
+            node_id: self.node_id,
+            node_name: self.node_name.clone(),
+            stage: self.stage,
+            status: self.status,
+            model: self.model.clone(),
+            transcript: Vec::new(),
+            cost: self.cost.clone(),
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            error: self.error.clone(),
+            final_verdict: self.final_verdict.clone(),
+            retries: self.retries,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub at: DateTime<Utc>,
@@ -85,7 +108,6 @@ pub struct EngineState {
     pub workdir: PathBuf,
     pub config_dir: PathBuf,
     pub project_name: String,
-    pub graph: NodeGraph,
     pub tasks: IndexMap<Uuid, EngineTask>,
     pub scheduler: SchedulerState,
     pub total_cost: TokenUsage,
@@ -102,7 +124,6 @@ impl EngineState {
             workdir,
             config_dir,
             project_name,
-            graph: NodeGraph::new(),
             tasks: IndexMap::new(),
             scheduler: SchedulerState::Idle,
             total_cost: TokenUsage::default(),
@@ -236,45 +257,23 @@ impl StateHandle {
         self.inner.lock().clone()
     }
 
-    /// Like `snapshot` but produces an `EngineState` with each task's
-    /// transcript *omitted* (empty `Vec`). Used by the web layer's
-    /// polled `/api/state` route — transcripts are the bulk of state
-    /// memory and shipping them on every poll dominates both the time
-    /// spent holding the inner lock (which blocks engine writes) and
-    /// the JSON payload size. Clients that need a specific task's
-    /// transcript fetch it on demand via `/api/task_transcript`.
+    /// Like `snapshot` but with each task's transcript replaced by an
+    /// empty `Vec` (never cloned). Used by `/api/state` — transcripts
+    /// are the bulk of state memory; shipping them every poll would
+    /// dominate both the inner-lock hold time (blocking engine writes)
+    /// and the JSON payload size. Clients fetch individual transcripts
+    /// on demand via `/api/task_transcript`.
     pub fn snapshot_slim(&self) -> EngineState {
         let s = self.inner.lock();
-        // Build a fresh EngineState that copies every field EXCEPT the
-        // per-task transcripts — those are replaced with empty Vecs
-        // without ever cloning the originals.
-        let mut tasks = IndexMap::with_capacity(s.tasks.len());
-        for (id, t) in s.tasks.iter() {
-            tasks.insert(
-                *id,
-                EngineTask {
-                    id: t.id,
-                    node_id: t.node_id,
-                    node_name: t.node_name.clone(),
-                    stage: t.stage,
-                    status: t.status,
-                    model: t.model.clone(),
-                    transcript: Vec::new(),
-                    cost: t.cost.clone(),
-                    started_at: t.started_at,
-                    finished_at: t.finished_at,
-                    error: t.error.clone(),
-                    final_verdict: t.final_verdict.clone(),
-                    retries: t.retries,
-                },
-            );
-        }
         EngineState {
             workdir: s.workdir.clone(),
             config_dir: s.config_dir.clone(),
             project_name: s.project_name.clone(),
-            graph: s.graph.clone(),
-            tasks,
+            tasks: s
+                .tasks
+                .iter()
+                .map(|(id, t)| (*id, t.clone_without_transcript()))
+                .collect(),
             scheduler: s.scheduler,
             total_cost: s.total_cost.clone(),
             estimated_cost_usd: s.estimated_cost_usd,

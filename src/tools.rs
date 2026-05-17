@@ -104,20 +104,33 @@ pub struct TaskCtx {
     pub max_nodes: usize,
     /// Hard cap on the depth of the node tree (root is depth 0).
     pub max_node_depth: usize,
-    /// Loop detection — same args three times in a row triggers an error.
-    pub recent_calls: Mutex<VecDeque<(String, u64)>>,
-    /// Filled by `submit_verdict` (judge stage only).
-    pub verdict: Mutex<Option<JudgeVerdict>>,
-    /// Filled by `submit_critique` (critic stage only). The reviser and
-    /// fast-path detection both read this instead of fuzzy-parsing prose.
-    pub critique: Mutex<Option<Critique>>,
-    /// Transcript callback for recording tool calls / results.
-    pub transcript: Mutex<Vec<TranscriptEntry>>,
-    /// File changes queued for the orchestrator to broadcast over SSE.
-    pub fs_events: Mutex<Vec<PathBuf>>,
+    /// All mutable per-task state, behind one mutex. Rig serializes tool
+    /// calls within a task (concurrency=1), so the lock is uncontended —
+    /// it exists only to give `&mut` semantics through a `&self` rig
+    /// `Tool::call`. Access via the `with_state` / `take_*` / `drain_*`
+    /// methods; do not lock directly from outside.
+    state: Mutex<TaskCtxState>,
     /// Held for the duration of any cargo invocation so parallel tasks
     /// don't trample each other's `target/` dir / lock files.
     pub cargo_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// All mutable accumulator state for a `TaskCtx`. Lives behind a single
+/// `Mutex` on the ctx — collapses what used to be five separate per-field
+/// `Mutex`es into one cohesive value.
+#[derive(Default)]
+struct TaskCtxState {
+    /// Loop detection — same args three times in a row triggers an error.
+    recent_calls: VecDeque<(String, u64)>,
+    /// Filled by `submit_verdict` (judge stage only).
+    verdict: Option<JudgeVerdict>,
+    /// Filled by `submit_critique` (critic stage only). The reviser and
+    /// fast-path detection both read this instead of fuzzy-parsing prose.
+    critique: Option<Critique>,
+    /// Transcript callback for recording tool calls / results.
+    transcript: Vec<TranscriptEntry>,
+    /// File changes queued for the orchestrator to broadcast over SSE.
+    fs_events: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,25 +147,16 @@ pub struct TranscriptEntry {
 }
 
 impl TranscriptEntry {
-    /// Who is "speaking" in this entry — the bureau (engine, framework,
-    /// tool result) or the model. Useful for transcript UI.
-    pub fn speaker(&self) -> Speaker {
-        match &self.kind {
-            TranscriptKind::AssistantText | TranscriptKind::ToolCall { .. } => Speaker::Model,
-            _ => Speaker::Bureau,
-        }
+    /// True if this entry was produced by the LLM (assistant text or
+    /// tool call); false for framework-produced entries (system/user
+    /// prompts, tool results, notes, errors). Used by the UI to pick
+    /// the entry's CSS class.
+    pub fn is_model(&self) -> bool {
+        matches!(
+            self.kind,
+            TranscriptKind::AssistantText | TranscriptKind::ToolCall { .. }
+        )
     }
-}
-
-/// Which side of the actor/framework boundary an entry came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Speaker {
-    /// The framework — system prompt, user prompt, tool definitions, tool
-    /// results, notes, errors.
-    Bureau,
-    /// The LLM — its assistant text and its tool calls.
-    Model,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,13 +227,54 @@ impl TaskCtx {
             max_spec_section_lines,
             max_nodes,
             max_node_depth,
-            recent_calls: Mutex::new(VecDeque::new()),
-            verdict: Mutex::new(None),
-            critique: Mutex::new(None),
-            transcript: Mutex::new(Vec::new()),
-            fs_events: Mutex::new(Vec::new()),
+            state: Mutex::new(TaskCtxState::default()),
             cargo_lock,
         }
+    }
+
+    /// Inspectors for the orchestrator. These run between tool calls (with
+    /// rig not holding the ctx), so there is no lock contention in
+    /// practice; each method just takes the inner mutex briefly.
+
+    /// Clone the current transcript without consuming it. Used to inspect
+    /// in-flight state during the forced-retry loop.
+    pub fn snapshot_transcript(&self) -> Vec<TranscriptEntry> {
+        self.state.lock().transcript.clone()
+    }
+
+    /// Drain the transcript — caller takes ownership and the ctx's copy
+    /// resets to empty. Called once per role invocation when the
+    /// orchestrator merges per-tool entries into the engine task.
+    pub fn drain_transcript(&self) -> Vec<TranscriptEntry> {
+        std::mem::take(&mut self.state.lock().transcript)
+    }
+
+    /// Take the verdict out of the ctx — judge tools set it; orchestrator
+    /// takes it after the judge call.
+    pub fn take_verdict(&self) -> Option<JudgeVerdict> {
+        self.state.lock().verdict.take()
+    }
+
+    /// Take the critique out of the ctx — critic tools set it; orchestrator
+    /// takes it after the critic call.
+    pub fn take_critique(&self) -> Option<Critique> {
+        self.state.lock().critique.take()
+    }
+
+    /// Drain the queue of file changes from this task's tools. The
+    /// orchestrator broadcasts them over SSE.
+    pub fn drain_fs_events(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.state.lock().fs_events)
+    }
+
+    /// Set the judge's verdict. Used by `submit_verdict`.
+    pub(crate) fn set_verdict(&self, v: JudgeVerdict) {
+        self.state.lock().verdict = Some(v);
+    }
+
+    /// Set the critic's structured critique. Used by `submit_critique`.
+    pub(crate) fn set_critique(&self, c: Critique) {
+        self.state.lock().critique = Some(c);
     }
 
     /// Load the graph from this task's workdir. Tools call this whenever
@@ -254,17 +299,18 @@ impl TaskCtx {
             content: s.clone(),
             role: Some(self.role),
         };
-        self.transcript.lock().push(entry);
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
         s.hash(&mut hasher);
         let h = hasher.finish();
-        let mut recent = self.recent_calls.lock();
-        recent.push_back((name.to_string(), h));
-        while recent.len() > LOOP_WINDOW {
-            recent.pop_front();
+        let mut st = self.state.lock();
+        st.transcript.push(entry);
+        st.recent_calls.push_back((name.to_string(), h));
+        while st.recent_calls.len() > LOOP_WINDOW {
+            st.recent_calls.pop_front();
         }
-        let consecutive = recent
+        let consecutive = st
+            .recent_calls
             .iter()
             .rev()
             .take_while(|(n, hh)| n == name && *hh == h)
@@ -307,7 +353,7 @@ impl TaskCtx {
                 role: Some(self.role),
             },
         };
-        self.transcript.lock().push(entry);
+        self.state.lock().transcript.push(entry);
         r
     }
 
@@ -329,8 +375,7 @@ impl TaskCtx {
     fn render_after_write(&self, graph: &NodeGraph) -> Result<(), ToolFailure> {
         let report = render::render_graph(&self.workdir, graph, self.layout)
             .map_err(|e| ToolFailure::Other(format!("re-render failed: {e}")))?;
-        let mut events = self.fs_events.lock();
-        events.extend(report.files_written.into_iter());
+        self.state.lock().fs_events.extend(report.files_written);
         Ok(())
     }
 }
@@ -532,187 +577,127 @@ pub struct SubmitRustOk {
     pub no_change: bool,
 }
 
-pub struct SubmitPublicTool {
-    pub ctx: Arc<TaskCtx>,
+/// Which `*.rs` slot a submit_* tool writes to.
+///
+/// The submit_public / submit_private / submit_tests tools share a single
+/// validation-then-write pipeline; they differ only in (a) which `Stage`s
+/// are allowed to call them, (b) which slot on the `Node` they update,
+/// and (c) which validator runs. This enum keeps those three knobs in one
+/// table; the three `Tool` impls delegate to `submit_rust_slot` below.
+#[derive(Clone, Copy)]
+enum SubmitSlot {
+    Public,
+    Private,
+    Tests,
 }
 
-impl Tool for SubmitPublicTool {
-    const NAME: &'static str = "submit_public";
-    type Error = ToolFailure;
-    type Args = SubmitRustArgs;
-    type Output = SubmitRustOk;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
-            parameters: json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}},
-                "required": ["content"]
-            }),
+impl SubmitSlot {
+    fn allowed_stages(self) -> &'static [Stage] {
+        match self {
+            SubmitSlot::Public => &[Stage::Iface],
+            SubmitSlot::Private => &[Stage::Iface, Stage::Impl, Stage::Debug],
+            SubmitSlot::Tests => &[Stage::Tests, Stage::Debug],
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
-            return self.ctx.finish(Self::NAME, Err::<SubmitRustOk, _>(e));
-        }
-        let r: Result<SubmitRustOk, ToolFailure> = (|| {
-            self.ctx.require_stage(Self::NAME, &[Stage::Iface])?;
-            let lines = args.content.lines().count();
-            if lines > self.ctx.max_file_lines {
-                return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
+    fn validate(self, content: &str, node: &crate::graph::Node, g: &crate::graph::NodeGraph)
+        -> Result<(), ValidateError>
+    {
+        match self {
+            // public.rs has its own narrow validator (forbids impl blocks etc.);
+            // private and tests share the import-scope validator.
+            SubmitSlot::Public => node_validate::validate_public(content),
+            SubmitSlot::Private | SubmitSlot::Tests => {
+                node_validate::validate_private(content, node, g)
             }
-            // Validation: enforce the public.rs constraint set.
-            node_validate::validate_public(&args.content)?;
-            let mut g = self.ctx.load_graph()?;
-            let n = g.get_mut(self.ctx.node_id).ok_or_else(|| {
-                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-            })?;
-            let no_change = n.public_rs.as_deref() == Some(args.content.as_str());
-            if !no_change {
-                n.public_rs = Some(args.content.clone());
-                n.updated_at = Utc::now();
-                self.ctx.render_after_write(&g)?;
-            }
-            Ok(SubmitRustOk {
-                bytes: args.content.len() as u64,
-                lines,
-                no_change,
-            })
-        })();
-        self.ctx.finish(Self::NAME, r)
-    }
-}
-
-pub struct SubmitPrivateTool {
-    pub ctx: Arc<TaskCtx>,
-}
-
-impl Tool for SubmitPrivateTool {
-    const NAME: &'static str = "submit_private";
-    type Error = ToolFailure;
-    type Args = SubmitRustArgs;
-    type Output = SubmitRustOk;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
-            parameters: json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}},
-                "required": ["content"]
-            }),
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
-            return self.ctx.finish(Self::NAME, Err::<SubmitRustOk, _>(e));
-        }
-        let r: Result<SubmitRustOk, ToolFailure> = (|| {
-            self.ctx
-                .require_stage(Self::NAME, &[Stage::Iface, Stage::Impl, Stage::Debug])?;
-            let lines = args.content.lines().count();
-            if lines > self.ctx.max_file_lines {
-                return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
-            }
-            let mut g = self.ctx.load_graph()?;
-            let n = g.get(self.ctx.node_id).ok_or_else(|| {
-                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-            })?;
-            node_validate::validate_private(&args.content, n, &g)?;
-            let n = g.get_mut(self.ctx.node_id).unwrap();
-            let no_change = n.private_rs.as_deref() == Some(args.content.as_str());
-            if !no_change {
-                n.private_rs = Some(args.content.clone());
-                n.updated_at = Utc::now();
-                self.ctx.render_after_write(&g)?;
-            }
-            Ok(SubmitRustOk {
-                bytes: args.content.len() as u64,
-                lines,
-                no_change,
-            })
-        })();
-        self.ctx.finish(Self::NAME, r)
-    }
-}
-
-pub struct SubmitTestsTool {
-    pub ctx: Arc<TaskCtx>,
-}
-
-impl Tool for SubmitTestsTool {
-    const NAME: &'static str = "submit_tests";
-    type Error = ToolFailure;
-    type Args = SubmitRustArgs;
-    type Output = SubmitRustOk;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
-            parameters: json!({
-                "type": "object",
-                "properties": {"content": {"type": "string"}},
-                "required": ["content"]
-            }),
+    /// Read/write the slot on the node. Returns the previous value so the
+    /// caller can detect no-change.
+    fn slot_mut(self, n: &mut crate::graph::Node) -> &mut Option<String> {
+        match self {
+            SubmitSlot::Public => &mut n.public_rs,
+            SubmitSlot::Private => &mut n.private_rs,
+            SubmitSlot::Tests => &mut n.tests_rs,
         }
     }
+}
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
-            return self.ctx.finish(Self::NAME, Err::<SubmitRustOk, _>(e));
-        }
-        let r: Result<SubmitRustOk, ToolFailure> = (|| {
-            self.ctx
-                .require_stage(Self::NAME, &[Stage::Tests, Stage::Debug])?;
-            let lines = args.content.lines().count();
-            if lines > self.ctx.max_file_lines {
-                return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
-            }
-            // Tests can use anything private would; same validator.
-            let mut g = self.ctx.load_graph()?;
-            let n = g.get(self.ctx.node_id).ok_or_else(|| {
-                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-            })?;
-            node_validate::validate_private(&args.content, n, &g)?;
-            let n = g.get_mut(self.ctx.node_id).unwrap();
-            let no_change = n.tests_rs.as_deref() == Some(args.content.as_str());
-            if !no_change {
-                n.tests_rs = Some(args.content.clone());
-                n.updated_at = Utc::now();
-                self.ctx.render_after_write(&g)?;
-            }
-            Ok(SubmitRustOk {
-                bytes: args.content.len() as u64,
-                lines,
-                no_change,
-            })
-        })();
-        self.ctx.finish(Self::NAME, r)
+/// Shared body of submit_public / submit_private / submit_tests. Loads the
+/// graph, runs the slot-appropriate validator, writes if changed, re-renders.
+fn submit_rust_slot(
+    ctx: &TaskCtx,
+    slot: SubmitSlot,
+    content: &str,
+    tool_name: &'static str,
+) -> Result<SubmitRustOk, ToolFailure> {
+    ctx.require_stage(tool_name, slot.allowed_stages())?;
+    let lines = content.lines().count();
+    if lines > ctx.max_file_lines {
+        return Err(ToolFailure::FileTooLarge(lines, ctx.max_file_lines));
     }
+    let mut g = ctx.load_graph()?;
+    let n = g
+        .get(ctx.node_id)
+        .ok_or_else(|| ToolFailure::Other(format!("node {} missing", ctx.node_id)))?;
+    slot.validate(content, n, &g)?;
+    let n = g.get_mut(ctx.node_id).unwrap();
+    let cur = slot.slot_mut(n);
+    let no_change = cur.as_deref() == Some(content);
+    if !no_change {
+        *cur = Some(content.to_string());
+        n.updated_at = Utc::now();
+        ctx.render_after_write(&g)?;
+    }
+    Ok(SubmitRustOk {
+        bytes: content.len() as u64,
+        lines,
+        no_change,
+    })
 }
 
-// --------------------------------------------------------------------------
-// Shared types used by submit_spec's child-creation field.
-// --------------------------------------------------------------------------
+/// One macro-style declaration per public-facing submit_* tool. Each tool
+/// type carries the rig `NAME` constant (rig requires it const) and a
+/// `SubmitSlot` discriminator; the actual work lives in `submit_rust_slot`.
+macro_rules! submit_rust_tool {
+    ($ty:ident, $name:literal, $slot:expr) => {
+        pub struct $ty {
+            pub ctx: Arc<TaskCtx>,
+        }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct ChildDecl {
-    pub name: String,
-    pub description: String,
-    /// References to existing node names (or earlier siblings in the same
-    /// `submit_spec` call) that this child will depend on.
-    #[serde(default)]
-    pub deps: Vec<String>,
-    /// If true, this child is a separate Cargo crate (workspace mode only).
-    #[serde(default)]
-    pub crate_boundary: bool,
+        impl Tool for $ty {
+            const NAME: &'static str = $name;
+            type Error = ToolFailure;
+            type Args = SubmitRustArgs;
+            type Output = SubmitRustOk;
+
+            async fn definition(&self, _prompt: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"]
+                    }),
+                }
+            }
+
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+                    return self.ctx.finish(Self::NAME, Err::<SubmitRustOk, _>(e));
+                }
+                let r = submit_rust_slot(&self.ctx, $slot, &args.content, Self::NAME);
+                self.ctx.finish(Self::NAME, r)
+            }
+        }
+    };
 }
+
+submit_rust_tool!(SubmitPublicTool, "submit_public", SubmitSlot::Public);
+submit_rust_tool!(SubmitPrivateTool, "submit_private", SubmitSlot::Private);
+submit_rust_tool!(SubmitTestsTool, "submit_tests", SubmitSlot::Tests);
 
 #[derive(Serialize, Debug, Clone)]
 pub struct NodeIdRef {
@@ -741,17 +726,10 @@ pub struct ArchNode {
     pub children: Vec<ArchNode>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct ExternalCrateDep {
-    /// crates.io name (e.g. `serde`, `tokio`, `rustls`).
-    pub name: String,
-    /// One-sentence reason this is needed.
-    #[serde(default)]
-    pub reason: String,
-    /// Whether to enable default features.
-    #[serde(default)]
-    pub features: Vec<String>,
-}
+// External crate deps are defined in `graph::ExternalCrateDep` — the
+// same type the renderer reads to populate `[workspace.dependencies]`.
+// The architect submits values of that type directly; no conversion.
+pub use crate::graph::ExternalCrateDep;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SubmitArchitectureArgs {
@@ -978,17 +956,7 @@ fn submit_architecture_apply(
     //    in any Cargo.toml.
     let external_deps = args.external_deps.len();
     if external_deps > 0 {
-        let r = g.get_mut(root_id).unwrap();
-        r.external_crate_deps = args
-            .external_deps
-            .into_iter()
-            .map(|d| crate::graph::ExternalCrateDep {
-                name: d.name,
-                version: None,
-                features: d.features,
-                reason: d.reason,
-            })
-            .collect();
+        g.get_mut(root_id).unwrap().external_crate_deps = args.external_deps;
     }
 
     ctx.render_after_write(&g)?;
@@ -1182,7 +1150,7 @@ impl Tool for SubmitCritiqueTool {
         }
         let issue_count = args.issues.len();
         let r: Result<SubmitCritiqueOk, ToolFailure> = {
-            *self.ctx.critique.lock() = Some(Critique { issues: args.issues });
+            self.ctx.set_critique(Critique { issues: args.issues });
             Ok(SubmitCritiqueOk {
                 recorded: true,
                 issue_count,
@@ -1238,7 +1206,7 @@ impl Tool for SubmitVerdictTool {
             return self.ctx.finish(Self::NAME, Err::<SubmitVerdictOk, _>(e));
         }
         let r: Result<SubmitVerdictOk, ToolFailure> = {
-            *self.ctx.verdict.lock() = Some(JudgeVerdict {
+            self.ctx.set_verdict(JudgeVerdict {
                 satisfactory: args.satisfactory,
                 reason: args.reason,
             });
@@ -2527,22 +2495,41 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
         ],
         (Debug, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
 
-        (Opt, Writer) | (Opt, Reviser) => vec![
-            SubmitPrivateTool::NAME,
-            CargoTestTool::NAME,
-            CargoClippyTool::NAME,
-        ],
-        (Opt, Critic) => vec![
-            CargoTestTool::NAME,
-            CargoClippyTool::NAME,
-            SubmitCritiqueTool::NAME,
-        ],
-        (Opt, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
-
         (_, QuickFixer) => unreachable!(),
     };
     v.extend(rest);
     v
+}
+
+/// Instantiate the rig `Tool` impl that corresponds to a tool name from
+/// `tool_names_for`. Single source of truth for "name → impl" — both the
+/// production LLM driver and the scripted mock driver route through this
+/// to attach / invoke tools by their catalog name.
+///
+/// A missing arm is a bug: `tool_names_for` and `instantiate_tool` must
+/// cover the same set of names.
+pub fn instantiate_tool(name: &str, ctx: Arc<TaskCtx>) -> Box<dyn rig::tool::ToolDyn> {
+    match name {
+        n if n == ReadFileTool::NAME => Box::new(ReadFileTool { ctx }),
+        n if n == SubmitArchitectureTool::NAME => Box::new(SubmitArchitectureTool { ctx }),
+        n if n == SubmitSpecTool::NAME => Box::new(SubmitSpecTool { ctx }),
+        n if n == SubmitPublicTool::NAME => Box::new(SubmitPublicTool { ctx }),
+        n if n == SubmitPrivateTool::NAME => Box::new(SubmitPrivateTool { ctx }),
+        n if n == SubmitTestsTool::NAME => Box::new(SubmitTestsTool { ctx }),
+        n if n == SubmitCritiqueTool::NAME => Box::new(SubmitCritiqueTool { ctx }),
+        n if n == SubmitVerdictTool::NAME => Box::new(SubmitVerdictTool { ctx }),
+        n if n == CargoCheckTool::NAME => Box::new(CargoCheckTool { ctx }),
+        n if n == CargoTestTool::NAME => Box::new(CargoTestTool { ctx }),
+        n if n == CargoTestNoRunTool::NAME => Box::new(CargoTestNoRunTool { ctx }),
+        n if n == CargoClippyTool::NAME => Box::new(CargoClippyTool { ctx }),
+        n if n == WriteFileTool::NAME => Box::new(WriteFileTool { ctx }),
+        n if n == WriteFileRangeTool::NAME => Box::new(WriteFileRangeTool { ctx }),
+        n if n == ApplyPatchTool::NAME => Box::new(ApplyPatchTool { ctx }),
+        other => panic!(
+            "instantiate_tool: no rig Tool impl registered for `{other}` — \
+             tool_names_for and instantiate_tool are out of sync"
+        ),
+    }
 }
 
 /// Tool set for the quickfix inner loop. Same shape for every stage:
@@ -2563,7 +2550,6 @@ pub(crate) fn slots_owned_by_stage(stage: Stage) -> &'static [crate::render::Nod
         Stage::Tests => &[TestsRs],
         Stage::Impl => &[PrivateRs],
         Stage::Debug => &[PrivateRs, TestsRs],
-        Stage::Opt => &[PrivateRs],
     }
 }
 
@@ -2586,7 +2572,7 @@ fn quickfix_tools_for(stage: Stage) -> Vec<&'static str> {
             v.push(CargoCheckTool::NAME);
             v.push(CargoTestNoRunTool::NAME);
         }
-        Impl | Debug | Opt => {
+        Impl | Debug => {
             v.push(CargoCheckTool::NAME);
             v.push(CargoTestTool::NAME);
         }
@@ -2941,7 +2927,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let v = ctx.verdict.lock().clone().unwrap();
+        let v = ctx.take_verdict().unwrap();
         assert!(!v.satisfactory);
         assert_eq!(v.reason, "missing thing");
     }
@@ -2998,7 +2984,6 @@ mod tests {
             Stage::Tests,
             Stage::Impl,
             Stage::Debug,
-            Stage::Opt,
         ] {
             assert!(
                 tool_names_for(stage, Role::Critic).contains(&"submit_critique"),
@@ -3099,14 +3084,11 @@ mod tests {
     }
 
     #[test]
-    fn speaker_classifies_model_vs_bureau_correctly() {
+    fn is_model_classifies_model_vs_bureau_correctly() {
         let cases = [
-            (TranscriptKind::System, Speaker::Bureau),
-            (TranscriptKind::UserPrompt, Speaker::Bureau),
-            (
-                TranscriptKind::ToolDefinitions { tools: vec![] },
-                Speaker::Bureau,
-            ),
+            (TranscriptKind::System, false),
+            (TranscriptKind::UserPrompt, false),
+            (TranscriptKind::ToolDefinitions { tools: vec![] }, false),
             (
                 TranscriptKind::ToolResult {
                     tool: "x".into(),
@@ -3114,12 +3096,12 @@ mod tests {
                     error: None,
                     output: None,
                 },
-                Speaker::Bureau,
+                false,
             ),
-            (TranscriptKind::Note, Speaker::Bureau),
-            (TranscriptKind::Error, Speaker::Bureau),
-            (TranscriptKind::AssistantText, Speaker::Model),
-            (TranscriptKind::ToolCall { tool: "x".into() }, Speaker::Model),
+            (TranscriptKind::Note, false),
+            (TranscriptKind::Error, false),
+            (TranscriptKind::AssistantText, true),
+            (TranscriptKind::ToolCall { tool: "x".into() }, true),
         ];
         for (kind, expected) in cases {
             let e = TranscriptEntry {
@@ -3128,7 +3110,7 @@ mod tests {
                 content: String::new(),
                 role: None,
             };
-            assert_eq!(e.speaker(), expected, "wrong speaker for {:?}", e.kind);
+            assert_eq!(e.is_model(), expected, "wrong is_model for {:?}", e.kind);
         }
     }
 
@@ -3339,7 +3321,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let stored = ctx.critique.lock().clone();
+        let stored = ctx.take_critique();
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().issues.len(), 1);
     }

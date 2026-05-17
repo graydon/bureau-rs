@@ -313,9 +313,6 @@ pub fn files_owned_by_stage(
             paths.push(src_dir.join("private.rs"));
             paths.push(src_dir.join("tests.rs")); // debug stage may rewrite tests
         }
-        Stage::Opt => {
-            paths.push(src_dir.join("private.rs"));
-        }
     }
     paths
 }

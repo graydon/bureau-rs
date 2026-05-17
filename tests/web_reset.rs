@@ -52,7 +52,6 @@ async fn reset_node_cascades_through_dependents() {
         workdir.path().to_path_buf(),
         "proj".into(),
     ));
-    state.write(|st| st.graph = g.clone());
 
     let app = AppState {
         state: state.clone(),
@@ -102,9 +101,8 @@ async fn reset_node_cascades_through_dependents() {
         );
     }
 
-    let snap = state.snapshot();
-    let lib_snap = snap.graph.get(lib_id).unwrap();
-    assert_eq!(lib_snap.stages.get(Stage::Spec), StageState::NotStarted);
+    // The in-memory state no longer mirrors the graph; the on-disk
+    // graph is the only source of truth (already asserted above).
 }
 
 #[tokio::test]
@@ -126,7 +124,6 @@ async fn reset_node_without_cascade_only_resets_target() {
         workdir.path().to_path_buf(),
         "proj".into(),
     ));
-    state.write(|st| st.graph = g.clone());
 
     let r = router(AppState {
         state: state.clone(),

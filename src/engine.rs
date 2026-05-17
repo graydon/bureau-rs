@@ -100,7 +100,6 @@ impl Engine {
         });
 
         self.ensure_root_seeded()?;
-        self.sync_graph_to_state();
 
         let max_parallel = self.config.toml.limits.max_parallel_tasks.max(1);
         let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
@@ -114,7 +113,6 @@ impl Engine {
         // complete" — operators thought work was done when it wasn't.
         let mut halt_reason: Option<String> = None;
         loop {
-            self.sync_graph_to_state();
             if let Some(cap) = self.config.toml.limits.cost_cap_usd {
                 let est = self.state.read(|s| s.estimated_cost_usd);
                 if est >= cap {
@@ -151,7 +149,6 @@ impl Engine {
                 // picks skip it. Concurrent tasks see this through main's
                 // .bureau/nodes/*.json on their next allocate.
                 self.set_stage_on_main(node_id, stage, StageState::InProgress).await?;
-                self.sync_graph_to_state();
                 let this = self.clone();
                 joinset.spawn(async move { this.advance_stage(node_id, stage).await });
                 total_tasks += 1;
@@ -224,13 +221,6 @@ impl Engine {
         Ok(())
     }
 
-    fn sync_graph_to_state(&self) {
-        // The UI's view of the graph is loaded fresh from disk each sync —
-        // no shared in-memory copy to drift.
-        let g = graph::load(&self.workdir).unwrap_or_default();
-        self.state.write(|s| s.graph = g);
-    }
-
     fn note(&self, msg: impl Into<String>) {
         let m: String = msg.into();
         tracing::info!("{m}");
@@ -271,7 +261,6 @@ impl Engine {
             StageState::InProgress => "start",
             StageState::Done => "done",
             StageState::Failed => "fail",
-            StageState::Skipped => "skip",
         };
         let _ = self
             .workspace
@@ -297,10 +286,9 @@ impl Engine {
                 Stage::Tests,
                 Stage::Impl,
                 Stage::Debug,
-                Stage::Opt,
             ] {
                 let st = n.stages.get(stage);
-                if st == StageState::Done || st == StageState::Skipped {
+                if st == StageState::Done {
                     continue;
                 }
                 if stage_is_ready(&g, n.id, stage) {
@@ -351,7 +339,6 @@ impl Engine {
             Stage::Tests,
             Stage::Impl,
             Stage::Debug,
-            Stage::Opt,
         ] {
             for id in &order {
                 if !stage_is_ready(&g, *id, stage) {
@@ -405,7 +392,6 @@ impl Engine {
             {
                 Ok(()) => {
                     self.set_stage_on_main(node_id, stage, StageState::Done).await?;
-                    self.sync_graph_to_state();
                     self.state.emit(UiEvent::NodeChanged { id: node_id });
                     return Ok(());
                 }
@@ -424,7 +410,6 @@ impl Engine {
             }
         }
         self.set_stage_on_main(node_id, stage, StageState::Failed).await?;
-        self.sync_graph_to_state();
         self.state.emit(UiEvent::NodeChanged { id: node_id });
         // Impl failures get picked up by the Debug stage; don't bubble.
         if stage == Stage::Impl {
@@ -939,7 +924,7 @@ impl Engine {
         let mut combined_text = resp.output.clone();
         let max_forced_retries = self.config.toml.limits.tool_retry_budget;
         for forced_attempt in 1..=max_forced_retries {
-            let snapshot = ctx.transcript.lock().clone();
+            let snapshot = ctx.snapshot_transcript();
             let unresolved = collect_failed_tool_calls(&snapshot);
             if unresolved.is_empty() {
                 break;
@@ -1009,7 +994,7 @@ impl Engine {
             content: combined_text.clone(),
             role: Some(role),
         };
-        let ctx_entries = ctx.transcript.lock().drain(..).collect::<Vec<_>>();
+        let ctx_entries = ctx.drain_transcript();
         let failed_tools = collect_failed_tool_calls(&ctx_entries);
         for (tool, args, err) in &failed_tools {
             tracing::warn!(
@@ -1021,9 +1006,9 @@ impl Engine {
                 "tool call failed: {err}"
             );
         }
-        let verdict = ctx.verdict.lock().take();
-        let critique = ctx.critique.lock().take();
-        let fs_events: Vec<PathBuf> = ctx.fs_events.lock().drain(..).collect();
+        let verdict = ctx.take_verdict();
+        let critique = ctx.take_critique();
+        let fs_events: Vec<PathBuf> = ctx.drain_fs_events();
 
         let transcript_cap = self.config.toml.limits.task_transcript_cap;
         self.state.write(|s| {
@@ -1062,7 +1047,6 @@ impl Engine {
             total: self.state.read(|s| s.total_cost.clone()),
             estimated_usd: self.state.read(|s| s.estimated_cost_usd),
         });
-        self.sync_graph_to_state();
         self.state.emit(UiEvent::NodeChanged { id: node_id });
 
         Ok(RoleOutcome {
@@ -1144,7 +1128,7 @@ fn gate_kind_for(stage: Stage) -> Option<GateKind> {
         Stage::Architect | Stage::Spec => None,
         Stage::Iface => Some(GateKind::Check),
         Stage::Tests => Some(GateKind::TestNoRun),
-        Stage::Impl | Stage::Debug | Stage::Opt => Some(GateKind::Test),
+        Stage::Impl | Stage::Debug => Some(GateKind::Test),
     }
 }
 
@@ -1325,7 +1309,6 @@ fn stage_is_ready(graph: &NodeGraph, id: NodeId, stage: Stage) -> bool {
         None => false,
     };
     match stage {
-        Stage::Opt => false,
         Stage::Architect => {
             if cur != StageState::NotStarted {
                 return false;
@@ -1497,18 +1480,6 @@ mod tests {
         assert!(!stage_is_ready(&g, root, Stage::Debug));
         g.get_mut(root).unwrap().stages.impl_ = StageState::Failed;
         assert!(stage_is_ready(&g, root, Stage::Debug));
-    }
-
-    #[test]
-    fn opt_is_skipped_for_now() {
-        let mut g = NodeGraph::new();
-        let root = g.insert_root(Node::new("app", "")).unwrap();
-        let s = &mut g.get_mut(root).unwrap().stages;
-        s.spec = StageState::Done;
-        s.iface = StageState::Done;
-        s.tests = StageState::Done;
-        s.impl_ = StageState::Done;
-        assert!(!stage_is_ready(&g, root, Stage::Opt));
     }
 
     #[test]

@@ -25,7 +25,6 @@ fn make_config(workdir: std::path::PathBuf, project_name: &str) -> Arc<Config> {
                 tests: None,
                 impl_: None,
                 debug: None,
-                opt: None,
                 writer: None,
                 critic: None,
                 reviser: None,
@@ -110,7 +109,7 @@ async fn engine_injects_project_mission_into_root_node_preamble() {
 
     // Root node's description should also be derived from problem.md, not
     // the placeholder "Project root."
-    let g = state.snapshot().graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     let root = g.root.unwrap();
     let desc = &g.get(root).unwrap().description;
     assert_ne!(desc, "Project root.", "root description should be derived from problem.md");
@@ -425,7 +424,7 @@ async fn engine_advances_root_through_spec_stage() {
     // we test full pipelines elsewhere.
     let _ = engine.run().await;
 
-    let g = state.snapshot().graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     let root = g.root.unwrap();
     assert_eq!(g.get(root).unwrap().stages.spec, StageState::Done);
     assert_eq!(
@@ -512,7 +511,7 @@ use super::public::*;
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
     let snap = state.snapshot();
-    let g = &snap.graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     let root = g.root.unwrap();
     let n = g.get(root).unwrap();
 
@@ -646,7 +645,7 @@ async fn engine_decomposes_root_then_advances_children() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
     let snap = state.snapshot();
-    let g = &snap.graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     if !result.is_ok() {
         eprintln!("---- decompose-test diagnostic ----");
         for n in g.iter() {
@@ -770,7 +769,7 @@ async fn engine_runs_two_independent_nodes_in_parallel() {
 
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
-    let g = state.snapshot().graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     assert_eq!(g.len(), 3);
     for n in g.iter() {
         assert_eq!(n.stages.spec, StageState::Done, "node `{}` spec", n.name);
@@ -819,7 +818,7 @@ async fn engine_halts_on_unsatisfactory_judge_verdict() {
 
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
-    let g = state.snapshot().graph;
+    let g = bureau_rs::graph::load(&workdir).unwrap();
     let root = g.root.unwrap();
     let n = g.get(root).unwrap();
     // Spec stage should be Failed because judge rejected every attempt.

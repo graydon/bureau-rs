@@ -562,7 +562,9 @@ function renderTasks() {
 }
 
 // Which side of the framework/model boundary an entry came from.
-// Mirror of TranscriptEntry::speaker() in src/tools.rs.
+// Mirror of TranscriptEntry::is_model() in src/tools.rs — kept JS-side
+// because /api/state's TranscriptEntry serialization doesn't carry a
+// pre-computed speaker, only the `kind` discriminant.
 function speakerFor(kind) {
   const t = kind?.type;
   return (t === 'assistant_text' || t === 'tool_call') ? 'model' : 'bureau';

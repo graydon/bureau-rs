@@ -26,14 +26,12 @@
 use crate::engine::{DriveParams, DriveResponse, LlmDriver};
 use crate::graph::Stage;
 use crate::state::TokenUsage;
-use crate::tools::{
-    self, CritiqueIssue, Role, SubmitCritiqueArgs, SubmitRustArgs, SubmitSpecArgs,
-    SubmitVerdictArgs, TaskCtx,
-};
+use crate::tools::{self, CritiqueIssue, Role, TaskCtx};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rig::tool::Tool;
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -243,73 +241,54 @@ impl LlmDriver for MockLlmDriver {
     }
 }
 
-async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
+/// Translate a `ScriptedCall` variant into the (tool_name, JSON-args) pair
+/// the rig `ToolDyn::call` interface accepts. Every variant routes through
+/// the same dispatch so the mock driver mirrors the production path: name
+/// goes through `tools::instantiate_tool`, args go through serde.
+fn call_payload(call: &ScriptedCall) -> (&'static str, serde_json::Value) {
     use ScriptedCall::*;
     match call {
         SubmitArchitecture {
             children,
             external_deps,
-        } => {
-            let tool = tools::SubmitArchitectureTool { ctx: ctx.clone() };
-            tool.call(tools::SubmitArchitectureArgs {
-                children: children.clone(),
-                external_deps: external_deps.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("submit_architecture: {e}"))?;
-        }
+        } => (
+            tools::SubmitArchitectureTool::NAME,
+            json!({"children": children, "external_deps": external_deps}),
+        ),
         SubmitSpec {
             public,
             private,
             deps,
-        } => {
-            let tool = tools::SubmitSpecTool { ctx: ctx.clone() };
-            tool.call(SubmitSpecArgs {
-                public: public.clone(),
-                private: private.clone(),
-                deps: deps.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("submit_spec: {e}"))?;
-        }
-        SubmitPublic(s) => {
-            let tool = tools::SubmitPublicTool { ctx: ctx.clone() };
-            tool.call(SubmitRustArgs { content: s.clone() })
-                .await
-                .map_err(|e| anyhow!("submit_public: {e}"))?;
-        }
-        SubmitPrivate(s) => {
-            let tool = tools::SubmitPrivateTool { ctx: ctx.clone() };
-            tool.call(SubmitRustArgs { content: s.clone() })
-                .await
-                .map_err(|e| anyhow!("submit_private: {e}"))?;
-        }
-        SubmitTests(s) => {
-            let tool = tools::SubmitTestsTool { ctx: ctx.clone() };
-            tool.call(SubmitRustArgs { content: s.clone() })
-                .await
-                .map_err(|e| anyhow!("submit_tests: {e}"))?;
-        }
+        } => (
+            tools::SubmitSpecTool::NAME,
+            json!({"public": public, "private": private, "deps": deps}),
+        ),
+        SubmitPublic(s) => (tools::SubmitPublicTool::NAME, json!({"content": s})),
+        SubmitPrivate(s) => (tools::SubmitPrivateTool::NAME, json!({"content": s})),
+        SubmitTests(s) => (tools::SubmitTestsTool::NAME, json!({"content": s})),
         SubmitVerdict {
             satisfactory,
             reason,
-        } => {
-            let tool = tools::SubmitVerdictTool { ctx: ctx.clone() };
-            tool.call(SubmitVerdictArgs {
-                satisfactory: *satisfactory,
-                reason: reason.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("submit_verdict: {e}"))?;
-        }
-        SubmitCritique { issues } => {
-            let tool = tools::SubmitCritiqueTool { ctx: ctx.clone() };
-            tool.call(SubmitCritiqueArgs {
-                issues: issues.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("submit_critique: {e}"))?;
-        }
+        } => (
+            tools::SubmitVerdictTool::NAME,
+            json!({"satisfactory": satisfactory, "reason": reason}),
+        ),
+        SubmitCritique { issues } => (
+            tools::SubmitCritiqueTool::NAME,
+            json!({"issues": issues}),
+        ),
     }
+}
+
+async fn invoke(call: &ScriptedCall, ctx: &Arc<TaskCtx>) -> Result<()> {
+    let (name, args) = call_payload(call);
+    let args_str =
+        serde_json::to_string(&args).map_err(|e| anyhow!("{name}: serialize args: {e}"))?;
+    // Production callers (rig agents) always go through ToolDyn::call,
+    // which uses serde to parse the JSON into the tool's `Args` type
+    // and routes errors through `Tool::Error`. We invoke the same path
+    // so failure paths are exercised identically in tests.
+    let tool = tools::instantiate_tool(name, ctx.clone());
+    let _ = tool.call(args_str).await;
     Ok(())
 }

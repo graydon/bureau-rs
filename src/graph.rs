@@ -57,19 +57,16 @@ pub enum Stage {
     Impl,
     /// Targeted fixup if `Impl` didn't make tests pass on the first try.
     Debug,
-    /// Optional polish.
-    Opt,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 7] = [
+    pub const ALL: [Stage; 6] = [
         Stage::Architect,
         Stage::Spec,
         Stage::Iface,
         Stage::Tests,
         Stage::Impl,
         Stage::Debug,
-        Stage::Opt,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -80,7 +77,6 @@ impl Stage {
             Stage::Tests => "tests",
             Stage::Impl => "impl",
             Stage::Debug => "debug",
-            Stage::Opt => "opt",
         }
     }
 }
@@ -98,7 +94,6 @@ pub enum StageState {
     InProgress,
     Done,
     Failed,
-    Skipped,
 }
 
 impl Default for StageState {
@@ -112,10 +107,7 @@ impl StageState {
         matches!(self, StageState::Done)
     }
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            StageState::Done | StageState::Failed | StageState::Skipped
-        )
+        matches!(self, StageState::Done | StageState::Failed)
     }
 }
 
@@ -132,7 +124,6 @@ pub struct NodeStages {
     #[serde(rename = "impl")]
     pub impl_: StageState,
     pub debug: StageState,
-    pub opt: StageState,
 }
 
 impl NodeStages {
@@ -144,7 +135,6 @@ impl NodeStages {
             Stage::Tests => self.tests,
             Stage::Impl => self.impl_,
             Stage::Debug => self.debug,
-            Stage::Opt => self.opt,
         }
     }
 
@@ -156,7 +146,6 @@ impl NodeStages {
             Stage::Tests => self.tests = value,
             Stage::Impl => self.impl_ = value,
             Stage::Debug => self.debug = value,
-            Stage::Opt => self.opt = value,
         }
     }
 
@@ -169,7 +158,6 @@ impl NodeStages {
         self.tests = StageState::NotStarted;
         self.impl_ = StageState::NotStarted;
         self.debug = StageState::NotStarted;
-        self.opt = StageState::NotStarted;
     }
 }
 

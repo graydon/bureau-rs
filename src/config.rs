@@ -39,8 +39,6 @@ pub struct ModelConfig {
     pub impl_: Option<String>,
     #[serde(default)]
     pub debug: Option<String>,
-    #[serde(default)]
-    pub opt: Option<String>,
 
     // ---- Per-role overrides (apply across all stages for that role) ----
     #[serde(default)]
@@ -81,7 +79,6 @@ impl ModelConfig {
             crate::graph::Stage::Tests => &self.tests,
             crate::graph::Stage::Impl => &self.impl_,
             crate::graph::Stage::Debug => &self.debug,
-            crate::graph::Stage::Opt => &self.opt,
         };
         if let Some(s) = stage_override.as_deref() {
             return s;

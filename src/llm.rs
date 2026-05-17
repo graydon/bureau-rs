@@ -7,17 +7,13 @@
 use crate::config::Config;
 use crate::graph::Stage;
 use crate::state::TokenUsage;
-use crate::tools::{
-    ApplyPatchTool, CargoCheckTool, CargoClippyTool, CargoTestNoRunTool, CargoTestTool,
-    ReadFileTool, Role, SubmitArchitectureTool, SubmitCritiqueTool, SubmitPrivateTool,
-    SubmitPublicTool, SubmitSpecTool, SubmitTestsTool, SubmitVerdictTool, TaskCtx,
-    WriteFileRangeTool, WriteFileTool,
-};
+use crate::tools::{self, Role, TaskCtx};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
 use rig::providers::openrouter;
+use rig::tool::ToolDyn;
 use std::sync::Arc;
 
 /// Inputs to a single agent invocation. Bundled so we can swap rig out for
@@ -117,242 +113,28 @@ pub(crate) async fn run_rig_agent(
     temperature: f64,
     max_turns: usize,
 ) -> Result<rig::agent::PromptResponse> {
-    // ReadFile is read-only and useful everywhere — register it on the
-    // base. Without this, models in writer/critic/reviser/judge roles
-    // occasionally hallucinate `read_file` (rig training data?) and
-    // rig responds with `ToolNotFoundError: read_file`. Adding it
-    // unconditionally removes the warning storm and gives roles the
-    // option to inspect on-disk source files if their context-bundled
-    // material isn't enough.
-    let base = client
+    // The catalog in `tools::tool_names_for` is the source of truth for
+    // which tools are attached at each (stage, role). We attach them
+    // here via `instantiate_tool`; no parallel per-(stage, role) match
+    // to drift.
+    //
+    // `tool_names_for` always lists `read_file` first (see tools.rs),
+    // so its always-on registration is implicit, not duplicated.
+    let tools: Vec<Box<dyn ToolDyn>> = tools::tool_names_for(stage, role)
+        .into_iter()
+        .map(|name| tools::instantiate_tool(name, ctx.clone()))
+        .collect();
+
+    let resp = client
         .agent(model)
         .preamble(preamble)
         .max_tokens(max_tokens)
         .temperature(temperature)
         .default_max_turns(max_turns.max(2))
-        .tool(ReadFileTool { ctx: ctx.clone() });
-
-    // Branch on (stage, role) to register the right tool set. The catalog
-    // in `tools::tool_names_for` is the source of truth for "which tools";
-    // we mirror it here to actually instantiate them.
-    let resp = match (stage, role) {
-        (Stage::Architect, Role::Writer) => {
-            base.tool(SubmitArchitectureTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Architect, _) => {
-            // Architect runs single-shot — no critic/reviser/judge cycles.
-            base.build().prompt(user_prompt).extended_details().await?
-        }
-
-        (Stage::Spec, Role::Writer) | (Stage::Spec, Role::Reviser) => {
-            base.tool(SubmitSpecTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Spec, Role::Critic) => {
-            base.tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Spec, Role::Judge) => {
-            base.tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        (Stage::Iface, Role::Writer) | (Stage::Iface, Role::Reviser) => {
-            base.tool(SubmitPublicTool { ctx: ctx.clone() })
-                .tool(SubmitPrivateTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Iface, Role::Critic) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Iface, Role::Judge) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        (Stage::Tests, Role::Writer) | (Stage::Tests, Role::Reviser) => {
-            base.tool(SubmitTestsTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestNoRunTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Tests, Role::Critic) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestNoRunTool { ctx: ctx.clone() })
-                .tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Tests, Role::Judge) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestNoRunTool { ctx: ctx.clone() })
-                .tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        (Stage::Impl, Role::Writer) | (Stage::Impl, Role::Reviser) => {
-            base.tool(SubmitPrivateTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Impl, Role::Critic) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx: ctx.clone() })
-                .tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Impl, Role::Judge) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        (Stage::Debug, Role::Writer) | (Stage::Debug, Role::Reviser) => {
-            base.tool(SubmitPrivateTool { ctx: ctx.clone() })
-                .tool(SubmitTestsTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Debug, Role::Critic) => {
-            base.tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Debug, Role::Judge) => {
-            base.tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        (Stage::Opt, Role::Writer) | (Stage::Opt, Role::Reviser) => {
-            base.tool(SubmitPrivateTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Opt, Role::Critic) => {
-            base.tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(CargoClippyTool { ctx: ctx.clone() })
-                .tool(SubmitCritiqueTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Opt, Role::Judge) => {
-            base.tool(CargoTestTool { ctx: ctx.clone() })
-                .tool(SubmitVerdictTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-
-        // QuickFixer — same shape of tools regardless of stage; the gate's
-        // diagnostic tool varies. The loop only fires for stages with a
-        // cargo gate; Architect/Spec branches are kept for exhaustiveness.
-        (Stage::Spec, Role::QuickFixer) => {
-            base.build().prompt(user_prompt).extended_details().await?
-        }
-        (Stage::Iface, Role::QuickFixer) => {
-            base.tool(ReadFileTool { ctx: ctx.clone() })
-                .tool(WriteFileTool { ctx: ctx.clone() })
-                .tool(WriteFileRangeTool { ctx: ctx.clone() })
-                .tool(ApplyPatchTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Tests, Role::QuickFixer) => {
-            base.tool(ReadFileTool { ctx: ctx.clone() })
-                .tool(WriteFileTool { ctx: ctx.clone() })
-                .tool(WriteFileRangeTool { ctx: ctx.clone() })
-                .tool(ApplyPatchTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestNoRunTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-        (Stage::Impl, Role::QuickFixer)
-        | (Stage::Debug, Role::QuickFixer)
-        | (Stage::Opt, Role::QuickFixer) => {
-            base.tool(ReadFileTool { ctx: ctx.clone() })
-                .tool(WriteFileTool { ctx: ctx.clone() })
-                .tool(WriteFileRangeTool { ctx: ctx.clone() })
-                .tool(ApplyPatchTool { ctx: ctx.clone() })
-                .tool(CargoCheckTool { ctx: ctx.clone() })
-                .tool(CargoTestTool { ctx })
-                .build()
-                .prompt(user_prompt)
-                .extended_details()
-                .await?
-        }
-    };
+        .tools(tools)
+        .build()
+        .prompt(user_prompt)
+        .extended_details()
+        .await?;
     Ok(resp)
 }

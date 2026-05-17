@@ -57,30 +57,16 @@ pub enum ValidateError {
     PrivateUnknownModule { first: String },
 }
 
-/// Result of a successful `validate_public`: the set of public item names
-/// declared in the file (e.g. trait names, struct names). Useful for the
-/// renderer's `pub use public::*;` invariant — there must be at least one
-/// public item to be useful, but we don't currently enforce that.
-#[derive(Debug, Clone, Default)]
-pub struct PublicSurface {
-    pub traits: Vec<String>,
-    pub types: Vec<String>,
-}
-
-pub fn validate_public(content: &str) -> Result<PublicSurface, ValidateError> {
+pub fn validate_public(content: &str) -> Result<(), ValidateError> {
     let file =
         syn::parse_file(content).map_err(|e| ValidateError::PublicSyntax(format!("{e}")))?;
-    let mut surface = PublicSurface::default();
     for item in &file.items {
-        check_public_item(item, &mut surface)?;
+        check_public_item(item)?;
     }
-    Ok(surface)
+    Ok(())
 }
 
-fn check_public_item(
-    item: &syn::Item,
-    surface: &mut PublicSurface,
-) -> Result<(), ValidateError> {
+fn check_public_item(item: &syn::Item) -> Result<(), ValidateError> {
     use syn::Item;
     match item {
         Item::Trait(t) => {
@@ -95,21 +81,9 @@ fn check_public_item(
                     }
                 }
             }
-            surface.traits.push(t.ident.to_string());
             Ok(())
         }
-        Item::Struct(s) => {
-            surface.types.push(s.ident.to_string());
-            Ok(())
-        }
-        Item::Enum(e) => {
-            surface.types.push(e.ident.to_string());
-            Ok(())
-        }
-        Item::Type(t) => {
-            surface.types.push(t.ident.to_string());
-            Ok(())
-        }
+        Item::Struct(_) | Item::Enum(_) | Item::Type(_) => Ok(()),
         Item::Use(u) => {
             // Allow `pub use super::private::X` and `use ...` re-exports
             // that are intra-module (super::*). Disallow `pub use crate::*`
@@ -340,9 +314,7 @@ pub enum Color { Red, Green, Blue }
 
 pub type Id = u64;
 "#;
-        let s = validate_public(src).unwrap();
-        assert_eq!(s.traits, vec!["Frob"]);
-        assert_eq!(s.types, vec!["Frobber", "Color", "Id"]);
+        validate_public(src).unwrap();
     }
 
     #[test]
@@ -406,8 +378,7 @@ pub trait T {
     fn f(&self) -> i32;
 }
 "#;
-        let s = validate_public(src).unwrap();
-        assert_eq!(s.traits, vec!["T"]);
+        validate_public(src).unwrap();
     }
 
     #[test]
