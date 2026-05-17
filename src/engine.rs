@@ -32,7 +32,6 @@ use crate::tools::{
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -905,16 +904,15 @@ impl Engine {
             });
         }
 
-        // Per-task graph mutex: load from disk, hand the TaskCtx a fresh
-        // Arc<Mutex<...>>; tools mutate it and render_after_write
-        // persists it back to disk in the worktree.
-        let task_graph = Arc::new(Mutex::new(graph::load(wt_path).unwrap_or_default()));
+        // TaskCtx no longer caches the graph in memory — tools load it
+        // fresh from the worktree's `.bureau/` on each call. Rig
+        // serializes tool dispatch (concurrency=1) so two tool calls
+        // in the same turn can't race on the on-disk state.
         let ctx = Arc::new(TaskCtx::new(
             task_id,
             node_id,
             stage,
             role,
-            task_graph,
             wt_path.to_path_buf(),
             self.layout,
             self.config.toml.limits.max_file_lines,

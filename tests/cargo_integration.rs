@@ -14,7 +14,6 @@ use bureau_rs::render::{Layout, render_graph};
 use bureau_rs::tools::{
     CargoCheckTool, Role, SubmitPrivateTool, SubmitPublicTool, SubmitRustArgs, TaskCtx,
 };
-use parking_lot::Mutex;
 use rig::tool::Tool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -22,7 +21,6 @@ use uuid::Uuid;
 fn ctx_for(
     workdir: std::path::PathBuf,
     layout: Layout,
-    graph: Arc<Mutex<NodeGraph>>,
     node_id: bureau_rs::graph::NodeId,
     stage: Stage,
 ) -> Arc<TaskCtx> {
@@ -31,7 +29,6 @@ fn ctx_for(
         node_id,
         stage,
         Role::Writer,
-        graph,
         workdir,
         layout,
         300,
@@ -53,10 +50,9 @@ async fn single_crate_cargo_check_succeeds_on_default_scaffold() {
     root.crate_boundary = true;
     let root_id = g.insert_root(root).unwrap();
     render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-    let graph = Arc::new(Mutex::new(g));
     // Need iface stage (cargo_check is registered there) and content
     // that compiles. Author public.rs with a trivial trait.
-    let ctx = ctx_for(workdir.clone(), Layout::SingleCrate, graph.clone(), root_id, Stage::Iface);
+    let ctx = ctx_for(workdir.clone(), Layout::SingleCrate, root_id, Stage::Iface);
     let pub_tool = SubmitPublicTool { ctx: ctx.clone() };
     pub_tool
         .call(SubmitRustArgs {
@@ -102,7 +98,6 @@ async fn workspace_cargo_check_resolves_package_to_real_member() {
     core_node.crate_boundary = true;
     let core_id = g.add_child(root_id, core_node).unwrap();
     render_graph(&workdir, &g, Layout::Workspace).unwrap();
-    let graph = Arc::new(Mutex::new(g));
     // Run cargo_check; the model passes a BAD `package` arg (a module
     // name that doesn't exist as a workspace member). The framework
     // should resolve it to the current node's containing crate (`core`)
@@ -110,7 +105,6 @@ async fn workspace_cargo_check_resolves_package_to_real_member() {
     let ctx = ctx_for(
         workdir.clone(),
         Layout::Workspace,
-        graph.clone(),
         core_id,
         Stage::Iface,
     );
@@ -145,11 +139,9 @@ async fn workspace_cargo_check_uses_valid_package_arg_verbatim() {
     core_node.crate_boundary = true;
     let _core_id = g.add_child(root_id, core_node).unwrap();
     render_graph(&workdir, &g, Layout::Workspace).unwrap();
-    let graph = Arc::new(Mutex::new(g));
     let ctx = ctx_for(
         workdir.clone(),
         Layout::Workspace,
-        graph.clone(),
         util_id,
         Stage::Iface,
     );
@@ -199,11 +191,9 @@ async fn workspace_root_mod_rs_does_not_declare_crate_children_as_modules() {
         "crate-boundary child should NOT be declared as a module of the parent crate (would trigger E0583): {root_mod}"
     );
     // Cargo check the workspace — should pass cleanly.
-    let graph = Arc::new(Mutex::new(g));
     let ctx = ctx_for(
         workdir.clone(),
         Layout::Workspace,
-        graph.clone(),
         root_id,
         Stage::Iface,
     );
@@ -245,11 +235,9 @@ async fn workspace_with_cross_crate_dep_compiles() {
         "core/Cargo.toml should declare a path dep on util:\n{core_cargo}"
     );
     // Author tiny content in util that core can call.
-    let graph = Arc::new(Mutex::new(g));
     let util_ctx = ctx_for(
         workdir.clone(),
         Layout::Workspace,
-        graph.clone(),
         util_id,
         Stage::Iface,
     );
@@ -266,11 +254,12 @@ async fn workspace_with_cross_crate_dep_compiles() {
         .await
         .unwrap();
     // Mark util's iface Done so core's iface can declare a dep on it.
-    graph.lock().get_mut(util_id).unwrap().stages.iface = StageState::Done;
+    let mut g = bureau_rs::graph::load(&workdir).unwrap();
+    g.get_mut(util_id).unwrap().stages.iface = StageState::Done;
+    render_graph(&workdir, &g, Layout::Workspace).unwrap();
     let core_ctx = ctx_for(
         workdir.clone(),
         Layout::Workspace,
-        graph.clone(),
         core_id,
         Stage::Iface,
     );
@@ -326,22 +315,8 @@ async fn parallel_tasks_land_without_merge_conflicts() {
     // from disk at allocate time.
     let wta = pool.allocate(Uuid::new_v4()).await.unwrap();
     let wtb = pool.allocate(Uuid::new_v4()).await.unwrap();
-    let graph_a = Arc::new(Mutex::new(bureau_rs::graph::load(&wta.path).unwrap()));
-    let graph_b = Arc::new(Mutex::new(bureau_rs::graph::load(&wtb.path).unwrap()));
-    let ctx_a = ctx_for(
-        wta.path.clone(),
-        Layout::SingleCrate,
-        graph_a.clone(),
-        alpha_id,
-        Stage::Spec,
-    );
-    let ctx_b = ctx_for(
-        wtb.path.clone(),
-        Layout::SingleCrate,
-        graph_b.clone(),
-        beta_id,
-        Stage::Spec,
-    );
+    let ctx_a = ctx_for(wta.path.clone(), Layout::SingleCrate, alpha_id, Stage::Spec);
+    let ctx_b = ctx_for(wtb.path.clone(), Layout::SingleCrate, beta_id, Stage::Spec);
     bureau_rs::tools::SubmitSpecTool { ctx: ctx_a }
         .call(bureau_rs::tools::SubmitSpecArgs {
             public: "# alpha\n\nFirst.".into(),

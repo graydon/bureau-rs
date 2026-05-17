@@ -87,11 +87,14 @@ pub struct TaskCtx {
     pub node_id: NodeId,
     pub stage: Stage,
     pub role: Role,
-    /// Live shared graph (per-task tools mutate this directly via the
-    /// orchestrator's lock; we go through the shared Arc to avoid copying
-    /// the whole graph each call).
-    pub graph: Arc<Mutex<NodeGraph>>,
-    /// Workdir on disk; we re-render after each successful submit.
+    /// Workdir on disk. The graph lives here as `.bureau/graph.json` +
+    /// `.bureau/nodes/*.json` and is the source of truth — tools that
+    /// need the graph load it fresh from disk on each call via
+    /// `graph::load(&ctx.workdir)`, mutate, and persist via
+    /// `render::render_graph` (which `graph::save`s as a side effect).
+    /// Rig dispatches tool calls with `concurrency = 1` so within a
+    /// task they're serialized at the agent layer; no in-process lock
+    /// needed.
     pub workdir: PathBuf,
     pub layout: Layout,
     pub max_file_lines: usize,
@@ -201,7 +204,6 @@ impl TaskCtx {
         node_id: NodeId,
         stage: Stage,
         role: Role,
-        graph: Arc<Mutex<NodeGraph>>,
         workdir: PathBuf,
         layout: Layout,
         max_file_lines: usize,
@@ -215,7 +217,6 @@ impl TaskCtx {
             node_id,
             stage,
             role,
-            graph,
             workdir,
             layout,
             max_file_lines,
@@ -229,6 +230,14 @@ impl TaskCtx {
             fs_events: Mutex::new(Vec::new()),
             cargo_lock,
         }
+    }
+
+    /// Load the graph from this task's workdir. Tools call this whenever
+    /// they need to read or mutate the graph; on mutation they then
+    /// call `render_after_write_with(&graph)` to persist + re-render.
+    fn load_graph(&self) -> Result<NodeGraph, ToolFailure> {
+        crate::graph::load(&self.workdir)
+            .map_err(|e| ToolFailure::Other(format!("load graph: {e}")))
     }
 
     fn record_call_check_loop<T: Serialize>(
@@ -312,9 +321,13 @@ impl TaskCtx {
         })
     }
 
-    fn render_after_write(&self) -> Result<(), ToolFailure> {
-        let graph = self.graph.lock();
-        let report = render::render_graph(&self.workdir, &graph, self.layout)
+    /// Re-render the workspace from the given graph state, persisting
+    /// `.bureau/graph.json` + `.bureau/nodes/*.json` (via `graph::save`
+    /// inside `render_graph`) and tracking which files changed for the
+    /// SSE event stream. Tools that mutate the graph in memory call
+    /// this with the mutated graph; tools that only read don't.
+    fn render_after_write(&self, graph: &NodeGraph) -> Result<(), ToolFailure> {
+        let report = render::render_graph(&self.workdir, graph, self.layout)
             .map_err(|e| ToolFailure::Other(format!("re-render failed: {e}")))?;
         let mut events = self.fs_events.lock();
         events.extend(report.files_written.into_iter());
@@ -444,7 +457,7 @@ fn submit_spec_apply(
         }
     }
 
-    let mut g = ctx.graph.lock();
+    let mut g = ctx.load_graph()?;
     let self_id = ctx.node_id;
     let self_name = g.get(self_id).map(|n| n.name.clone()).unwrap_or_default();
 
@@ -492,8 +505,7 @@ fn submit_spec_apply(
         });
     }
 
-    drop(g);
-    ctx.render_after_write()?;
+    ctx.render_after_write(&g)?;
     Ok(SubmitSpecOk {
         public_bytes,
         public_lines,
@@ -554,21 +566,15 @@ impl Tool for SubmitPublicTool {
             }
             // Validation: enforce the public.rs constraint set.
             node_validate::validate_public(&args.content)?;
-            let mut no_change = false;
-            {
-                let mut g = self.ctx.graph.lock();
-                let n = g.get_mut(self.ctx.node_id).ok_or_else(|| {
-                    ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-                })?;
-                if n.public_rs.as_deref() == Some(args.content.as_str()) {
-                    no_change = true;
-                } else {
-                    n.public_rs = Some(args.content.clone());
-                    n.updated_at = Utc::now();
-                }
-            }
+            let mut g = self.ctx.load_graph()?;
+            let n = g.get_mut(self.ctx.node_id).ok_or_else(|| {
+                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
+            })?;
+            let no_change = n.public_rs.as_deref() == Some(args.content.as_str());
             if !no_change {
-                self.ctx.render_after_write()?;
+                n.public_rs = Some(args.content.clone());
+                n.updated_at = Utc::now();
+                self.ctx.render_after_write(&g)?;
             }
             Ok(SubmitRustOk {
                 bytes: args.content.len() as u64,
@@ -613,32 +619,17 @@ impl Tool for SubmitPrivateTool {
             if lines > self.ctx.max_file_lines {
                 return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
             }
-            // Validate against the in-place node — no clone needed.
-            // (The previous code cloned the node, ran validate against
-            // the clone, then dropped the clone with `let _ = validated`;
-            // it implied a snapshot semantic that wasn't load-bearing
-            // since TaskCtx::graph is a per-task Mutex with no concurrent
-            // writers.)
-            {
-                let g = self.ctx.graph.lock();
-                let n = g.get(self.ctx.node_id).ok_or_else(|| {
-                    ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-                })?;
-                node_validate::validate_private(&args.content, n, &g)?;
-            }
-            let mut no_change = false;
-            {
-                let mut g = self.ctx.graph.lock();
-                let n = g.get_mut(self.ctx.node_id).unwrap();
-                if n.private_rs.as_deref() == Some(args.content.as_str()) {
-                    no_change = true;
-                } else {
-                    n.private_rs = Some(args.content.clone());
-                    n.updated_at = Utc::now();
-                }
-            }
+            let mut g = self.ctx.load_graph()?;
+            let n = g.get(self.ctx.node_id).ok_or_else(|| {
+                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
+            })?;
+            node_validate::validate_private(&args.content, n, &g)?;
+            let n = g.get_mut(self.ctx.node_id).unwrap();
+            let no_change = n.private_rs.as_deref() == Some(args.content.as_str());
             if !no_change {
-                self.ctx.render_after_write()?;
+                n.private_rs = Some(args.content.clone());
+                n.updated_at = Utc::now();
+                self.ctx.render_after_write(&g)?;
             }
             Ok(SubmitRustOk {
                 bytes: args.content.len() as u64,
@@ -684,26 +675,17 @@ impl Tool for SubmitTestsTool {
                 return Err(ToolFailure::FileTooLarge(lines, self.ctx.max_file_lines));
             }
             // Tests can use anything private would; same validator.
-            {
-                let g = self.ctx.graph.lock();
-                let n = g.get(self.ctx.node_id).ok_or_else(|| {
-                    ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
-                })?;
-                node_validate::validate_private(&args.content, n, &g)?;
-            }
-            let mut no_change = false;
-            {
-                let mut g = self.ctx.graph.lock();
-                let n = g.get_mut(self.ctx.node_id).unwrap();
-                if n.tests_rs.as_deref() == Some(args.content.as_str()) {
-                    no_change = true;
-                } else {
-                    n.tests_rs = Some(args.content.clone());
-                    n.updated_at = Utc::now();
-                }
-            }
+            let mut g = self.ctx.load_graph()?;
+            let n = g.get(self.ctx.node_id).ok_or_else(|| {
+                ToolFailure::Other(format!("node {} missing", self.ctx.node_id))
+            })?;
+            node_validate::validate_private(&args.content, n, &g)?;
+            let n = g.get_mut(self.ctx.node_id).unwrap();
+            let no_change = n.tests_rs.as_deref() == Some(args.content.as_str());
             if !no_change {
-                self.ctx.render_after_write()?;
+                n.tests_rs = Some(args.content.clone());
+                n.updated_at = Utc::now();
+                self.ctx.render_after_write(&g)?;
             }
             Ok(SubmitRustOk {
                 bytes: args.content.len() as u64,
@@ -929,7 +911,7 @@ fn submit_architecture_apply(
     //    We have to build top-down so parents exist before their kids.
     flat.sort_by_key(|(path, _)| path.len());
 
-    let mut g = ctx.graph.lock();
+    let mut g = ctx.load_graph()?;
     let root_id = g
         .root
         .ok_or_else(|| ToolFailure::Other("graph has no root".into()))?;
@@ -1009,8 +991,7 @@ fn submit_architecture_apply(
             .collect();
     }
 
-    drop(g);
-    ctx.render_after_write()?;
+    ctx.render_after_write(&g)?;
     Ok(SubmitArchitectureOk {
         nodes_created,
         deps_added,
@@ -1025,7 +1006,7 @@ fn submit_architecture_apply(
 /// back to the containing crate of the current node — that's almost
 /// always what they meant.
 fn resolve_cargo_package(ctx: &TaskCtx, requested: Option<&str>) -> Option<String> {
-    let g = ctx.graph.lock();
+    let g = ctx.load_graph().ok()?;
     // In single-crate layout, cargo doesn't need `-p`; the workdir IS
     // the one and only package.
     if matches!(ctx.layout, crate::render::Layout::SingleCrate) {
@@ -1687,7 +1668,7 @@ impl Tool for ReadFileTool {
             // is rejected — read access has to be scoped or models can
             // peek at things they shouldn't reason about.
             {
-                let g = self.ctx.graph.lock();
+                let g = self.ctx.load_graph()?;
                 if !is_readable_by_node(&g, self.ctx.node_id, &rel, self.ctx.layout) {
                     let hint = readable_paths_hint(&g, self.ctx.node_id, self.ctx.layout);
                     return Err(ToolFailure::Other(format!(
@@ -2002,7 +1983,7 @@ fn read_slot_content(ctx: &TaskCtx, path: &str) -> Result<String, ToolFailure> {
             "path '{path}' must be a relative path with no parent-dir traversal"
         )));
     }
-    let g = ctx.graph.lock();
+    let g = ctx.load_graph()?;
     let resolved = render::resolve_path_to_slot(&g, &rel, ctx.layout);
     if let Some((node_id, slot)) = resolved {
         let n = g
@@ -2133,7 +2114,7 @@ fn apply_slot_edit(
         return Err(ToolFailure::FileTooLarge(line_count, ctx.max_file_lines));
     }
     let resolved = {
-        let g = ctx.graph.lock();
+        let g = ctx.load_graph()?;
         render::resolve_path_to_slot(&g, &rel, ctx.layout)
     };
     let (node_id, slot) = resolved.ok_or_else(|| {
@@ -2168,54 +2149,45 @@ fn apply_slot_edit(
             )));
         }
     }
-    // Per-slot validation (mirrors the submit_* tools).
-    {
-        let g = ctx.graph.lock();
-        let n = g.get(node_id).ok_or_else(|| {
-            ToolFailure::Other(format!("node {node_id} missing"))
-        })?;
-        match slot {
-            render::NodeSlot::PublicRs => {
-                node_validate::validate_public(&content)?;
-            }
-            render::NodeSlot::PrivateRs | render::NodeSlot::TestsRs => {
-                node_validate::validate_private(&content, n, &g)?;
-            }
-            render::NodeSlot::SpecPublicMd | render::NodeSlot::SpecPrivateMd => {
-                // Spec is freeform markdown; no content validator beyond
-                // the line cap we already enforced above (using
-                // max_file_lines — spec markdown has a separate cap, but
-                // the per-line cap is the safer of the two).
-            }
+    // Load once: validate against the loaded graph, then mutate +
+    // render through the same in-memory copy.
+    let mut g = ctx.load_graph()?;
+    let n = g
+        .get(node_id)
+        .ok_or_else(|| ToolFailure::Other(format!("node {node_id} missing")))?;
+    match slot {
+        render::NodeSlot::PublicRs => {
+            node_validate::validate_public(&content)?;
+        }
+        render::NodeSlot::PrivateRs | render::NodeSlot::TestsRs => {
+            node_validate::validate_private(&content, n, &g)?;
+        }
+        render::NodeSlot::SpecPublicMd | render::NodeSlot::SpecPrivateMd => {
+            // Spec is freeform markdown; no content validator beyond
+            // the line cap we already enforced above.
         }
     }
-    let no_change;
-    {
-        let mut g = ctx.graph.lock();
-        let n = g.get_mut(node_id).ok_or_else(|| {
-            ToolFailure::Other(format!("node {node_id} missing"))
-        })?;
-        let cur: Option<&String> = match slot {
-            render::NodeSlot::PublicRs => n.public_rs.as_ref(),
-            render::NodeSlot::PrivateRs => n.private_rs.as_ref(),
-            render::NodeSlot::TestsRs => n.tests_rs.as_ref(),
-            render::NodeSlot::SpecPublicMd => n.spec_public_md.as_ref(),
-            render::NodeSlot::SpecPrivateMd => n.spec_private_md.as_ref(),
-        };
-        no_change = cur.map(|s| s == &content).unwrap_or(false);
-        if !no_change {
-            match slot {
-                render::NodeSlot::PublicRs => n.public_rs = Some(content.clone()),
-                render::NodeSlot::PrivateRs => n.private_rs = Some(content.clone()),
-                render::NodeSlot::TestsRs => n.tests_rs = Some(content.clone()),
-                render::NodeSlot::SpecPublicMd => n.spec_public_md = Some(content.clone()),
-                render::NodeSlot::SpecPrivateMd => n.spec_private_md = Some(content.clone()),
-            }
-            n.updated_at = Utc::now();
-        }
-    }
+    let n = g
+        .get_mut(node_id)
+        .ok_or_else(|| ToolFailure::Other(format!("node {node_id} missing")))?;
+    let cur: Option<&String> = match slot {
+        render::NodeSlot::PublicRs => n.public_rs.as_ref(),
+        render::NodeSlot::PrivateRs => n.private_rs.as_ref(),
+        render::NodeSlot::TestsRs => n.tests_rs.as_ref(),
+        render::NodeSlot::SpecPublicMd => n.spec_public_md.as_ref(),
+        render::NodeSlot::SpecPrivateMd => n.spec_private_md.as_ref(),
+    };
+    let no_change = cur.map(|s| s == &content).unwrap_or(false);
     if !no_change {
-        ctx.render_after_write()?;
+        match slot {
+            render::NodeSlot::PublicRs => n.public_rs = Some(content.clone()),
+            render::NodeSlot::PrivateRs => n.private_rs = Some(content.clone()),
+            render::NodeSlot::TestsRs => n.tests_rs = Some(content.clone()),
+            render::NodeSlot::SpecPublicMd => n.spec_public_md = Some(content.clone()),
+            render::NodeSlot::SpecPrivateMd => n.spec_private_md = Some(content.clone()),
+        }
+        n.updated_at = Utc::now();
+        ctx.render_after_write(&g)?;
     }
     Ok((content.len() as u64, line_count, no_change))
 }
@@ -2628,21 +2600,23 @@ mod tests {
     use crate::graph::Node;
     use crate::render::Layout;
 
-    fn fixture(stage: Stage) -> (tempfile::TempDir, Arc<Mutex<NodeGraph>>, NodeId, Arc<TaskCtx>) {
+    /// Test fixture. Builds a fresh single-crate workdir with a root
+    /// node, persists it via `render::render_graph` (which writes the
+    /// `.bureau/` graph state), and hands back the TempDir + root id +
+    /// a fresh TaskCtx pointing at it. Tests that need to read or
+    /// mutate the graph go through `graph::load`/`graph::save` against
+    /// `ctx.workdir` — the same path the tools use.
+    fn fixture(stage: Stage) -> (tempfile::TempDir, NodeId, Arc<TaskCtx>) {
         let tmp = tempfile::tempdir().unwrap();
         let workdir = tmp.path().to_path_buf();
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "the app")).unwrap();
-        // Initial render so the workdir is set up enough for cargo (we
-        // don't actually run cargo in unit tests).
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             root,
             stage,
             Role::Writer,
-            graph.clone(),
             workdir,
             Layout::SingleCrate,
             300,
@@ -2651,12 +2625,12 @@ mod tests {
             5,
             Arc::new(tokio::sync::Mutex::new(())),
         ));
-        (tmp, graph, root, ctx)
+        (tmp, root, ctx)
     }
 
     #[tokio::test]
     async fn submit_spec_public_persists_to_node_and_disk() {
-        let (tmp, graph, root, ctx) = fixture(Stage::Spec);
+        let (tmp, root, ctx) = fixture(Stage::Spec);
         let tool = SubmitSpecTool { ctx };
         let r = tool
             .call(SubmitSpecArgs {
@@ -2668,7 +2642,7 @@ mod tests {
             .unwrap();
         assert!(r.public_lines >= 2);
         assert_eq!(
-            graph.lock().get(root).unwrap().spec_public_md.as_deref(),
+            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().spec_public_md.as_deref(),
             Some("# Spec\n\nDoes the thing.")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/public.md")).unwrap();
@@ -2677,7 +2651,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_spec_private_writes_to_separate_slot_and_file() {
-        let (tmp, graph, root, ctx) = fixture(Stage::Spec);
+        let (tmp, root, ctx) = fixture(Stage::Spec);
         let tool = SubmitSpecTool { ctx };
         tool.call(SubmitSpecArgs {
             public: "# Spec\n\nDoes the thing.".into(),
@@ -2687,7 +2661,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            graph.lock().get(root).unwrap().spec_private_md.as_deref(),
+            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().spec_private_md.as_deref(),
             Some("# Notes\n\nWhy I chose option B.")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/private.md")).unwrap();
@@ -2696,7 +2670,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_spec_rejected_outside_spec_stage() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = SubmitSpecTool { ctx };
         let err = tool
             .call(SubmitSpecArgs {
@@ -2734,14 +2708,12 @@ mod tests {
             n.stages.impl_ = StageState::Done;
         }
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
         // Run a spec stage on `core` that adds a dep on `util`.
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             core,
             Stage::Spec,
             Role::Writer,
-            graph.clone(),
             workdir,
             Layout::SingleCrate,
             300,
@@ -2760,7 +2732,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.deps_added.len(), 1);
-        let g = graph.lock();
+        let g = crate::graph::load(tmp.path()).unwrap();
         // leaf's iface MUST stay Done — we don't mutate dependents.
         assert_eq!(g.get(leaf).unwrap().stages.iface, StageState::Done);
         assert_eq!(g.get(leaf).unwrap().stages.impl_, StageState::Done);
@@ -2778,13 +2750,11 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "the app")).unwrap();
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             root,
             Stage::Architect,
             Role::Writer,
-            graph.clone(),
             workdir,
             Layout::SingleCrate,
             300,
@@ -2824,7 +2794,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.nodes_created, 3); // util, core, engine
         assert_eq!(r.deps_added, 1); // core -> util
-        let g = graph.lock();
+        let g = crate::graph::load(tmp.path()).unwrap();
         assert_eq!(g.len(), 4); // root + 3
         let core = g.find_by_name("core").unwrap();
         let util = g.find_by_name("util").unwrap();
@@ -2842,13 +2812,11 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             root,
             Stage::Architect,
             Role::Writer,
-            graph.clone(),
             workdir,
             Layout::SingleCrate,
             300, 500, 64, 5,
@@ -2887,13 +2855,11 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         render::render_graph(&workdir, &g, Layout::SingleCrate).unwrap();
-        let graph = Arc::new(Mutex::new(g));
         let ctx = Arc::new(TaskCtx::new(
             Uuid::new_v4(),
             root,
             Stage::Architect,
             Role::Writer,
-            graph.clone(),
             workdir,
             Layout::SingleCrate,
             300, 500, 64, 5,
@@ -2919,7 +2885,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_public_validates_and_persists() {
-        let (_tmp, graph, root, ctx) = fixture(Stage::Iface);
+        let (tmp, root, ctx) = fixture(Stage::Iface);
         let tool = SubmitPublicTool { ctx };
         let r = tool
             .call(SubmitRustArgs {
@@ -2928,12 +2894,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.no_change);
-        assert!(graph.lock().get(root).unwrap().public_rs.is_some());
+        assert!(crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.is_some());
     }
 
     #[tokio::test]
     async fn submit_public_rejects_impl_block() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = SubmitPublicTool { ctx };
         let err = tool
             .call(SubmitRustArgs {
@@ -2946,7 +2912,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_public_idempotent_no_change() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = SubmitPublicTool { ctx };
         let body = "pub trait T { fn f(&self); }\n";
         let _ = tool
@@ -2966,7 +2932,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_verdict_records_into_ctx() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = SubmitVerdictTool { ctx: ctx.clone() };
         let _ = tool
             .call(SubmitVerdictArgs {
@@ -2982,7 +2948,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_detection_triggers_after_three_identical_calls() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let body = "pub trait T { fn f(&self); }\n";
         let tool = SubmitPublicTool { ctx };
         let _ = tool
@@ -3170,7 +3136,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_replaces_managed_slot_and_renders() {
-        let (tmp, graph, root, ctx) = fixture(Stage::Iface);
+        let (tmp, root, ctx) = fixture(Stage::Iface);
         let tool = WriteFileTool { ctx };
         // public.rs lives at src/public.rs for the root node in single-crate mode.
         let r = tool
@@ -3182,7 +3148,7 @@ mod tests {
             .unwrap();
         assert!(!r.no_change);
         assert_eq!(
-            graph.lock().get(root).unwrap().public_rs.as_deref(),
+            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.as_deref(),
             Some("pub trait Foo {}\n")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
@@ -3191,7 +3157,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_no_change_when_content_matches() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = WriteFileTool { ctx };
         tool.call(WriteFileArgs {
             path: "src/public.rs".into(),
@@ -3211,7 +3177,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_rejects_unmanaged_path() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = WriteFileTool { ctx };
         let err = tool
             .call(WriteFileArgs {
@@ -3227,13 +3193,12 @@ mod tests {
     #[tokio::test]
     async fn write_file_rejects_other_nodes_slots() {
         // Add a sibling child whose public.rs belongs to it, not root.
-        let (_tmp, graph, _root, ctx) = fixture(Stage::Iface);
-        let _child = graph
-            .lock()
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        let _child = g
             .add_child(ctx.node_id, Node::new("helper", "helper"))
             .unwrap();
-        // re-render with the new child
-        crate::render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        crate::render::render_graph(&ctx.workdir, &g, Layout::SingleCrate).unwrap();
         let tool = WriteFileTool { ctx };
         let err = tool
             .call(WriteFileArgs {
@@ -3248,7 +3213,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_slices_by_line_range() {
-        let (tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (tmp, _root, ctx) = fixture(Stage::Iface);
         std::fs::write(
             tmp.path().join("src/public.rs"),
             "line1\nline2\nline3\nline4\nline5\n",
@@ -3271,7 +3236,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_rejects_parent_dir_traversal() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Iface);
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
         let tool = ReadFileTool { ctx };
         let err = tool
             .call(ReadFileArgs {
@@ -3287,11 +3252,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_range_inserts_between_existing_lines() {
-        let (_tmp, graph, root, ctx) = fixture(Stage::Iface);
+        let (tmp, root, ctx) = fixture(Stage::Iface);
         // Seed public.rs with three lines.
-        graph.lock().get_mut(root).unwrap().public_rs =
+        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        g.get_mut(root).unwrap().public_rs =
             Some("pub trait A {}\npub trait B {}\npub trait C {}\n".into());
-        render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        render::render_graph(&ctx.workdir, &g, Layout::SingleCrate).unwrap();
         let tool = WriteFileRangeTool { ctx };
         // Replace line 2 ("pub trait B {}") with two new lines.
         tool.call(WriteFileRangeArgs {
@@ -3302,7 +3268,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let final_content = graph.lock().get(root).unwrap().public_rs.clone().unwrap();
+        let final_content = crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.clone().unwrap();
         assert_eq!(
             final_content,
             "pub trait A {}\npub trait B {}\npub trait B_inserted {}\npub trait C {}\n"
@@ -3311,10 +3277,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_patch_applies_unified_diff() {
-        let (_tmp, graph, root, ctx) = fixture(Stage::Iface);
-        graph.lock().get_mut(root).unwrap().public_rs =
-            Some("pub trait Old {}\n".into());
-        render::render_graph(&ctx.workdir, &graph.lock(), Layout::SingleCrate).unwrap();
+        let (tmp, root, ctx) = fixture(Stage::Iface);
+        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        g.get_mut(root).unwrap().public_rs = Some("pub trait Old {}\n".into());
+        render::render_graph(&ctx.workdir, &g, Layout::SingleCrate).unwrap();
         let patch = "--- a/src/public.rs\n+++ b/src/public.rs\n@@ -1 +1 @@\n-pub trait Old {}\n+pub trait New {}\n";
         let tool = ApplyPatchTool { ctx };
         let r = tool
@@ -3324,7 +3290,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.files_changed, vec!["src/public.rs".to_string()]);
-        let after = graph.lock().get(root).unwrap().public_rs.clone().unwrap();
+        let after = crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.clone().unwrap();
         assert!(after.contains("New"));
         assert!(!after.contains("Old"));
     }
@@ -3362,7 +3328,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_critique_sets_ctx_critique() {
-        let (_tmp, _g, _root, ctx) = fixture(Stage::Spec);
+        let (_tmp, _root, ctx) = fixture(Stage::Spec);
         let tool = SubmitCritiqueTool { ctx: ctx.clone() };
         tool.call(SubmitCritiqueArgs {
             issues: vec![CritiqueIssue {
