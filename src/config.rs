@@ -42,6 +42,13 @@ pub struct ModelConfig {
     #[serde(default)]
     pub escalated: Option<String>,
 
+    /// Model used by the spec-summary cache to compress ancestor specs
+    /// into 5-10 lines of context-bundle text. Goal here is cheap and
+    /// fast — every uncached ancestor on every node's first stage
+    /// hits this model. Defaults to `default` if unset.
+    #[serde(default)]
+    pub summary: Option<String>,
+
     // ---- Per-stage overrides (apply across all roles in that stage) ----
     #[serde(default)]
     pub architect: Option<String>,
@@ -361,6 +368,7 @@ mod tests {
         ModelConfig {
             default: "default-model".into(),
             escalated: None,
+            summary: None,
             architect: None,
             spec: None,
             iface: None,

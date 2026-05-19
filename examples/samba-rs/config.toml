@@ -38,6 +38,13 @@ architect = "openai/gpt-5.5"
 # swapping to something smarter is often what unsticks it.
 escalated = "deepseek/deepseek-v4-pro"
 
+# Used by the spec-summary cache: ancestor specs get compressed to ~5-10
+# lines via this model before being inlined into context bundles. Goal
+# is cheap+fast (one short call per uncached ancestor spec); accuracy
+# isn't critical because callers fall back to the framework's
+# first-paragraph brief on summarizer failure. Defaults to `default`.
+# summary = "deepseek/deepseek-v4-flash"
+
 # Per-stage examples (commented out; uncomment + edit as desired):
 # spec  = "openai/gpt-5.5              # smarter for spec writing
 # iface = "openai/gpt-5.4-mini"        # simpler for iface scaffolding

@@ -66,6 +66,11 @@ pub struct Engine {
     /// state is flipped to `Paused` for the duration so the UI banner
     /// shows what's happening.
     pub rate_limit_until: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    /// Cache of LLM-summarized ancestor specs. `None` if no summarizer
+    /// is configured (e.g. mock-driver tests). Pre-warmed before each
+    /// run_role's context build; the bundle reads from this cache and
+    /// falls back to the framework's first-paragraph brief on miss.
+    pub spec_summaries: Option<Arc<crate::spec_summary::SpecSummaryCache>>,
 }
 
 impl Engine {
@@ -92,6 +97,11 @@ impl Engine {
         let layout = config.layout();
         let workspace = crate::worktree::Workspace::init(&workdir)?;
         let worktrees = Arc::new(crate::worktree::WorktreePool::new(workspace.clone())?);
+        // Build the spec-summary cache when an OpenRouter client is
+        // wirable — i.e. for production. For mock-driver / test runs,
+        // there's no client at hand so we leave the cache as None and
+        // the context bundle falls back to its existing brief layer.
+        let spec_summaries = build_spec_summary_cache(&config).map(Arc::new);
         Ok(Self {
             config,
             state,
@@ -103,6 +113,7 @@ impl Engine {
             worktrees,
             prices: Arc::new(prices),
             rate_limit_until: Arc::new(parking_lot::Mutex::new(None)),
+            spec_summaries,
         })
     }
 
@@ -932,6 +943,34 @@ impl Engine {
         // bytes for every call across the whole run) so they live in
         // the system prompt below for maximum cache reuse.
         let g_for_ctx = graph::load(wt_path, self.layout).unwrap_or_default();
+
+        // Pre-warm the spec-summary cache for this node's ancestor
+        // chain. Each ancestor's compact summary replaces the
+        // first-paragraph brief in the context bundle. Best-effort:
+        // if summarization fails on any ancestor, the bundle falls
+        // back to the brief for that one (see `ancestor_brief`).
+        if let Some(cache) = self.spec_summaries.as_ref() {
+            let pairs: Vec<(crate::graph::NodeId, String)> = g_for_ctx
+                .ancestors(node_id, false)
+                .into_iter()
+                .filter_map(|aid| {
+                    let a = g_for_ctx.get(aid)?;
+                    let spec = a.spec_public_md.clone()?;
+                    Some((aid, spec))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                let n = cache.prewarm(&pairs).await;
+                if n > 0 {
+                    tracing::debug!(
+                        ancestors = pairs.len(),
+                        newly_summarized = n,
+                        "spec-summary prewarm complete"
+                    );
+                }
+            }
+        }
+
         let mut bundle = node_context::ContextBundle::new();
         let inner = node_context::build_for_stage(
             &g_for_ctx,
@@ -940,6 +979,7 @@ impl Engine {
             self.config.toml.limits.max_nodes,
             self.config.toml.limits.max_node_depth,
             self.layout,
+            self.spec_summaries.as_deref(),
         );
         bundle.extend_from(inner);
         // Cycle context (retry failures, previous critic+reviser output)
@@ -1357,6 +1397,40 @@ fn build_cycle_context(ex: &CycleExtras, args_cap: usize) -> String {
         cyc.push_str("\n\n");
     }
     cyc
+}
+
+/// Build the spec-summary cache from config. Returns `None` if we
+/// can't construct an openrouter client (no API key in env etc.) —
+/// the engine falls back to the framework's first-paragraph brief in
+/// that case, no crash. Tests with mock drivers never go through
+/// this path; they set `spec_summaries: None` explicitly.
+fn build_spec_summary_cache(
+    config: &Config,
+) -> Option<crate::spec_summary::SpecSummaryCache> {
+    let key_var = config
+        .toml
+        .provider
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string());
+    let key = std::env::var(&key_var).ok()?;
+    let mut builder = rig::providers::openrouter::Client::builder().api_key(&key);
+    if let Some(base) = &config.toml.provider.base_url {
+        builder = builder.base_url(base);
+    }
+    let client = builder.build().ok()?;
+    let model = config
+        .toml
+        .models
+        .summary
+        .clone()
+        .unwrap_or_else(|| config.toml.models.default.clone());
+    // Summary calls are short — cap tokens tightly so a runaway
+    // model can't spend a $1 on summarizing a 100-line spec.
+    let summarizer = Arc::new(crate::spec_summary::OpenRouterSummarizer::new(
+        client, model, 512,
+    ));
+    Some(crate::spec_summary::SpecSummaryCache::new(summarizer))
 }
 
 fn gate_kind_for(stage: Stage) -> Option<GateKind> {

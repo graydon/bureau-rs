@@ -20,6 +20,7 @@ fn make_config(workdir: std::path::PathBuf, project_name: &str) -> Arc<Config> {
             models: ModelConfig {
                 default: "mock".into(),
                 escalated: None,
+                summary: None,
                 architect: None,
                 spec: None,
                 iface: None,

@@ -2031,6 +2031,298 @@ impl Tool for ApplyPatchTool {
     }
 }
 
+// --------------------------------------------------------------------------
+// read_item / write_item — single-item read/write on the current node.
+// --------------------------------------------------------------------------
+//
+// These let the model edit a single top-level item (trait, struct,
+// impl, etc.) without re-emitting the whole file. The wins:
+//   1. Tokens: the model writes ~20 lines of replacement instead of
+//      the full {max_file}-line slot every time.
+//   2. Localization: the model doesn't have to remember the rest of
+//      the file; the framework keeps it intact.
+//
+// Slot semantics match `submit_*`: same stage-ownership rules, same
+// per-slot validator runs after the splice on the resulting full
+// content (so you can't sneak a `pub fn` into `public.rs` via
+// `write_item` either).
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ReadItemArgs {
+    /// Which slot to read from: "public", "private", or "tests".
+    pub slot: String,
+    /// One or more top-level item identifiers. For trait/struct/enum/fn/etc.
+    /// just the item's name. For impl blocks, either the self-type alone
+    /// (e.g. `FrobberImpl`) or the full `Trait for SelfType` header
+    /// (e.g. `Frob for FrobberImpl`) when self-type alone is ambiguous.
+    pub names: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ReadItemEntry {
+    pub name: String,
+    pub content: String,
+    pub lines: usize,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ReadItemOk {
+    pub items: Vec<ReadItemEntry>,
+    /// Names the caller asked for that couldn't be resolved (no
+    /// such item, or ambiguous). Present so a multi-name call can
+    /// report partial success cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ReadItemError>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ReadItemError {
+    pub name: String,
+    pub message: String,
+}
+
+pub struct ReadItemTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for ReadItemTool {
+    const NAME: &'static str = "read_item";
+    type Error = ToolFailure;
+    type Args = ReadItemArgs;
+    type Output = ReadItemOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "string", "enum": ["public", "private", "tests"]},
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1
+                    }
+                },
+                "required": ["slot", "names"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<ReadItemOk, _>(e));
+        }
+        let r = read_item_inner(&self.ctx, &args.slot, &args.names);
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+fn read_item_inner(
+    ctx: &Arc<TaskCtx>,
+    slot_name: &str,
+    names: &[String],
+) -> Result<ReadItemOk, ToolFailure> {
+    let slot = parse_submit_slot(slot_name)?;
+    if names.is_empty() {
+        return Err(ToolFailure::Other(
+            "read_item: `names` must be a non-empty array".into(),
+        ));
+    }
+    let g = ctx.load_graph()?;
+    let n = g
+        .get(ctx.node_id)
+        .ok_or_else(|| ToolFailure::Other(format!("node {} missing", ctx.node_id)))?;
+    let content = slot_content(slot, n).ok_or_else(|| {
+        ToolFailure::Other(format!(
+            "read_item: {slot_name}.rs hasn't been authored yet on this node"
+        ))
+    })?;
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for name in names {
+        match crate::rust_summary::read_top_item(&content, name) {
+            Ok(rendered) => {
+                let lines = rendered.lines().count();
+                items.push(ReadItemEntry {
+                    name: name.clone(),
+                    content: rendered,
+                    lines,
+                });
+            }
+            Err(e) => errors.push(ReadItemError {
+                name: name.clone(),
+                message: e.to_string(),
+            }),
+        }
+    }
+    Ok(ReadItemOk { items, errors })
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WriteItemArgs {
+    /// Which slot to edit: "public", "private", or "tests".
+    pub slot: String,
+    /// One or more (name, content) pairs to apply in order. Atomic:
+    /// if ANY replacement fails (item not found, kind mismatch, final
+    /// validator rejection), NONE are applied.
+    pub items: Vec<WriteItemEntry>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WriteItemEntry {
+    /// Identifier of the existing top-level item to replace (same name
+    /// semantics as `read_item`).
+    pub name: String,
+    /// Replacement source. Must parse as exactly ONE top-level Rust
+    /// item of the SAME kind (trait → trait, struct → struct, etc.).
+    /// Attributes, doc comments, and item bodies are all carried into
+    /// the resulting file verbatim.
+    pub content: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct WriteItemOk {
+    pub slot: String,
+    pub bytes: u64,
+    pub lines: usize,
+    /// Names of items that were replaced (preserves caller order).
+    pub items_replaced: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_change: bool,
+}
+
+pub struct WriteItemTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for WriteItemTool {
+    const NAME: &'static str = "write_item";
+    type Error = ToolFailure;
+    type Args = WriteItemArgs;
+    type Output = WriteItemOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "string", "enum": ["public", "private", "tests"]},
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "content": {"type": "string"}
+                            },
+                            "required": ["name", "content"]
+                        }
+                    }
+                },
+                "required": ["slot", "items"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<WriteItemOk, _>(e));
+        }
+        let r = write_item_inner(&self.ctx, &args.slot, &args.items);
+        self.ctx.finish(Self::NAME, r)
+    }
+}
+
+fn write_item_inner(
+    ctx: &Arc<TaskCtx>,
+    slot_name: &str,
+    items: &[WriteItemEntry],
+) -> Result<WriteItemOk, ToolFailure> {
+    let slot = parse_submit_slot(slot_name)?;
+    if items.is_empty() {
+        return Err(ToolFailure::Other(
+            "write_item: `items` must be a non-empty array".into(),
+        ));
+    }
+    // Stage ownership — same as submit_* on this slot.
+    ctx.require_stage(WriteItemTool::NAME, slot.allowed_stages())?;
+    let mut g = ctx.load_graph()?;
+    let n = g
+        .get(ctx.node_id)
+        .ok_or_else(|| ToolFailure::Other(format!("node {} missing", ctx.node_id)))?;
+    let cur = slot_content(slot, n).ok_or_else(|| {
+        ToolFailure::Other(format!(
+            "write_item: {slot_name}.rs hasn't been authored yet — submit the \
+             full slot first via submit_{slot_name}, then use write_item to edit \
+             individual items"
+        ))
+    })?;
+    // Apply each replacement in caller order. If any fails, the whole
+    // call aborts and state is untouched (we haven't written anywhere
+    // yet — `g` is a local clone). All-or-nothing matches the way
+    // `submit_*` validates the FULL submission before persisting.
+    let mut working = cur.clone();
+    let mut replaced: Vec<String> = Vec::new();
+    for entry in items {
+        working = crate::rust_summary::write_top_item(&working, &entry.name, &entry.content)
+            .map_err(|e| {
+                ToolFailure::Other(format!(
+                    "write_item: failed on `{}`: {e} (no items applied)",
+                    entry.name
+                ))
+            })?;
+        replaced.push(entry.name.clone());
+    }
+    // Per-slot validator runs against the FULL resulting file — so any
+    // write_item attempt that snuck in a forbidden form (e.g. a `fn`
+    // in public.rs via "replace the trait with a fn") is rejected
+    // just like submit_public would have rejected it.
+    slot.validate(&working, n, &g)?;
+    let lines = working.lines().count();
+    if lines > ctx.max_file_lines {
+        return Err(ToolFailure::FileTooLarge(lines, ctx.max_file_lines));
+    }
+    let bytes = working.len() as u64;
+    let no_change = cur == working;
+    if !no_change {
+        let n = g.get_mut(ctx.node_id).unwrap();
+        *slot.slot_mut(n) = Some(working);
+        n.updated_at = Utc::now();
+        ctx.render_after_write(&g)?;
+    }
+    Ok(WriteItemOk {
+        slot: slot_name.to_string(),
+        bytes,
+        lines,
+        items_replaced: replaced,
+        no_change,
+    })
+}
+
+fn parse_submit_slot(s: &str) -> Result<SubmitSlot, ToolFailure> {
+    match s {
+        "public" => Ok(SubmitSlot::Public),
+        "private" => Ok(SubmitSlot::Private),
+        "tests" => Ok(SubmitSlot::Tests),
+        _ => Err(ToolFailure::Other(format!(
+            "slot '{s}' is not one of 'public', 'private', 'tests'"
+        ))),
+    }
+}
+
+fn slot_content(slot: SubmitSlot, n: &crate::graph::Node) -> Option<String> {
+    match slot {
+        SubmitSlot::Public => n.public_rs.clone(),
+        SubmitSlot::Private => n.private_rs.clone(),
+        SubmitSlot::Tests => n.tests_rs.clone(),
+    }
+}
+
 fn apply_patch_inner(ctx: &Arc<TaskCtx>, patch_text: &str) -> Result<ApplyPatchOk, ToolFailure> {
     let patches = mpatch::parse_auto(patch_text).map_err(|e| {
         ToolFailure::Other(format!("apply_patch: parse failed: {e}"))
@@ -2548,6 +2840,31 @@ to one crate. Returns warnings up to a small cap."
             kb = READ_FILE_MAX_BYTES / 1024
         ),
 
+        "read_item" => "Read one or more top-level items from a Rust slot on THIS node. \
+            `slot`: \"public\", \"private\", or \"tests\". `names`: array of \
+            item identifiers — for trait/struct/enum/fn/etc. just the name \
+            (`Foo`); for impl blocks, the self-type alone (`FrobberImpl`) or \
+            the full `Trait for SelfType` form (`Frob for FrobberImpl`) when \
+            self-type alone is ambiguous. Returns each item's source verbatim \
+            (preserves doc comments and attributes). Names that can't be \
+            resolved come back in the `errors` array; the rest still return \
+            in `items`. Pair with `write_item` to edit specific items without \
+            re-emitting the whole file."
+            .to_string(),
+
+        "write_item" => format!(
+            "Replace one or more top-level items in a Rust slot on THIS node. \
+            `slot` uses the same convention as `read_item`. `items` is an \
+            array of `{{name, content}}` pairs applied in order; each \
+            `content` must parse as exactly ONE Rust item of the SAME kind \
+            as the existing one (trait → trait, struct → struct, impl → impl, \
+            etc.) — kind mismatch is rejected. The call is ATOMIC: if any \
+            replacement fails, NONE are applied. The resulting full file \
+            goes through the same per-slot validator as `submit_*` (so \
+            forbidden forms like `pub fn` in public.rs are still rejected). \
+            Hard cap: {max_file} lines on the resulting file."
+        ),
+
         "write_file" => format!(
             "Replace the whole content of a managed file. `path` must point at \
             one of THIS node's slots: `<src>/public.rs`, `<src>/private.rs`, \
@@ -2632,6 +2949,8 @@ pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
 pub fn unified_tool_names() -> Vec<&'static str> {
     vec![
         ReadFileTool::NAME,
+        ReadItemTool::NAME,
+        WriteItemTool::NAME,
         SubmitArchitectureTool::NAME,
         SubmitSpecTool::NAME,
         SubmitPublicTool::NAME,
@@ -2660,8 +2979,11 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
     if matches!(role, QuickFixer) {
         return quickfix_tools_for(stage);
     }
-    // read_file is universal — every non-quickfix role can inspect files.
-    let mut v: Vec<&'static str> = vec![ReadFileTool::NAME];
+    // read_file and read_item are universal — every non-quickfix role
+    // can inspect files. read_item only does anything useful on Rust
+    // slots but rejecting it pre-call buys nothing; let the per-call
+    // "slot hasn't been authored" message handle the no-op case.
+    let mut v: Vec<&'static str> = vec![ReadFileTool::NAME, ReadItemTool::NAME];
     match (stage, role) {
         (Architect, Writer) => v.push(SubmitArchitectureTool::NAME),
         (Architect, _) => {} // single-shot stage, non-writer roles produce nothing.
@@ -2673,6 +2995,7 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
         (Iface, Writer) | (Iface, Reviser) => {
             v.push(SubmitPublicTool::NAME);
             v.push(SubmitPrivateTool::NAME);
+            v.push(WriteItemTool::NAME);
             v.push(CargoCheckTool::NAME);
         }
         (Iface, Critic) => {
@@ -2686,6 +3009,7 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
 
         (Tests, Writer) | (Tests, Reviser) => {
             v.push(SubmitTestsTool::NAME);
+            v.push(WriteItemTool::NAME);
             v.push(CargoCheckTool::NAME);
             v.push(CargoTestNoRunTool::NAME);
         }
@@ -2702,6 +3026,7 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
 
         (Impl, Writer) | (Impl, Reviser) => {
             v.push(SubmitPrivateTool::NAME);
+            v.push(WriteItemTool::NAME);
             v.push(CargoCheckTool::NAME);
             v.push(CargoTestTool::NAME);
             v.push(CargoClippyTool::NAME);
@@ -2721,6 +3046,7 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
         (Debug, Writer) | (Debug, Reviser) => {
             v.push(SubmitPrivateTool::NAME);
             v.push(SubmitTestsTool::NAME);
+            v.push(WriteItemTool::NAME);
             v.push(CargoCheckTool::NAME);
             v.push(CargoTestTool::NAME);
             v.push(CargoClippyTool::NAME);
@@ -2750,6 +3076,8 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
 pub fn instantiate_tool(name: &str, ctx: Arc<TaskCtx>) -> Box<dyn rig::tool::ToolDyn> {
     match name {
         n if n == ReadFileTool::NAME => Box::new(ReadFileTool { ctx }),
+        n if n == ReadItemTool::NAME => Box::new(ReadItemTool { ctx }),
+        n if n == WriteItemTool::NAME => Box::new(WriteItemTool { ctx }),
         n if n == SubmitArchitectureTool::NAME => Box::new(SubmitArchitectureTool { ctx }),
         n if n == SubmitSpecTool::NAME => Box::new(SubmitSpecTool { ctx }),
         n if n == SubmitPublicTool::NAME => Box::new(SubmitPublicTool { ctx }),
@@ -2796,8 +3124,10 @@ fn quickfix_tools_for(stage: Stage) -> Vec<&'static str> {
     use Stage::*;
     let mut v = vec![
         ReadFileTool::NAME,
+        ReadItemTool::NAME,
         WriteFileTool::NAME,
         WriteFileRangeTool::NAME,
+        WriteItemTool::NAME,
         ApplyPatchTool::NAME,
     ];
     match stage {
@@ -3249,6 +3579,218 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolFailure::Validate(_)));
+    }
+
+    #[tokio::test]
+    async fn write_item_replaces_in_place_and_persists() {
+        let (tmp, root, ctx) = fixture(Stage::Iface);
+        // Seed public.rs with two items.
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self) -> i32; }\n\
+                      pub trait Bar { fn g(&self) -> i32; }\n"
+                .into(),
+        })
+        .await
+        .unwrap();
+        // Replace only `Foo` — leave `Bar` intact.
+        let tool = WriteItemTool { ctx: ctx.clone() };
+        let r = tool
+            .call(WriteItemArgs {
+                slot: "public".into(),
+                items: vec![WriteItemEntry {
+                    name: "Foo".into(),
+                    content: "pub trait Foo { fn f(&self) -> i64; }".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(!r.no_change);
+        assert_eq!(r.items_replaced, vec!["Foo".to_string()]);
+        // Verify the resulting public.rs has the new Foo + unchanged Bar.
+        let g = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap();
+        let pub_rs = g.get(root).unwrap().public_rs.clone().unwrap();
+        assert!(pub_rs.contains("fn f(&self) -> i64"));
+        assert!(pub_rs.contains("pub trait Bar"));
+        assert!(!pub_rs.contains("fn f(&self) -> i32"));
+    }
+
+    #[tokio::test]
+    async fn write_item_multiple_items_atomic() {
+        // Two replacements in one call. Both succeed → both land.
+        let (tmp, root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self) -> i32; }\n\
+                      pub trait Bar { fn g(&self) -> i32; }\n"
+                .into(),
+        })
+        .await
+        .unwrap();
+        let tool = WriteItemTool { ctx: ctx.clone() };
+        let r = tool
+            .call(WriteItemArgs {
+                slot: "public".into(),
+                items: vec![
+                    WriteItemEntry {
+                        name: "Foo".into(),
+                        content: "pub trait Foo { fn f(&self) -> i64; }".into(),
+                    },
+                    WriteItemEntry {
+                        name: "Bar".into(),
+                        content: "pub trait Bar { fn g(&self) -> u8; }".into(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.items_replaced, vec!["Foo".to_string(), "Bar".to_string()]);
+        let g = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap();
+        let pub_rs = g.get(root).unwrap().public_rs.clone().unwrap();
+        assert!(pub_rs.contains("fn f(&self) -> i64"));
+        assert!(pub_rs.contains("fn g(&self) -> u8"));
+    }
+
+    #[tokio::test]
+    async fn write_item_multiple_atomic_on_partial_failure() {
+        // First replacement OK, second references a missing item.
+        // Atomic: NEITHER applies; file stays as it was.
+        let (tmp, root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        let original = "pub trait Foo { fn f(&self) -> i32; }\n";
+        sub.call(SubmitRustArgs {
+            content: original.into(),
+        })
+        .await
+        .unwrap();
+        let tool = WriteItemTool { ctx: ctx.clone() };
+        let err = tool
+            .call(WriteItemArgs {
+                slot: "public".into(),
+                items: vec![
+                    WriteItemEntry {
+                        name: "Foo".into(),
+                        content: "pub trait Foo { fn f(&self) -> i64; }".into(),
+                    },
+                    WriteItemEntry {
+                        name: "Nonexistent".into(),
+                        content: "pub trait Nonexistent {}".into(),
+                    },
+                ],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolFailure::Other(ref m) if m.contains("no items applied")));
+        // File on disk unchanged.
+        let g = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap();
+        let pub_rs = g.get(root).unwrap().public_rs.clone().unwrap();
+        assert!(pub_rs.contains("fn f(&self) -> i32"));
+        assert!(!pub_rs.contains("i64"));
+    }
+
+    #[tokio::test]
+    async fn write_item_runs_public_validator_on_result() {
+        // Even when only one item changes, the per-slot validator
+        // checks the whole resulting file. Sneaking a forbidden form
+        // (here: `pub fn` in public.rs) must still fail.
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self); }\n".into(),
+        })
+        .await
+        .unwrap();
+        let tool = WriteItemTool { ctx };
+        let err = tool
+            .call(WriteItemArgs {
+                slot: "public".into(),
+                items: vec![WriteItemEntry {
+                    name: "Foo".into(),
+                    content: "pub fn Foo() -> i32 { 42 }".into(),
+                }],
+            })
+            .await
+            .unwrap_err();
+        // Either kind-mismatch (trait → fn) or validator rejection.
+        assert!(matches!(err, ToolFailure::Other(_) | ToolFailure::Validate(_)));
+    }
+
+    #[tokio::test]
+    async fn read_item_returns_one_item() {
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self) -> i32; }\n\
+                      pub struct Bar;\n"
+                .into(),
+        })
+        .await
+        .unwrap();
+        let tool = ReadItemTool { ctx };
+        let r = tool
+            .call(ReadItemArgs {
+                slot: "public".into(),
+                names: vec!["Foo".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].name, "Foo");
+        assert!(r.items[0].content.contains("pub trait Foo"));
+        assert!(!r.items[0].content.contains("Bar"));
+        assert!(r.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_item_returns_multiple_items_in_one_call() {
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self) -> i32; }\n\
+                      pub trait Bar { fn g(&self) -> i32; }\n\
+                      pub struct Baz;\n"
+                .into(),
+        })
+        .await
+        .unwrap();
+        let tool = ReadItemTool { ctx };
+        let r = tool
+            .call(ReadItemArgs {
+                slot: "public".into(),
+                names: vec!["Foo".into(), "Bar".into(), "Baz".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.items.len(), 3);
+        assert!(r.errors.is_empty());
+        let names: Vec<_> = r.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Foo", "Bar", "Baz"]);
+    }
+
+    #[tokio::test]
+    async fn read_item_partial_success_reports_errors() {
+        // Some names resolve, others don't — partial-success returns
+        // the resolved ones in `items` and the failures in `errors`.
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let sub = SubmitPublicTool { ctx: ctx.clone() };
+        sub.call(SubmitRustArgs {
+            content: "pub trait Foo { fn f(&self) -> i32; }\n".into(),
+        })
+        .await
+        .unwrap();
+        let tool = ReadItemTool { ctx };
+        let r = tool
+            .call(ReadItemArgs {
+                slot: "public".into(),
+                names: vec!["Foo".into(), "Nonexistent".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].name, "Foo");
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].name, "Nonexistent");
+        assert!(r.errors[0].message.contains("Foo")); // available list mentions Foo
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@ pub mod placeholders;
 pub mod pricing;
 pub mod prompts;
 pub mod render;
+pub mod rust_summary;
+pub mod spec_summary;
 pub mod state;
 pub mod tools;
 pub mod web;
