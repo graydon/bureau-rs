@@ -126,11 +126,10 @@ async fn engine_injects_project_mission_into_root_node_preamble() {
 
 #[tokio::test]
 async fn unresolved_tool_failure_triggers_forced_retry_until_resolved() {
-    // The actor calls decompose with a self-dep (fail), then submit_spec
-    // (success). With tool_retry_budget = 2, the framework should fire a
-    // fresh drive() for the unresolved decompose failure. We script the
-    // retry to call decompose again with VALID args; it succeeds and the
-    // child is created.
+    // The actor's first submit_spec call fails (empty public — atomic
+    // failure). With tool_retry_budget = 2, the framework should fire
+    // a fresh drive() for the unresolved failure. We script the retry
+    // to call submit_spec again with VALID args; it succeeds.
     let tmp = tempfile::tempdir().unwrap();
     let workdir = tmp.path().to_path_buf();
     let mut config = (*make_config(workdir.clone(), "retry")).clone();
@@ -318,12 +317,12 @@ async fn args_display_cap_is_configurable_and_respected() {
 }
 
 #[tokio::test]
-async fn failed_decompose_in_actor_turn_surfaces_to_critic_and_reviser() {
-    // The user-reported bug: an actor turn calls `decompose`, gets a
-    // validation error (e.g. self-dep), still calls submit_spec, then
-    // ends. The framework used to lose the decomposition silently. This
-    // test pins the new behavior: the next role's preamble explicitly
-    // calls out the failed tool call so the model can retry.
+async fn failed_tool_call_in_actor_turn_surfaces_to_critic_and_reviser() {
+    // The user-reported bug: an actor turn fires a tool call that gets
+    // a validation error, then ends without retrying. The framework
+    // used to lose the failed call silently. This test pins the new
+    // behavior: the next role's preamble explicitly calls out the
+    // failed tool call so the model can address it.
     let tmp = tempfile::tempdir().unwrap();
     let workdir = tmp.path().to_path_buf();
     let mut config = (*make_config(workdir.clone(), "split")).clone();
@@ -564,7 +563,7 @@ use super::public::*;
 }
 
 #[tokio::test]
-async fn engine_decomposes_root_then_advances_children() {
+async fn engine_builds_tree_then_advances_children() {
     let tmp = tempfile::tempdir().unwrap();
     let workdir = tmp.path().to_path_buf();
     let config = make_config(workdir.clone(), "split");
@@ -584,12 +583,13 @@ async fn engine_decomposes_root_then_advances_children() {
             "core math primitives",
         )])],
     );
-    // Root spec: thin umbrella spec, no decompose (architect already did).
+    // Root spec: thin umbrella spec — the architect already laid out
+    // the children, so the spec stage just writes prose.
     driver.script(
         Stage::Spec,
         Role::Writer,
         vec![ScriptedCall::submit_spec(
-            "# split\n\nThe split crate. Decomposed by architect into `core`.",
+            "# split\n\nThe split crate. Architect laid out one child: `core`.",
         )],
     );
     // Child spec.
@@ -655,7 +655,7 @@ async fn engine_decomposes_root_then_advances_children() {
     let snap = state.snapshot();
     let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     if !result.is_ok() {
-        eprintln!("---- decompose-test diagnostic ----");
+        eprintln!("---- tree-build-test diagnostic ----");
         for n in g.iter() {
             eprintln!(
                 "node {} stages spec={:?} iface={:?} tests={:?} impl={:?}",

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "bureau-rs", about = "Hierarchical decomposition agent for Rust projects")]
+#[command(name = "bureau-rs", about = "Multi-stage agent orchestrator for generating Rust projects")]
 struct Cli {
     /// Configuration directory containing problem.md and config.toml.
     config_dir: PathBuf,

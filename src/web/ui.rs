@@ -120,6 +120,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
                          color: var(--border); user-select: none; }
   .phase-pill.clickable { cursor: pointer; }
   .phase-pill.clickable:hover { outline: 1px solid var(--accent); }
+  .clickable-chip { cursor: pointer; user-select: none; }
+  .clickable-chip:hover { color: var(--accent); }
+  .task.attempt { padding: 2px 6px; opacity: 0.85; }
   .children { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 4px; }
   .task { padding: 4px 6px; border-radius: 3px; cursor: pointer; font-size: 11px; }
   .task:hover { background: var(--bg2); }
@@ -555,21 +558,24 @@ function renderNodeRecursive(parent, nodeId) {
   }
 }
 
+// Per-group expansion state for the task list. When the user clicks
+// the "×N" attempt badge, the group expands to show each individual
+// attempt on its own row. Keyed by "node_name|stage".
+const expandedTaskGroups = {};
+
 function renderTasks() {
   const el = document.getElementById('task-list');
   el.innerHTML = '';
-  // Dedupe by (node_name, stage): retries and integrator passes create
-  // fresh task UUIDs for the same (node, stage), which made the list
-  // look like the same row appearing 3-4 times. We keep only the
-  // most-recently-started one per (node, stage) and show retry count
-  // separately. The user can still click into older attempts from
-  // the issues list or the graph's phase pills.
-  const grouped = new Map(); // "node|stage" -> { latest, count, totalCost }
+  // Group by (node_name, stage): retries create fresh task UUIDs for
+  // the same (node, stage). We collapse to one row per group by
+  // default; the "×N" badge is clickable to expand and reveal every
+  // attempt, each clickable to select its own transcript.
+  const grouped = new Map(); // "node|stage" -> { latest, attempts: [], totalIn, totalOut }
   for (const t of Object.values(state.tasks || {})) {
     const key = t.node_name + '|' + t.stage;
     let g = grouped.get(key);
-    if (!g) { g = { latest: t, count: 0, totalIn: 0, totalOut: 0 }; grouped.set(key, g); }
-    g.count++;
+    if (!g) { g = { latest: t, attempts: [], totalIn: 0, totalOut: 0, key }; grouped.set(key, g); }
+    g.attempts.push(t);
     g.totalIn += (t.cost?.input_tokens || 0);
     g.totalOut += (t.cost?.output_tokens || 0);
     if ((t.started_at || '') > (g.latest.started_at || '')) g.latest = t;
@@ -580,18 +586,64 @@ function renderTasks() {
   );
   for (const g of rows.slice(0, 30)) {
     const t = g.latest;
+    const count = g.attempts.length;
+    const expanded = !!expandedTaskGroups[g.key];
+
+    // Main row: shows the latest attempt's stats. Clicking the body
+    // selects the latest attempt. Clicking the "×N" chip toggles
+    // expansion to show prior attempts.
     const div = document.createElement('div');
     div.className = 'task' + (t.id === selectedTaskId ? ' selected' : '');
     const tokens = g.totalIn + g.totalOut;
-    const attemptsTag = g.count > 1 ? ` <span class="muted">×${g.count}</span>` : '';
+    const attemptsChip = count > 1
+      ? ` <span class="muted clickable-chip" data-action="toggle-attempts">${expanded ? '▾' : '▸'}×${count}</span>`
+      : '';
     div.innerHTML = `
       <span class="entity">task</span>
-      <strong>${escapeHtml(t.node_name)}</strong>${attemptsTag}
+      <strong>${escapeHtml(t.node_path || t.node_name)}</strong>${attemptsChip}
       <span class="phase">${t.stage}</span>
       <span class="status ${t.status}">${t.status}</span>
       <span class="muted">${fmt(tokens)} tok</span>`;
-    div.onclick = () => { selectTask(t.id); };
+    div.onclick = (e) => {
+      // Clicking the attempts chip toggles expansion, NOT the row click.
+      const chip = e.target.closest('[data-action="toggle-attempts"]');
+      if (chip) {
+        e.stopPropagation();
+        expandedTaskGroups[g.key] = !expandedTaskGroups[g.key];
+        markDirty('tasks');
+        render();
+        return;
+      }
+      selectTask(t.id);
+    };
     el.appendChild(div);
+
+    // Expanded: render each attempt as its own row (newest-first),
+    // indented under the group's main row.
+    if (expanded) {
+      const sorted = [...g.attempts].sort(
+        (a, b) => (b.started_at || '').localeCompare(a.started_at || '')
+      );
+      sorted.forEach((at, idx) => {
+        const sub = document.createElement('div');
+        sub.className = 'task attempt' + (at.id === selectedTaskId ? ' selected' : '');
+        sub.style.marginLeft = '14px';
+        sub.style.fontSize = '11px';
+        const subTokens = (at.cost?.input_tokens || 0) + (at.cost?.output_tokens || 0);
+        const which = sorted.length - idx; // "attempt N of M" where 1 is oldest
+        sub.innerHTML = `
+          <span class="muted">attempt ${which}</span>
+          <span class="phase">${at.stage}</span>
+          <span class="status ${at.status}">${at.status}</span>
+          <span class="muted">${fmt(subTokens)} tok</span>
+          <span class="muted">${escapeHtml((at.started_at || '').replace('T', ' ').slice(0, 19))}</span>`;
+        sub.onclick = (e) => {
+          e.stopPropagation();
+          selectTask(at.id);
+        };
+        el.appendChild(sub);
+      });
+    }
   }
 }
 
@@ -660,7 +712,7 @@ function renderTranscript() {
   const t = state.tasks?.[selectedTaskId];
   if (!t) { el.innerHTML = '<div class="muted">Task not found.</div>'; return; }
   document.getElementById('task-title').textContent =
-    `${t.node_name} · ${t.stage} · ${t.status}`;
+    `${t.node_path || t.node_name} · ${t.stage} · ${t.status}`;
   el.innerHTML = '';
   (t.transcript || []).forEach((e, i) => {
     const cls = (e.kind && e.kind.type) || 'note';
@@ -832,7 +884,7 @@ async function refreshIssues() {
       <div>
         <span class="status ${it.status}">${it.status || 'permanent'}</span>
         <span class="phase">${it.stage}</span>
-        <strong>${escapeHtml(it.node_name)}</strong>
+        <strong>${escapeHtml(it.node_path || it.node_name)}</strong>
         ${it.tool ? `<span class="muted">${escapeHtml(it.tool)}</span>` : ''}
       </div>
       <div class="imsg">${escapeHtml(it.message)}</div>`;

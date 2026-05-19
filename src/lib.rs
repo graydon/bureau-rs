@@ -1,4 +1,6 @@
 pub mod config;
+pub mod crates_io;
+pub mod docs_rs;
 pub mod engine;
 pub mod event_log;
 pub mod gate;

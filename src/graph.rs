@@ -1,4 +1,4 @@
-//! The decomposition graph.
+//! The project's node graph.
 //!
 //! Each `Node` represents one abstraction with a public interface and hidden
 //! internals. Nodes are arranged in two overlaid graphs:
@@ -10,10 +10,12 @@
 //!   (filesystem nesting), but the dep graph also admits cross-subtree
 //!   edges (e.g. unrelated nodes both depending on a shared utility).
 //!
-//! The orchestrator owns the graph; the model builds it up via `decompose`
-//! calls. Each node passes through stages (spec, iface, tests, impl, debug,
-//! opt) tracked per-node so the scheduler can run independent stages in
-//! parallel and dep-order anything that needs to compile.
+//! The orchestrator owns the graph. The architect stage builds the WHOLE
+//! tree in one `submit_architecture` call; subsequent stages don't add
+//! nodes (the spec stage CAN add dep edges via `submit_spec.deps`). Each
+//! node passes through stages (spec, iface, tests, impl, debug) tracked
+//! per-node so the scheduler can run independent stages in parallel and
+//! dep-order anything that needs to compile.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};

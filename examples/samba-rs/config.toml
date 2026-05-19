@@ -23,7 +23,8 @@ layout = "workspace"
 # default = "nvidia/nemotron-3-super-120b-a12b:free"
 # default = "qwen/qwen3.5-flash-02-23"
 # default = "tencent/hy3-preview"
-default = "deepseek/deepseek-v4-flash"
+# default = "deepseek/deepseek-v4-flash"
+default = "openai/gpt-oss-120b:cerebras"
 
 # Architect lays out the entire project tree in ONE call — it deserves
 # the strongest model you have. Suggested alternatives:
@@ -36,7 +37,7 @@ architect = "openai/gpt-5.5"
 # other field. Rationale: if the cheap default got stuck on a (node,
 # stage), retrying with the same model usually re-fails the same way;
 # swapping to something smarter is often what unsticks it.
-escalated = "deepseek/deepseek-v4-pro"
+# escalated = "deepseek/deepseek-v4-pro"
 
 # Used by the spec-summary cache: ancestor specs get compressed to ~5-10
 # lines via this model before being inlined into context bundles. Goal

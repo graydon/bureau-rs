@@ -2,20 +2,27 @@
 //!
 //! Three families:
 //!
-//! 1. **Slot-fillers** — `submit_spec`, `submit_public`, `submit_private`,
+//! 1. **Tree builder** — `submit_architecture`. Architect-stage only.
+//!    Lays out the whole project's node tree (crates, modules, dep
+//!    edges, external crates) in one call. After this runs, the tree
+//!    is fixed.
+//!
+//! 2. **Slot-fillers** — `submit_spec`, `submit_public`, `submit_private`,
 //!    `submit_tests`. Each writes a single, well-defined slot of the
 //!    currently-active node. The framework re-renders the on-disk source
 //!    tree after every successful submit. The model never names file paths.
-//!
-//! 2. **Graph mutators** — `decompose`. Adds children and/or self-deps to
-//!    the current node. Cycle-checked, name-validated, dep-validated.
 //!
 //! 3. **Diagnostics** — `cargo_check`, `cargo_test`, `cargo_test_no_run`,
 //!    `cargo_clippy`. Read-only; let the model iterate within a turn.
 //!
 //! 4. **Verdict** — `submit_verdict`. Judge-only.
 //!
-//! 5. **Quickfix file-edit tools** — `read_file`, `write_file`,
+//! 5. **Item-level read/write** — `read_item` / `write_item`. Read or
+//!    replace a single top-level item in one of THIS node's slots
+//!    (trait, struct, impl, etc.). Available everywhere a slot is
+//!    writable.
+//!
+//! 6. **Quickfix file-edit tools** — `read_file`, `write_file`,
 //!    `write_file_range`, `apply_patch`. `read_file` is registered on
 //!    every role (it's read-only). The write/patch trio is only
 //!    registered for the QuickFixer role and is scoped to slots owned
@@ -100,7 +107,7 @@ pub struct TaskCtx {
     pub max_file_lines: usize,
     pub max_spec_section_lines: usize,
     /// Hard cap on the total number of nodes the graph may hold. The
-    /// decompose tool refuses to exceed it.
+    /// architect refuses to build a tree that exceeds this.
     pub max_nodes: usize,
     /// Hard cap on the depth of the node tree (root is depth 0).
     pub max_node_depth: usize,
@@ -493,10 +500,12 @@ impl TaskCtx {
     ///
     /// Does NOT emit [`UiEvent::GraphTopologyChanged`] — that signal
     /// is reserved for the small set of tools that actually mutate
-    /// topology (architect, decompose, root seed). Firing it on every
-    /// content-only `submit_*` would have the client refetching
-    /// `/api/graph` dozens of times per second under normal write
-    /// load, which was overwhelming the BroadcastStream consumer.
+    /// topology (architect's `submit_architecture`, root seed,
+    /// /api/reset_node, and the spec-stage path that adds new dep
+    /// edges via `submit_spec`). Firing it on every content-only
+    /// `submit_*` would have the client refetching `/api/graph`
+    /// dozens of times per second under normal write load, which was
+    /// overwhelming the BroadcastStream consumer.
     fn render_after_write(&self, graph: &NodeGraph) -> Result<(), ToolFailure> {
         let report = render::render_graph(&self.workdir, graph, self.layout)
             .map_err(|e| ToolFailure::Other(format!("re-render failed: {e}")))?;
@@ -507,7 +516,7 @@ impl TaskCtx {
     /// Like [`Self::render_after_write`] but also fires
     /// [`UiEvent::GraphTopologyChanged`]. Call this from tools that
     /// added / removed nodes or dep edges (architect's
-    /// `submit_architecture`, decompose's child-add path) so the UI
+    /// `submit_architecture`, spec's dep-add path) so the UI
     /// refetches `/api/graph` and repaints the tree. The other
     /// `submit_*` tools just fill slot content and use the plain
     /// version.
@@ -526,10 +535,9 @@ impl TaskCtx {
 // breaking the writer's output across multiple tool calls (each one would
 // be a separate API roundtrip shipping the full transcript). Instead the
 // writer makes ONE `submit_spec` call carrying the whole submission:
-// public spec content, optional private notes, optional children to
-// create, optional dep edges to add. The schema dynamically hides the
-// `children` field when the decomposition cap is exhausted, which gives
-// the same enforcement-by-absence as filtering tools out of the catalog.
+// public spec content, optional private notes, optional dep edges to
+// add. The architect has already laid out the tree, so this stage
+// cannot add children.
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SubmitSpecArgs {
@@ -2323,6 +2331,248 @@ fn slot_content(slot: SubmitSlot, n: &crate::graph::Node) -> Option<String> {
     }
 }
 
+// --------------------------------------------------------------------------
+// search_crates / crate_docs / docs_lookup — let the model verify external
+// dependencies before declaring them, and explore their APIs without
+// reaching for `read_file` on the operator's local cargo registry.
+// --------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SearchCratesArgs {
+    /// One or more search queries — each runs against crates.io and
+    /// produces its own hit list. Use this to verify several names /
+    /// capability descriptions in one tool call.
+    pub queries: Vec<String>,
+    /// Per-query result cap (1..25). Default 10.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SearchCratesOk {
+    pub results: Vec<crate::crates_io::SearchHit>,
+}
+
+pub struct SearchCratesTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for SearchCratesTool {
+    const NAME: &'static str = "search_crates";
+    type Error = ToolFailure;
+    type Args = SearchCratesArgs;
+    type Output = SearchCratesOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 25}
+                },
+                "required": ["queries"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<SearchCratesOk, _>(e));
+        }
+        if args.queries.is_empty() {
+            return self.ctx.finish(
+                Self::NAME,
+                Err::<SearchCratesOk, _>(ToolFailure::Other(
+                    "search_crates: `queries` must be a non-empty array".into(),
+                )),
+            );
+        }
+        // Cap batch size to keep crates.io / our latency reasonable.
+        let queries: Vec<String> = args.queries.into_iter().take(20).collect();
+        let limit = args.limit.unwrap_or(10).clamp(1, 25);
+        let results = crate::crates_io::search_many(queries, limit).await;
+        self.ctx
+            .finish(Self::NAME, Ok::<_, ToolFailure>(SearchCratesOk { results }))
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct CrateDocsArgs {
+    /// One or more crates to fetch docs for. Each entry can specify
+    /// an optional version (default `latest`). All requests run in
+    /// parallel; per-crate failures don't sink the batch.
+    pub crates: Vec<CrateDocsEntry>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct CrateDocsEntry {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CrateDocsOk {
+    pub results: Vec<crate::docs_rs::DocsHit>,
+}
+
+pub struct CrateDocsTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for CrateDocsTool {
+    const NAME: &'static str = "crate_docs";
+    type Error = ToolFailure;
+    type Args = CrateDocsArgs;
+    type Output = CrateDocsOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "crates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "version": {"type": "string"}
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["crates"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<CrateDocsOk, _>(e));
+        }
+        if args.crates.is_empty() {
+            return self.ctx.finish(
+                Self::NAME,
+                Err::<CrateDocsOk, _>(ToolFailure::Other(
+                    "crate_docs: `crates` must be a non-empty array".into(),
+                )),
+            );
+        }
+        // Cap batch size — docs pages are bigger than search results,
+        // and we don't want to hammer docs.rs from a single call.
+        let requests: Vec<crate::docs_rs::DocsRequest> = args
+            .crates
+            .into_iter()
+            .take(12)
+            .map(|e| crate::docs_rs::DocsRequest {
+                name: e.name,
+                version: e.version,
+                path: None,
+            })
+            .collect();
+        let results = crate::docs_rs::fetch_many(requests).await;
+        self.ctx
+            .finish(Self::NAME, Ok::<_, ToolFailure>(CrateDocsOk { results }))
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct DocsLookupArgs {
+    /// One or more docs.rs item pages to fetch. Each entry names the
+    /// crate, an optional version, and the sub-path beyond the crate
+    /// root. All run in parallel.
+    pub lookups: Vec<DocsLookupEntry>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct DocsLookupEntry {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Sub-path beyond the crate root, e.g.
+    /// `"block_api/struct.Md4Core.html"`.
+    pub path: String,
+}
+
+pub struct DocsLookupTool {
+    pub ctx: Arc<TaskCtx>,
+}
+
+impl Tool for DocsLookupTool {
+    const NAME: &'static str = "docs_lookup";
+    type Error = ToolFailure;
+    type Args = DocsLookupArgs;
+    type Output = CrateDocsOk;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: tool_description(Self::NAME, self.ctx.prompt_limits()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "lookups": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "version": {"type": "string"},
+                                "path": {"type": "string"}
+                            },
+                            "required": ["name", "path"]
+                        }
+                    }
+                },
+                "required": ["lookups"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Err(e) = self.ctx.record_call_check_loop(Self::NAME, &args) {
+            return self.ctx.finish(Self::NAME, Err::<CrateDocsOk, _>(e));
+        }
+        if args.lookups.is_empty() {
+            return self.ctx.finish(
+                Self::NAME,
+                Err::<CrateDocsOk, _>(ToolFailure::Other(
+                    "docs_lookup: `lookups` must be a non-empty array".into(),
+                )),
+            );
+        }
+        let requests: Vec<crate::docs_rs::DocsRequest> = args
+            .lookups
+            .into_iter()
+            .take(12)
+            .map(|e| crate::docs_rs::DocsRequest {
+                name: e.name,
+                version: e.version,
+                path: Some(e.path),
+            })
+            .collect();
+        let results = crate::docs_rs::fetch_many(requests).await;
+        self.ctx
+            .finish(Self::NAME, Ok::<_, ToolFailure>(CrateDocsOk { results }))
+    }
+}
+
 fn apply_patch_inner(ctx: &Arc<TaskCtx>, patch_text: &str) -> Result<ApplyPatchOk, ToolFailure> {
     let patches = mpatch::parse_auto(patch_text).map_err(|e| {
         ToolFailure::Other(format!("apply_patch: parse failed: {e}"))
@@ -2710,7 +2960,7 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
               stages; not a binding contract.\n\
             \n\
             Sizing: the framework caps total node count and depth (visible in the \
-            Decomposition budget section). Aim shallower-and-broader rather than \
+            Architecture budget section). Aim shallower-and-broader rather than \
             deeper-and-narrower. Each leaf module ≈ one Rust file (per-file cap \
             {max_file} lines)."
         ),
@@ -2840,6 +3090,44 @@ to one crate. Returns warnings up to a small cap."
             kb = READ_FILE_MAX_BYTES / 1024
         ),
 
+        "search_crates" => "BATCHED. Search crates.io for one or more queries in \
+            parallel. Use this BEFORE declaring external crates in \
+            `submit_architecture`'s `external_deps` — so you don't propose names \
+            that don't exist (cargo will fail the workspace gate with \
+            `error: no matching package named 'X'`). Scatter-gather all your \
+            candidate names in ONE call. \
+            `queries`: array of free-text searches (up to 20; each matches against \
+            crate name, description, readme). `limit`: per-query result cap, \
+            1..25, default 10. \
+            Returns `{results: [{query, crates?: [{name, description, \
+            max_stable_version, max_version, recent_downloads}], error?}]}` — \
+            each query's outcome echoed back. A failed query doesn't sink the \
+            others. For deeper inspection follow up with `crate_docs`."
+            .to_string(),
+
+        "crate_docs" => "BATCHED. Fetch the docs.rs landing page for one or more \
+            crates in parallel and return their extracted markdown. Trafilatura \
+            strips nav/sidebar chrome so what you get is the crate-level rustdoc \
+            (top trait/struct/fn declarations, intro prose, usage examples). \
+            `crates`: array of `{name, version?}` (up to 12; `version` defaults to \
+            `latest`). \
+            Returns `{results: [{name, version?, page?: {url, title, content}, \
+            error?}]}` — each entry's outcome echoed back. Use after `search_crates` \
+            to verify a handful of candidates do what you want. For item-level \
+            docs (one struct's method list, etc.) follow up with `docs_lookup`."
+            .to_string(),
+
+        "docs_lookup" => "BATCHED. Fetch one or more specific item pages on docs.rs \
+            in parallel and return their extracted markdown. \
+            `lookups`: array of `{name, version?, path}` (up to 12). `path` is the \
+            sub-path beyond the crate root, e.g. \
+            `\"block_api/struct.Md4Core.html\"` for \
+            `https://docs.rs/md4/latest/md4/block_api/struct.Md4Core.html`. \
+            Returns `{results: [{name, version?, path?, page?: {url, title, \
+            content}, error?}]}`. Use when `crate_docs` told you a type or trait \
+            exists and you need its full surface."
+            .to_string(),
+
         "read_item" => "Read one or more top-level items from a Rust slot on THIS node. \
             `slot`: \"public\", \"private\", or \"tests\". `names`: array of \
             item identifiers — for trait/struct/enum/fn/etc. just the name \
@@ -2951,6 +3239,9 @@ pub fn unified_tool_names() -> Vec<&'static str> {
         ReadFileTool::NAME,
         ReadItemTool::NAME,
         WriteItemTool::NAME,
+        SearchCratesTool::NAME,
+        CrateDocsTool::NAME,
+        DocsLookupTool::NAME,
         SubmitArchitectureTool::NAME,
         SubmitSpecTool::NAME,
         SubmitPublicTool::NAME,
@@ -2979,11 +3270,17 @@ pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
     if matches!(role, QuickFixer) {
         return quickfix_tools_for(stage);
     }
-    // read_file and read_item are universal — every non-quickfix role
-    // can inspect files. read_item only does anything useful on Rust
-    // slots but rejecting it pre-call buys nothing; let the per-call
-    // "slot hasn't been authored" message handle the no-op case.
-    let mut v: Vec<&'static str> = vec![ReadFileTool::NAME, ReadItemTool::NAME];
+    // Universal tools: read_file + read_item (inspect this project's
+    // own files), and search_crates + crate_docs + docs_lookup
+    // (inspect external crates on crates.io / docs.rs). All read-only;
+    // safe everywhere.
+    let mut v: Vec<&'static str> = vec![
+        ReadFileTool::NAME,
+        ReadItemTool::NAME,
+        SearchCratesTool::NAME,
+        CrateDocsTool::NAME,
+        DocsLookupTool::NAME,
+    ];
     match (stage, role) {
         (Architect, Writer) => v.push(SubmitArchitectureTool::NAME),
         (Architect, _) => {} // single-shot stage, non-writer roles produce nothing.
@@ -3078,6 +3375,9 @@ pub fn instantiate_tool(name: &str, ctx: Arc<TaskCtx>) -> Box<dyn rig::tool::Too
         n if n == ReadFileTool::NAME => Box::new(ReadFileTool { ctx }),
         n if n == ReadItemTool::NAME => Box::new(ReadItemTool { ctx }),
         n if n == WriteItemTool::NAME => Box::new(WriteItemTool { ctx }),
+        n if n == SearchCratesTool::NAME => Box::new(SearchCratesTool { ctx }),
+        n if n == CrateDocsTool::NAME => Box::new(CrateDocsTool { ctx }),
+        n if n == DocsLookupTool::NAME => Box::new(DocsLookupTool { ctx }),
         n if n == SubmitArchitectureTool::NAME => Box::new(SubmitArchitectureTool { ctx }),
         n if n == SubmitSpecTool::NAME => Box::new(SubmitSpecTool { ctx }),
         n if n == SubmitPublicTool::NAME => Box::new(SubmitPublicTool { ctx }),
@@ -3205,6 +3505,7 @@ mod tests {
                     id: task_id,
                     node_id: ctx_no_state.node_id,
                     node_name: "app".into(),
+                    node_path: "crate".into(),
                     stage,
                     status: crate::state::TaskStatus::Running,
                     model: "mock".into(),
@@ -3825,8 +4126,8 @@ mod tests {
         assert!(r2.no_change);
     }
 
-    // (Tests for spec-stage decomposition removed — `submit_spec` no
-    // longer accepts `children`. Decomposition is now exclusively the
+    // (Old child-adding tests removed — `submit_spec` no longer
+    // accepts a `children` field. Tree layout is exclusively the
     // architect stage's job; see the architect tests above.)
 
     #[tokio::test]
@@ -3884,8 +4185,10 @@ mod tests {
         }
         // Quickfix is the exception — different mode, different tools.
         assert_ne!(tool_names_for(Stage::Iface, Role::QuickFixer), baseline);
-        // The composite tool replaces the separate public/private/decompose
-        // trio — those legacy names must NOT appear anywhere.
+        // Legacy tool names from earlier designs must NOT appear in
+        // the unified catalog — they're either replaced by composite
+        // tools (`submit_spec`) or by the architect-stage tree builder
+        // (`submit_architecture`).
         assert!(!baseline.contains(&"submit_spec_public"));
         assert!(!baseline.contains(&"submit_spec_private"));
         assert!(!baseline.contains(&"decompose"));

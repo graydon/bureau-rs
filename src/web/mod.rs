@@ -286,6 +286,9 @@ struct Issue {
     task_id: Uuid,
     node_id: NodeId,
     node_name: String,
+    /// Fully-qualified module path (`crate::a::b::c`). Falls back to
+    /// `node_name` if the task didn't have one populated.
+    node_path: String,
     stage: String,
     timestamp: chrono::DateTime<chrono::Utc>,
     kind: &'static str,
@@ -347,6 +350,11 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
                             task_id: *tid,
                             node_id: t.node_id,
                             node_name: t.node_name.clone(),
+                            node_path: if t.node_path.is_empty() {
+                                t.node_name.clone()
+                            } else {
+                                t.node_path.clone()
+                            },
                             stage: t.stage.to_string(),
                             timestamp: e.timestamp,
                             kind: "tool_failure",
@@ -363,6 +371,11 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
                             task_id: *tid,
                             node_id: t.node_id,
                             node_name: t.node_name.clone(),
+                            node_path: if t.node_path.is_empty() {
+                                t.node_name.clone()
+                            } else {
+                                t.node_path.clone()
+                            },
                             stage: t.stage.to_string(),
                             timestamp: e.timestamp,
                             kind: "task_error",

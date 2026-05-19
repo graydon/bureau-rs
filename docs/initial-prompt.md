@@ -5,6 +5,14 @@ agent orchestrator for generating Rust software. The Python original used Anthro
 agent SDK and vendor coding agents. This rewrite calls LLM APIs directly via `rig`, owns
 its own agent loop, and is specialized entirely for generating Rust programs.
 
+> **Note:** the architecture has evolved from the original "per-phase subtask
+> emit" design described below. The current implementation uses a single
+> ARCHITECT stage that builds the entire node tree up front in one call;
+> per-node stages (spec → iface → tests → impl → debug) then run on each
+> node, with parallelism driven by graph dependencies and worktree
+> isolation. There is no per-stage subtask emission. See `src/engine.rs`
+> and `src/tools.rs` for the current authoritative behavior.
+
 ---
 
 ## Goals and Non-Goals
@@ -27,8 +35,8 @@ its own agent loop, and is specialized entirely for generating Rust programs.
 
 ## Phases
 
-Phases execute sequentially. Each phase is a complete top-down decomposition and
-execution pass over the project. Phase order:
+Phases execute sequentially. Each phase runs across the node tree (built once by
+the architect stage). Phase order:
 
 1. **Spec** — produce structured specification documents
 2. **Interface** — produce Rust type signatures, module declarations, trait definitions
@@ -61,8 +69,8 @@ Task {
     id: Uuid,
     phase: Phase,
     description: String,
-    read_files: Vec<PathBuf>,   // declared at decomposition time
-    write_files: Vec<PathBuf>,  // declared at decomposition time
+    read_files: Vec<PathBuf>,   // declared at architect time
+    write_files: Vec<PathBuf>,  // declared at architect time
     subtasks: Vec<Task>,        // populated during execution
     status: TaskStatus,
     agent_transcript: Vec<Message>,
@@ -80,8 +88,9 @@ Each task node:
 3. Emits a list of subtasks, each with declared read/write file sets
 4. Subtasks are scheduled by the orchestrator subject to interference analysis
 
-This interleaving of "do work, then emit subtasks" (rather than pure upfront
-decomposition) is intentional — the node has real context when subdividing.
+(Stale design note — the implementation later moved to a single up-front
+architect stage that lays out the whole tree, with no per-stage subtask
+emission.)
 
 ### Parallelism
 
@@ -91,8 +100,9 @@ Within a phase, tasks execute in parallel subject to:
 - Implemented as a per-file `tokio::sync::RwLock` (or equivalent reader-writer set)
 
 If a task discovers mid-execution that it needs to write a file not in its declared
-write-set, it must either fail-and-redecompose or request a write-set extension
-(re-checking interference). Prefer fail-and-redecompose for simplicity.
+write-set, it must fail and retry from the architect's declared write-set, or the
+operator must restructure the tree. The current implementation uses git worktrees
+plus a rebase + post-rebase gate to catch cross-task interference.
 
 ### Git Worktrees
 
@@ -156,7 +166,7 @@ interface file was changed, reject the write and return an error to the agent.
 - `list_compiler_errors() -> Vec<CompilerErrorSummary>`
 - `replace_fn_body(path: &Path, fn_name: &str, new_body: &str)`
 - `write_file(path: &Path, content: &str)` — narrow: only files in write-set
-- No `emit_subtasks` — debug phase is sequential fixup, no further decomposition
+- No subtask emission — debug phase is sequential fixup against this node's own slot
 
 ### Optimization Phase
 - Same as Debug but without compiler error tools; with optional perf annotation tools
@@ -222,7 +232,7 @@ Orchestrator {
 ```
 
 Main loop per phase:
-1. Run root decomposition task (sequential, produces top-level task list)
+1. Run the architect stage on the root (sequential, produces the full node tree)
 2. Feed tasks into scheduler
 3. Scheduler acquires read/write locks, spawns tokio tasks
 4. Each task may emit subtasks; scheduler feeds them back in
@@ -373,7 +383,7 @@ Options:
   --port <N>           Web UI port (default: 8765)
   --resume <file>      Resume from checkpoint JSON
   --phase <phase>      Start from a specific phase (skip earlier phases)
-  --dry-run            Decompose and show task graph, don't execute
+  --dry-run            Build the architecture and show the task graph, don't execute
   --no-ui              Don't start web server
 ```
 
@@ -465,7 +475,7 @@ for convergence.
 - LLM navigates by filename; good names + small files ≈ semantic index
 - Limits per-task context size naturally
 - Reduces merge conflicts in parallel worktrees
-- Forces modular decomposition at the Rust level too
+- Forces modular structure at the Rust level too
 
 ---
 

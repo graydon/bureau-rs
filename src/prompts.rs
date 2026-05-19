@@ -321,15 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn role_preamble_spec_actor_pushes_decompose_for_large_missions() {
+    fn role_preamble_spec_actor_does_not_mention_decompose() {
+        // Decomposition is the architect's job; the spec stage just
+        // writes prose for an existing node. If "decompose" appears
+        // in the spec preamble we've regressed on that separation.
         let p = role_block(Stage::Spec, Role::Writer, test_limits());
         assert!(
-            p.contains("decompose"),
-            "spec actor preamble must mention decompose"
-        );
-        assert!(
-            p.to_lowercase().contains("snake_case"),
-            "spec actor preamble must mention snake_case names"
+            !p.contains("decompose"),
+            "spec actor preamble must NOT mention decompose: {p}"
         );
     }
 

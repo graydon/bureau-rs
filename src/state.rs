@@ -53,7 +53,15 @@ pub enum TaskStatus {
 pub struct EngineTask {
     pub id: Uuid,
     pub node_id: NodeId,
+    /// Just the node's leaf name (e.g. `tcp`). Kept for backward
+    /// compatibility and as the dedup key in the task-list UI.
     pub node_name: String,
+    /// Fully-qualified module path from the crate root
+    /// (e.g. `samba_rs::network::tcp`). With many nodes the leaf
+    /// name alone is ambiguous; the UI displays this in the
+    /// transcript header and task list.
+    #[serde(default)]
+    pub node_path: String,
     pub stage: Stage,
     pub status: TaskStatus,
     pub model: String,
@@ -83,6 +91,7 @@ impl EngineTask {
             id: self.id,
             node_id: self.node_id,
             node_name: self.node_name.clone(),
+            node_path: self.node_path.clone(),
             stage: self.stage,
             status: self.status,
             model: self.model.clone(),
@@ -190,10 +199,10 @@ pub enum UiEvent {
         id: NodeId,
     },
     /// Graph topology changed (node added/removed, dep edge added).
-    /// Fires after architect creates the tree and after each decompose
-    /// call. The client refetches `/api/graph` on this event — that's
-    /// the one piece of state SSE can't deliver incrementally without
-    /// bloating every event payload.
+    /// Fires after the architect creates the tree, and after any spec
+    /// submission that adds dep edges. The client refetches `/api/graph`
+    /// on this event — that's the one piece of state SSE can't deliver
+    /// incrementally without bloating every event payload.
     GraphTopologyChanged,
     TaskCreated {
         task: EngineTask,
@@ -346,6 +355,7 @@ mod tests {
             id: Uuid::new_v4(),
             node_id: crate::graph::NodeId::new(),
             node_name: "n".into(),
+            node_path: "crate::n".into(),
             stage: Stage::Spec,
             status: TaskStatus::Running,
             model: "mock".into(),

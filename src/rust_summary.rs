@@ -32,29 +32,45 @@ use syn::{File, Item, TraitItem};
 use thiserror::Error;
 
 /// Return a compact summary of the given Rust source, or the original
-/// content if parsing fails.
+/// content if parsing fails. Items are separated by blank lines for
+/// readability — prettyplease packs them tightly by default.
 pub fn summarize_rust(content: &str) -> String {
     let file = match syn::parse_file(content) {
         Ok(f) => f,
         Err(_) => return content.to_string(),
     };
-    let mut summarized = File {
-        shebang: None,
-        attrs: Vec::new(),
-        items: Vec::new(),
-    };
-    for item in &file.items {
-        if let Some(s) = summarize_item(item) {
-            summarized.items.push(s);
-        }
-    }
-    if summarized.items.is_empty() {
+    let summarized: Vec<Item> = file.items.iter().filter_map(summarize_item).collect();
+    if summarized.is_empty() {
         // No signature-bearing items found; the file was just imports
         // and doc comments. Emit a tiny marker so the bundle reader
         // can tell the file existed but had nothing to show.
         return "// (no public-surface items)\n".to_string();
     }
-    prettyplease::unparse(&summarized)
+    render_items_spaced(&summarized)
+}
+
+/// Render each top-level item as its own prettyplease pass, then join
+/// the results with blank lines. Without this, prettyplease packs
+/// items tightly — `pub struct A; pub struct B;` on adjacent lines —
+/// which is hard to read for the model in summary form.
+fn render_items_spaced(items: &[Item]) -> String {
+    let mut out = String::new();
+    for item in items {
+        let singleton = File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: vec![item.clone()],
+        };
+        let rendered = prettyplease::unparse(&singleton);
+        if !out.is_empty() {
+            // Single blank line between items. prettyplease already
+            // emits a trailing newline per render, so we just add
+            // one more.
+            out.push('\n');
+        }
+        out.push_str(&rendered);
+    }
+    out
 }
 
 fn summarize_item(item: &Item) -> Option<Item> {
@@ -248,7 +264,8 @@ pub fn write_top_item(
         )));
     }
     file.items[idx] = new_file.items.into_iter().next().unwrap();
-    Ok(prettyplease::unparse(&file))
+    // Blank lines between items match the summary-rendering convention.
+    Ok(render_items_spaced(&file.items))
 }
 
 fn parse_file(content: &str) -> Result<File, ItemLookupError> {
@@ -256,13 +273,19 @@ fn parse_file(content: &str) -> Result<File, ItemLookupError> {
 }
 
 fn find_item_index(file: &File, name: &str) -> Result<usize, ItemLookupError> {
+    // Normalize the caller's query so fully-qualified path syntax (and
+    // a leading `impl ` keyword) match the same canonical forms we
+    // emit from `canonical_names`. E.g. the query
+    // `"impl super::public::Foo for super::public::Bar"` is
+    // normalized to `"Foo for Bar"` before comparison.
+    let normalized = normalize_lookup_name(name);
     let mut matches: Vec<(usize, String)> = Vec::new();
     let mut all_names: Vec<String> = Vec::new();
     for (i, item) in file.items.iter().enumerate() {
         let names = canonical_names(item);
         for n in &names {
             all_names.push(n.clone());
-            if n == name {
+            if n == &normalized || n == name {
                 matches.push((i, n.clone()));
                 break;
             }
@@ -283,6 +306,40 @@ fn find_item_index(file: &File, name: &str) -> Result<usize, ItemLookupError> {
                 .join(", "),
         }),
     }
+}
+
+/// Normalize a caller-supplied lookup name into the same form
+/// `canonical_names` emits. Handles:
+///
+/// - Leading `impl ` keyword (the natural way to refer to an impl block).
+/// - Module-prefix paths on types (`super::public::Foo` → `Foo`,
+///   `crate::a::b::Bar` → `Bar`).
+/// - Trait impl headers: `impl Trait<G> for super::module::Type`
+///   → `Trait for Type` (generics stripped — match by name).
+///
+/// Falls back to a plain `Path::last_segment` extraction for non-impl
+/// queries. If parsing fails entirely, returns the original string —
+/// caller still tries exact match.
+fn normalize_lookup_name(query: &str) -> String {
+    let trimmed = query.trim();
+    // Strip leading `impl ` if present.
+    let body = trimmed.strip_prefix("impl ").unwrap_or(trimmed).trim();
+    // Impl-block header heuristic: presence of " for " in the body OR
+    // the caller wrote a leading `impl` keyword.
+    let looks_like_impl = trimmed.starts_with("impl ") || body.contains(" for ");
+    if looks_like_impl {
+        let synthetic = format!("impl {body} {{}}");
+        if let Ok(item) = syn::parse_str::<syn::ItemImpl>(&synthetic) {
+            let self_ty = type_to_simple_string(&item.self_ty);
+            if let Some((_, path, _)) = &item.trait_ {
+                let trait_str = path_to_simple_string(path);
+                return format!("{trait_str} for {self_ty}");
+            }
+            return self_ty;
+        }
+    }
+    // Non-impl: strip module-path prefix, keep last segment.
+    trimmed.rsplit("::").next().unwrap_or(trimmed).to_string()
 }
 
 /// One or more identifying names for an item. For nameable items
@@ -584,5 +641,67 @@ pub struct Bar { pub y: u8 }
         let src = "pub struct Foo;\n";
         let err = write_top_item(src, "Bar", "pub struct Bar;").unwrap_err();
         assert!(matches!(err, ItemLookupError::NotFound { .. }));
+    }
+
+    // ---- impl lookup with fully-qualified path syntax ----
+
+    #[test]
+    fn read_item_accepts_impl_keyword_prefix() {
+        let src = r#"
+impl Frob for FrobberImpl {
+    fn shape(&self) -> i32 { 1 }
+}
+"#;
+        // The model often writes the full impl header — accept that.
+        let out = read_top_item(src, "impl Frob for FrobberImpl").unwrap();
+        assert!(out.contains("impl Frob for FrobberImpl"));
+    }
+
+    #[test]
+    fn read_item_accepts_module_qualified_paths() {
+        // The actual judge-reported case: impl referenced via
+        // `super::public::Trait for super::public::Type`.
+        let src = r#"
+impl Frob for FrobberImpl {
+    fn shape(&self) -> i32 { 1 }
+}
+"#;
+        let out = read_top_item(
+            src,
+            "impl super::public::Frob for super::public::FrobberImpl",
+        )
+        .unwrap();
+        assert!(out.contains("impl Frob for FrobberImpl"));
+    }
+
+    #[test]
+    fn read_item_accepts_module_qualified_self_type_for_inherent_impl() {
+        let src = "impl FrobberImpl { fn build() {} }\n";
+        let out = read_top_item(src, "impl super::private::FrobberImpl").unwrap();
+        assert!(out.contains("impl FrobberImpl"));
+    }
+
+    #[test]
+    fn read_item_accepts_module_qualified_struct_name() {
+        let src = "pub struct Foo { pub x: i32 }\npub struct Bar;\n";
+        // Even though the struct only has a short name, accept the
+        // fully-qualified form (the model sometimes refers to items
+        // through their canonical path).
+        let out = read_top_item(src, "super::public::Foo").unwrap();
+        assert!(out.contains("pub struct Foo"));
+        assert!(!out.contains("Bar"));
+    }
+
+    #[test]
+    fn write_item_accepts_impl_keyword_prefix() {
+        let src = r#"
+impl Frob for FrobberImpl {
+    fn shape(&self) -> i32 { 1 }
+}
+"#;
+        let new = "impl Frob for FrobberImpl {\n    fn shape(&self) -> i32 { 42 }\n}\n";
+        let out = write_top_item(src, "impl Frob for FrobberImpl", new).unwrap();
+        assert!(out.contains("42"));
+        assert!(!out.contains(" 1\n") && !out.contains(" 1 }"));
     }
 }

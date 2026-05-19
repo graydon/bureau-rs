@@ -39,6 +39,17 @@ pub fn spawn(state: &StateHandle, log_path: PathBuf) -> Result<JoinHandle<()>> {
                     if log_dead {
                         continue;
                     }
+                    // Skip streaming chunks. They're for the live UI;
+                    // a single multi-turn LLM call easily produces
+                    // hundreds of them and they drown out the actual
+                    // record-of-events in the forensic log. The
+                    // canonical assistant text lands as a
+                    // `TranscriptAppended` at end-of-turn — that's
+                    // what we want to see when reconstructing what
+                    // happened.
+                    if matches!(ev, crate::state::UiEvent::AssistantChunk { .. }) {
+                        continue;
+                    }
                     let wrapper = serde_json::json!({
                         "at": Utc::now().to_rfc3339(),
                         "ev": ev,

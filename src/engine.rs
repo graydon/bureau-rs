@@ -1,4 +1,4 @@
-//! The per-node-stage engine — orchestrator for the node decomposition
+//! The per-node-stage engine — orchestrator for the node tree
 //! pipeline.
 //!
 //! Flow per stage:
@@ -567,6 +567,10 @@ impl Engine {
         let node_name = self
             .node_name(node_id)
             .ok_or_else(|| anyhow!("node {node_id} missing"))?;
+        let node_path = {
+            let g = graph::load(&self.workdir, self.layout).unwrap_or_default();
+            crate::node_context::module_path(&g, node_id)
+        };
         let writer_model = self
             .config
             .toml
@@ -577,6 +581,7 @@ impl Engine {
             id: task_id,
             node_id,
             node_name: node_name.clone(),
+            node_path,
             stage,
             status: TaskStatus::Running,
             model: writer_model.clone(),
@@ -1025,6 +1030,13 @@ impl Engine {
         let cycle_ctx = extras.as_ref().map(|ex| {
             build_cycle_context(ex, self.config.toml.limits.args_display_cap)
         });
+        // Resolve the node's identifiers for the "Your task" header
+        // BEFORE dropping the graph view.
+        let node_name_for_header = g_for_ctx
+            .get(node_id)
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        let module_path_str = node_context::module_path(&g_for_ctx, node_id);
         drop(g_for_ctx);
 
         let prompt_limits = crate::tools::PromptLimits {
@@ -1089,12 +1101,32 @@ impl Engine {
         // model exactly which subset is live this turn so it doesn't
         // burn turns on tools that will be rejected.
         let tools_block = build_tools_eligibility(stage, role);
+        // Short "what you're doing this turn" lead-in. Small models
+        // got lost when the role block lived at the END of a 130-line
+        // user prompt; putting the headline at the TOP gives them an
+        // immediate anchor (stage, role, node, primary tool) before
+        // the bulky context bundle. Costs cross-(stage,role) cache on
+        // the same node — already partly broken by per-stage context
+        // variation, and a worthwhile trade for legibility on smaller
+        // models.
+        let primary_tool = primary_tool_for(stage, role);
+        let task_header = format!(
+            "# Your task this turn\n\n\
+             - **Stage:** `{stage}`\n\
+             - **Role:** `{role:?}`\n\
+             - **Node:** `{node_name_for_header}` (`{module_path_str}`)\n\
+             - **Primary tool:** {primary_tool}\n\n\
+             Full stage/role guidance and the tool eligibility list are at the BOTTOM \
+             of this prompt; the bulk in the middle is context (ancestor specs, \
+             siblings, dep ifaces, your own slots). When in doubt, read the bottom \
+             first.\n",
+        );
         let user_prompt = match &cycle_ctx {
             Some(c) => format!(
-                "{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}\n\n# Critique cycle context\n\n{c}",
+                "{task_header}\n{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}\n\n# Critique cycle context\n\n{c}",
             ),
             None => format!(
-                "{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}",
+                "{task_header}\n{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}",
             ),
         };
 
@@ -1349,6 +1381,30 @@ struct CycleExtras {
 ///
 /// QuickFixer is a separate mode with its own attached tool list (no
 /// unified catalog applies), so we render a simpler block there.
+/// The one tool the model should be calling this turn. Used in the
+/// "Your task" header so even a small model that doesn't make it
+/// past the first paragraph knows what to do. Writers/Revisers
+/// produce content; Critics critique; Judge verdicts; Quickfix
+/// edits. None of these is open-ended — naming the main verb up
+/// front saves the model a lot of guessing.
+fn primary_tool_for(stage: Stage, role: Role) -> &'static str {
+    use Role::*;
+    use Stage::*;
+    match (stage, role) {
+        (Architect, _) => "`submit_architecture`",
+        (Spec, Writer) | (Spec, Reviser) => "`submit_spec`",
+        (Iface, Writer) | (Iface, Reviser) => "`submit_public` + `submit_private`",
+        (Tests, Writer) | (Tests, Reviser) => "`submit_tests`",
+        (Impl, Writer) | (Impl, Reviser) => "`submit_private`",
+        (Debug, Writer) | (Debug, Reviser) => {
+            "`submit_private` (and `submit_tests` only if a test is wrong)"
+        }
+        (_, Critic) => "`submit_critique` (exactly once at end of turn)",
+        (_, Judge) => "`submit_verdict` (exactly once at end of turn)",
+        (_, QuickFixer) => "`write_file_range` / `apply_patch` / `write_item`",
+    }
+}
+
 fn build_tools_eligibility(stage: Stage, role: Role) -> String {
     let accepted = crate::tools::tools_accepted_at(stage, role);
     let accepted_str = accepted
@@ -1490,13 +1546,11 @@ fn build_spec_summary_cache(
 
 fn gate_kind_for(stage: Stage) -> Option<GateKind> {
     match stage {
-        // Architect commits the whole rendered tree; Spec can call
-        // decompose which re-renders ancestor mod.rs / Cargo.toml and
-        // writes placeholder Rust files for newly-added children.
-        // Either can produce a tree that fails to compile (bad
-        // architect tree, malformed Cargo.toml entry, duplicate
-        // member names, etc.). Without a gate here, the broken state
-        // lands on main and every downstream stage's critic sees
+        // Architect commits the whole rendered tree. It can produce
+        // a tree that fails to compile (bad external_crate_deps,
+        // malformed Cargo.toml entry, duplicate member names, etc.).
+        // Without a gate here, the broken state lands on main and
+        // every downstream stage's critic sees
         // "pre-existing errors" it has to ignore. `Check` is cheap
         // when nothing changed (cargo's incremental compile is a
         // no-op on a clean tree) and triggers the quickfix loop when
@@ -1512,6 +1566,12 @@ fn summarize_errors(errors: &[crate::gate::CompilerError], max: usize) -> String
     if errors.is_empty() {
         return "(no errors recorded)".into();
     }
+    // When there's only a handful of errors we keep the FULL message
+    // for each — important for the X0001 "couldn't parse a structured
+    // failure" path, which packs stderr_tail / stdout_tail / exit code
+    // into the message body. With many rustc errors (≥ 4) we collapse
+    // to first-line-per-error to keep the context manageable.
+    let full_text = errors.len() <= 3;
     let mut s = String::new();
     for e in errors.iter().take(max) {
         let loc = match (&e.file, e.line) {
@@ -1519,8 +1579,17 @@ fn summarize_errors(errors: &[crate::gate::CompilerError], max: usize) -> String
             (Some(f), None) => f.display().to_string(),
             _ => e.id.clone(),
         };
-        let first = e.message.lines().next().unwrap_or("").trim();
-        s.push_str(&format!("  - [{loc}] {first}\n"));
+        if full_text {
+            s.push_str(&format!("  - [{loc}]\n"));
+            for line in e.message.lines() {
+                s.push_str("      ");
+                s.push_str(line);
+                s.push('\n');
+            }
+        } else {
+            let first = e.message.lines().next().unwrap_or("").trim();
+            s.push_str(&format!("  - [{loc}] {first}\n"));
+        }
     }
     if errors.len() > max {
         s.push_str(&format!("  - ... and {} more\n", errors.len() - max));
@@ -1530,11 +1599,22 @@ fn summarize_errors(errors: &[crate::gate::CompilerError], max: usize) -> String
 
 /// Scan a slice of transcript entries and return UNRESOLVED tool failures —
 /// for each tool name, only the LAST result is considered.
+///
+/// Read-only tools (`read_file`, `read_item`, the crate-docs tools,
+/// the cargo diagnostic tools) are excluded: a failed exploratory
+/// read is harmless and doesn't need a retry-this-or-explain-why
+/// preamble — the model has already moved on. Only failures of
+/// mutating tools (`submit_*`, `write_*`, `apply_patch`) are surfaced,
+/// since those are how the model actually produces output and a
+/// dangling unresolved one means the stage's work isn't recorded.
 fn collect_failed_tool_calls(entries: &[TranscriptEntry]) -> Vec<(String, String, String)> {
     use std::collections::HashMap;
     let mut last: HashMap<String, (usize, bool, String, String)> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
         if let TranscriptKind::ToolResult { tool, ok, error, .. } = &e.kind {
+            if !tool_is_mutating(tool) {
+                continue;
+            }
             let args = entries[..i]
                 .iter()
                 .rev()
@@ -1562,6 +1642,28 @@ fn collect_failed_tool_calls(entries: &[TranscriptEntry]) -> Vec<(String, String
         .collect();
     failures.sort_by_key(|(idx, ..)| *idx);
     failures.into_iter().map(|(_, t, a, e)| (t, a, e)).collect()
+}
+
+/// True for tools whose failures matter for retry — they're how the
+/// stage produces output. Read-only tools (`read_*`, `search_crates`,
+/// `crate_docs`, `docs_lookup`, the cargo diagnostic tools) are
+/// excluded because a failed exploratory call is harmless: the model
+/// just doesn't get the data it asked for and proceeds.
+fn tool_is_mutating(name: &str) -> bool {
+    matches!(
+        name,
+        "submit_architecture"
+            | "submit_spec"
+            | "submit_public"
+            | "submit_private"
+            | "submit_tests"
+            | "submit_critique"
+            | "submit_verdict"
+            | "write_file"
+            | "write_file_range"
+            | "write_item"
+            | "apply_patch"
+    )
 }
 
 /// HTTP 429 / quota / daily-limit errors. These should NOT count
@@ -1858,7 +1960,7 @@ mod tests {
             TranscriptEntry {
                 timestamp: now,
                 kind: TranscriptKind::ToolCall {
-                    tool: "decompose".into(),
+                    tool: "submit_architecture".into(),
                 },
                 content: "{\"children\":[{\"name\":\"x\",\"deps\":[\"x\"]}]}".into(),
                 role: None,
@@ -1866,7 +1968,7 @@ mod tests {
             TranscriptEntry {
                 timestamp: now,
                 kind: TranscriptKind::ToolResult {
-                    tool: "decompose".into(),
+                    tool: "submit_architecture".into(),
                     ok: false,
                     error: Some("child 'x' lists itself".into()),
                     output: None,
@@ -1896,7 +1998,7 @@ mod tests {
         ];
         let failures = collect_failed_tool_calls(&entries);
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].0, "decompose");
+        assert_eq!(failures[0].0, "submit_architecture");
         assert!(failures[0].1.contains("\"children\""));
         assert!(failures[0].2.contains("lists itself"));
     }

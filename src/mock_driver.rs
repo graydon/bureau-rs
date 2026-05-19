@@ -43,7 +43,7 @@ pub enum ScriptedCall {
         external_deps: Vec<tools::ExternalCrateDep>,
     },
     /// The composite spec-stage submission. Mirrors `SubmitSpecArgs`.
-    /// No `children` field — specs no longer decompose.
+    /// No `children` field — the architect lays out the whole tree.
     SubmitSpec {
         public: String,
         private: Option<String>,

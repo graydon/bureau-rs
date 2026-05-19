@@ -169,15 +169,14 @@ pub struct Limits {
     /// Hard cap on total tasks the engine will run before bailing.
     #[serde(default = "default_max_tasks_total")]
     pub max_tasks_total: usize,
-    /// Hard cap on the number of nodes the decomposition graph may
-    /// contain. The `decompose` tool refuses to add children that would
-    /// exceed it. Default 64. Use to stop runaway decomposition where
-    /// every spec stage keeps splitting into more children.
+    /// Hard cap on the number of nodes the architect can produce.
+    /// `submit_architecture` is rejected if it tries to exceed this.
+    /// Default 64. Use to stop the architect from over-elaborating.
     #[serde(default = "default_max_nodes")]
     pub max_nodes: usize,
-    /// Hard cap on the depth of the decomposition tree (root has depth
-    /// 0). The `decompose` tool refuses children whose depth would
-    /// exceed it. Default 5. Forces leaves to bottom out.
+    /// Hard cap on tree depth (root has depth 0). The architect is
+    /// rejected if it nests children past this. Default 5. Forces
+    /// leaves to bottom out at a manageable depth.
     #[serde(default = "default_max_node_depth")]
     pub max_node_depth: usize,
     #[serde(default)]

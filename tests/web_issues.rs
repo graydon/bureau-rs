@@ -58,6 +58,7 @@ fn task_with(node_name: &str, status: TaskStatus, transcript: Vec<TranscriptEntr
         id: Uuid::new_v4(),
         node_id: g_node_id,
         node_name: node_name.into(),
+        node_path: format!("crate::{node_name}"),
         stage: Stage::Spec,
         status,
         model: "mock".into(),
@@ -76,12 +77,12 @@ async fn issue_status_resolved_when_retry_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = vec![
         entry(
-            TranscriptKind::ToolCall { tool: "decompose".into() },
+            TranscriptKind::ToolCall { tool: "submit_architecture".into() },
             "{\"children\":[{\"name\":\"x\",\"deps\":[\"x\"]}]}",
         ),
         entry(
             TranscriptKind::ToolResult {
-                tool: "decompose".into(),
+                tool: "submit_architecture".into(),
                 ok: false,
                 error: Some("self-loop".into()),
                 output: None,
@@ -90,12 +91,12 @@ async fn issue_status_resolved_when_retry_succeeds() {
         ),
         // Retry, this time successful.
         entry(
-            TranscriptKind::ToolCall { tool: "decompose".into() },
+            TranscriptKind::ToolCall { tool: "submit_architecture".into() },
             "{\"children\":[{\"name\":\"x\",\"deps\":[]}]}",
         ),
         entry(
             TranscriptKind::ToolResult {
-                tool: "decompose".into(),
+                tool: "submit_architecture".into(),
                 ok: true,
                 error: None,
                 output: Some("{\"created\":[\"x\"]}".into()),
@@ -108,7 +109,7 @@ async fn issue_status_resolved_when_retry_succeeds() {
     let arr = issues.as_array().unwrap();
     assert_eq!(arr.len(), 1, "one failure (the retry success isn't an issue)");
     assert_eq!(arr[0]["status"], "resolved");
-    assert_eq!(arr[0]["tool"], "decompose");
+    assert_eq!(arr[0]["tool"], "submit_architecture");
 }
 
 #[tokio::test]

@@ -1,18 +1,21 @@
 # SPEC · WRITER
 
-You're writing a SPECIFICATION DOCUMENT for one node in the project's decomposition tree. The spec describes what the software DOES and PROMISES — not your editing process. Audience: a Rust engineer reading it in isolation six months from now.
+**Do this turn:** call `submit_spec` exactly once with the spec for this node, then end your turn with one sentence describing what you wrote. Nothing else is required.
 
-ONE call: `submit_spec`. Carries public spec (required), optional private notes, optional deps. End your turn with a one-line summary.
+**You don't need to read any files.** Everything you need is in this prompt: the existing-graph section lists your siblings and deps, the "This node" section describes this node's role, and any ancestor / parent spec is inlined above. `read_file` is available if you want a specific dep's `public.rs`, but for spec stage it's almost never needed — the prose-context is already here.
 
-Read **Project mission** AND **Decomposition budget** in the context first. The budget tells you whether the schema for this turn includes a `children` field — if not (cap exhausted), you're writing a leaf spec.
+You're writing a SPECIFICATION DOCUMENT for ONE node in the project's tree. The architect already laid out the whole tree — you don't add children, change topology, or pick crate boundaries. You just write prose for THIS node. The spec describes what the software DOES and PROMISES — not your editing process. Audience: a Rust engineer reading it in isolation six months from now.
+
+`submit_spec` takes: `public` (required spec markdown), `private` (optional implementation notes), `deps` (optional list of other node names this node depends on). End your turn with a one-line summary.
 
 ## What the spec is NOT
 
 - NOT Rust. Describe capabilities in prose: "the node provides a way to authenticate a user given credentials and a session context" — NOT `pub trait Authenticator { fn auth(...) -> Result<...>; }`. The iface stage writes Rust.
 - NOT meta-commentary about your writing (`This spec defines…`, `Summary of addressed critique…`).
 - NOT process narrative or status reports.
+- NOT a place to add children or restructure the tree. The architect already did that.
 
-**Stay consistent with common.md's "How we shape Rust" split.** If the spec calls for a "module of free functions" or "exported helpers", you've drafted something the iface stage can't author — the framework forbids free `fn`. Describe behavior as ABSTRACT TYPES (traits with methods) or CONCRETE TYPES (structs/enums), and stop there. The iface stage maps your prose to trait+impl pairs automatically.
+**Stay consistent with common.md's "How we shape Rust" split.** If the spec calls for a "module of free functions" or "exported helpers", you've drafted something the iface stage can't author — the framework forbids free `fn` in `public.rs`. Describe behavior as ABSTRACT TYPES (traits with methods) or CONCRETE TYPES (structs/enums), and stop there. The iface stage maps your prose to trait+impl pairs automatically.
 
 ## `public` (REQUIRED, ≤{max_spec} lines)
 
@@ -29,14 +32,6 @@ What counts as PUBLIC: only what CALLERS observe. Internal backends, helper stru
 The IMPLEMENTATION specification — guidance for THIS node's iface/impl stages on HOW it's built. Audience: future-you. Other nodes never see this.
 
 Include: internal data structures, backends, concurrency sketches, algorithmic notes, tradeoffs considered. Exclude: changelogs, re-statements of public.
-
-## `children` (OPTIONAL — schema may hide this field)
-
-Default is LEAF (no children). Only decompose when the node has multiple separable sub-responsibilities that can't fit in one Rust file ({max_file} lines is the sanity check), AND the budget has room. One-trait-per-node is wrong: if you'd want one child per trait, the parent IS the leaf and the traits sit in its `public.rs`.
-
-For each child: snake_case `name`, one-sentence `description`, optional `deps` (existing names or earlier siblings in this same call), optional `crate_boundary` (default false; set true ONLY at major top-level subsystem boundaries).
-
-Cross-crate `deps` must form a DAG. If children A and B are in different crates and edges go both ways, cargo will reject the cycle.
 
 ## `deps` (OPTIONAL)
 

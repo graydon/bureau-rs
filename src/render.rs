@@ -443,7 +443,7 @@ fn render_mod_rs(graph: &NodeGraph, node: &Node, layout: Layout) -> String {
         .collect();
     if !same_crate_children.is_empty() {
         s.push('\n');
-        s.push_str("// Children (sub-decompositions in the same crate).\n");
+        s.push_str("// Children (sub-modules in the same crate).\n");
         for child in same_crate_children {
             // Children are `pub mod` so cross-cutting deps from elsewhere in
             // the graph can reach them via `crate::a::b::child`. Their own

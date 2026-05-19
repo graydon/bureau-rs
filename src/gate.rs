@@ -95,6 +95,12 @@ impl GateKind {
 }
 
 /// Run a cargo command in `workdir` and parse JSON output for errors.
+///
+/// When cargo exits non-zero, the full stdout + stderr + exit code are
+/// always dumped to `<workdir>/.bureau/last-gate-failure.log` for
+/// post-hoc inspection — the X0001 fallback path can only fit a tail
+/// in the per-call diagnostic, but the operator needs the whole story
+/// when "the framework can't find the error" with empty-looking output.
 pub async fn run_gate(workdir: &Path, kind: GateKind) -> Result<GateOutcome> {
     let mut cmd = Command::new("cargo");
     cmd.args(kind.args())
@@ -102,15 +108,73 @@ pub async fn run_gate(workdir: &Path, kind: GateKind) -> Result<GateOutcome> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("CARGO_TERM_COLOR", "never");
+    let cmdline = format!("cargo {}", kind.args().join(" "));
     let output = cmd.output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok(parse_cargo_output(
-        &stdout,
-        &stderr,
-        output.status.success(),
-        kind,
-    ))
+    let exit_code = output.status.code();
+    if !output.status.success() {
+        // Always preserve a full dump on failure. The X0001 fallback
+        // only carries a short tail; without the full log we can't
+        // diagnose pathological cases (empty stderr, build-script
+        // panics that print to stdout, etc.).
+        let dump = format!(
+            "command: {cmdline}\n\
+             workdir: {workdir_disp}\n\
+             exit code: {exit}\n\
+             ---- stdout ({stdout_bytes} bytes) ----\n{stdout}\n\
+             ---- stderr ({stderr_bytes} bytes) ----\n{stderr}\n",
+            workdir_disp = workdir.display(),
+            exit = exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".to_string()),
+            stdout_bytes = stdout.len(),
+            stderr_bytes = stderr.len(),
+        );
+        write_gate_failure_log(workdir, &dump);
+        // Also emit a high-signal warn so the operator sees a real
+        // message in the binary's log rather than just a UI X0001.
+        tracing::warn!(
+            cmd = %cmdline,
+            exit = ?exit_code,
+            stdout_bytes = stdout.len(),
+            stderr_bytes = stderr.len(),
+            "cargo gate failed (full output dumped to .bureau/last-gate-failure.log)"
+        );
+        if !stderr.trim().is_empty() {
+            tracing::warn!(stderr = %stderr.trim(), "cargo gate stderr");
+        }
+    }
+    let mut outcome = parse_cargo_output(&stdout, &stderr, output.status.success(), kind);
+    // Stash the exit code in the X0001 fallback if it fired so the
+    // model can see what was actually different (signal vs exit 101,
+    // etc.). We do this after parse so we don't change parse_cargo_output's
+    // signature (still callable from tools.rs without exit info).
+    if let Some(last) = outcome.errors.last_mut() {
+        if last.id.starts_with('X') {
+            if let Some(code) = exit_code {
+                last.message = format!("{} (exit code {code})", last.message);
+            } else {
+                last.message = format!("{} (killed by signal)", last.message);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Write a full diagnostic dump of a cargo failure to a stable path
+/// under `.bureau/`. Single rolling file — operators expect to find
+/// "the most recent failure" without browsing a directory.
+fn write_gate_failure_log(workdir: &Path, content: &str) {
+    let dir = workdir.join(".bureau");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(?e, "couldn't create .bureau for gate-failure log");
+        return;
+    }
+    let path = dir.join("last-gate-failure.log");
+    if let Err(e) = std::fs::write(&path, content) {
+        tracing::warn!(path = %path.display(), ?e, "couldn't write gate-failure log");
+    }
 }
 
 /// Parse cargo's stdout/stderr into a GateOutcome. Pulled out of `run_gate`
@@ -248,24 +312,62 @@ pub fn parse_cargo_output(
     }
 
     // Final fallback: cargo exited non-zero and we couldn't extract a
-    // structured cause. Synthesize an error with a stderr tail so the
-    // gate failure is at least diagnosable rather than mysteriously
-    // empty (the bug that caused phase-impl to retry forever with
-    // "0 errors").
+    // structured cause. Surface BOTH stderr and stdout tails — some
+    // cargo workflow errors (`error: failed to parse manifest`, build
+    // script panics) land on stdout because `--message-format=json`
+    // muxes through stdout. Also surface any non-message JSON records
+    // we saw (e.g. `build-finished` with `success: false`, or a
+    // `compiler-message` at level=`warning` that flipped the build
+    // anyway) — those carry the diagnostic the model needs.
     if !status_success && errors.is_empty() {
-        let tail = tail_of(stderr, 40);
+        let stderr_tail = tail_of(stderr, 60);
+        let stdout_tail = tail_of(stdout, 60);
+        // Pull out any rendered diagnostic strings we ignored above
+        // (because they weren't level=error). Frequently a level=
+        // "error: aborting due to previous errors" is here that
+        // explains the failure even when stderr is empty.
+        let mut ignored_diagnostics = Vec::new();
+        for line in stdout.lines() {
+            let val: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(msg) = val.get("message") {
+                if let Some(rendered) =
+                    msg.get("rendered").and_then(|s| s.as_str())
+                {
+                    if !rendered.is_empty() {
+                        ignored_diagnostics.push(rendered.to_string());
+                    }
+                }
+            }
+        }
+        let json_diag_block = if ignored_diagnostics.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "JSON diagnostics (not classified as error level):\n{}\n",
+                ignored_diagnostics.join("\n---\n")
+            )
+        };
         idx += 1;
         errors.push(CompilerError {
             id: format!("X{idx:04}"),
             file: None,
             line: None,
             message: format!(
-                "cargo {} exited non-zero; could not parse a structured failure. \
-                 Last stderr lines:\n{}",
+                "cargo {} exited non-zero; could not extract a structured error \
+                 message. Full output dumped to .bureau/last-gate-failure.log.\n\n\
+                 {json_diag_block}\
+                 ---- last stderr lines ----\n{stderr_tail}\n\
+                 ---- last stdout lines ----\n{stdout_tail}",
                 kind.label(),
-                tail
             ),
-            raw: serde_json::json!({"stderr_tail": tail}),
+            raw: serde_json::json!({
+                "stderr_tail": stderr_tail,
+                "stdout_tail": stdout_tail,
+                "ignored_diagnostics": ignored_diagnostics,
+            }),
         });
     }
 
