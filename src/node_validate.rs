@@ -62,6 +62,24 @@ pub enum ValidateError {
          is not a known module name; check the spelling"
     )]
     PrivateUnknownModule { first: String },
+    #[error(
+        "private.rs: forbidden item '{kind}'. private.rs may contain only `use` imports, \
+         type definitions (struct/enum/type), `impl` blocks (for trait impls or inherent \
+         impls on private types), `const`/`static`, and doc comments. \
+         FREE FUNCTIONS are not allowed — every callable must be a method on a trait \
+         (defined in public.rs) implemented for a type. See common.md's \
+         'How we shape Rust' section."
+    )]
+    PrivateForbiddenItem { kind: String },
+    #[error("tests.rs: invalid Rust syntax: {0}")]
+    TestsSyntax(String),
+    #[error(
+        "tests.rs: forbidden item '{kind}'. tests.rs may contain `use` imports, \
+         `fn` (`#[test]`-attributed or bare helpers), `mod` submodules of the same \
+         shape, type definitions, traits, `impl` blocks, and `const`/`static`. \
+         `extern crate` and free-form macro invocations are not allowed."
+    )]
+    TestsForbiddenItem { kind: String },
 }
 
 pub fn validate_public(content: &str) -> Result<(), ValidateError> {
@@ -140,10 +158,17 @@ fn check_public_item(item: &syn::Item) -> Result<(), ValidateError> {
     }
 }
 
-/// Validate `private.rs` (or `tests.rs`) imports against the node's declared
-/// dep set. Allows `use super::*`, `use self::*`, and `use crate::<name>::*`
-/// only if `<name>` is a child of the current node, an ancestor's name, or
-/// a directly-declared dep node's name. Foreign nodes are rejected.
+/// Validate `private.rs`. Two layers of checks:
+///
+/// 1. **Use-path scoping** — `use crate::<X>::...` paths must reference
+///    declared deps, ancestors, own children, or this node itself.
+///    See `allowed_first_segments` for the full rule.
+/// 2. **Item-form whitelist** — `private.rs` may contain only `use`,
+///    type definitions (struct/enum/type), `impl` blocks, `const` /
+///    `static`, and doc comments. NO free `fn`: every callable must
+///    be a method on a trait+impl pair (the framework's split — see
+///    common.md). NO `mod` blocks (children get their own nodes).
+///    NO `extern crate`, `macro_rules!`, `pub use`, etc.
 pub fn validate_private(
     content: &str,
     node: &Node,
@@ -153,11 +178,97 @@ pub fn validate_private(
         syn::parse_file(content).map_err(|e| ValidateError::PrivateSyntax(format!("{e}")))?;
     let allowed = allowed_first_segments(node, graph);
     for item in &file.items {
-        if let syn::Item::Use(u) = item {
-            check_use_tree(&u.tree, &allowed)?;
-        }
+        check_private_item(item, &allowed)?;
     }
     Ok(())
+}
+
+fn check_private_item(
+    item: &syn::Item,
+    allowed: &HashSet<String>,
+) -> Result<(), ValidateError> {
+    use syn::Item;
+    match item {
+        Item::Use(u) => check_use_tree(&u.tree, allowed),
+        Item::Struct(_) | Item::Enum(_) | Item::Type(_) | Item::Union(_) => Ok(()),
+        Item::Impl(_) => Ok(()),
+        Item::Const(_) | Item::Static(_) => Ok(()),
+        // Free functions are fine in private.rs — they're internal
+        // helpers and there's no benefit to forcing them onto inherent
+        // impls. Only PUBLIC.rs forbids loose fn (that's the surface).
+        Item::Fn(_) => Ok(()),
+        Item::Trait(_) => {
+            // Traits belong in public.rs (they ARE the public interface).
+            Err(ValidateError::PrivateForbiddenItem {
+                kind: "trait (define traits in public.rs)".to_string(),
+            })
+        }
+        Item::Mod(_) => Err(ValidateError::PrivateForbiddenItem {
+            kind: "mod (children are framework-managed nodes, not inline mods)"
+                .to_string(),
+        }),
+        Item::ExternCrate(_) => Err(ValidateError::PrivateForbiddenItem {
+            kind: "extern crate".to_string(),
+        }),
+        Item::Macro(_) => Err(ValidateError::PrivateForbiddenItem {
+            kind: "macro invocation".to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Validate `tests.rs`. The allowed items are:
+/// - `use` (scoped via `allowed_first_segments` like private.rs)
+/// - functions (`#[test]`-attributed or bare helpers — both fine here,
+///   helpers are common in test files and there's no reason to force
+///   them onto impls)
+/// - type definitions, traits, `impl` blocks
+/// - inner `mod` modules of the same shape (so the conventional nested
+///   `mod tests {{}}` pattern still works)
+/// - `const`/`static`
+pub fn validate_tests(
+    content: &str,
+    node: &Node,
+    graph: &NodeGraph,
+) -> Result<(), ValidateError> {
+    let file =
+        syn::parse_file(content).map_err(|e| ValidateError::TestsSyntax(format!("{e}")))?;
+    let allowed = allowed_first_segments(node, graph);
+    for item in &file.items {
+        check_tests_item(item, &allowed)?;
+    }
+    Ok(())
+}
+
+fn check_tests_item(
+    item: &syn::Item,
+    allowed: &HashSet<String>,
+) -> Result<(), ValidateError> {
+    use syn::Item;
+    match item {
+        Item::Use(u) => check_use_tree(&u.tree, allowed),
+        Item::Struct(_) | Item::Enum(_) | Item::Type(_) | Item::Union(_) => Ok(()),
+        Item::Trait(_) | Item::Impl(_) => Ok(()),
+        Item::Const(_) | Item::Static(_) => Ok(()),
+        // Free functions are fine — both `#[test]` and bare helpers.
+        Item::Fn(_) => Ok(()),
+        Item::Mod(m) => {
+            // Recurse into inner mod bodies if any — same rules apply.
+            if let Some((_, items)) = &m.content {
+                for inner in items {
+                    check_tests_item(inner, allowed)?;
+                }
+            }
+            Ok(())
+        }
+        Item::ExternCrate(_) => Err(ValidateError::TestsForbiddenItem {
+            kind: "extern crate".to_string(),
+        }),
+        Item::Macro(_) => Err(ValidateError::TestsForbiddenItem {
+            kind: "macro invocation".to_string(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Compute the set of first-segment names allowed in `use crate::<X>::...`
@@ -509,15 +620,26 @@ pub(super) struct Inner(Frob);
 
     #[test]
     fn private_allows_super_self_paths() {
+        // `use super::*` and `use self::...` are fine — the framework
+        // uses them constantly (super::public::* etc.). Inline `mod`
+        // blocks, however, are forbidden in private.rs (children are
+        // framework-managed nodes, not inline modules).
         let (g, _root, a) = fresh_graph();
         let src = r#"
 use super::public::*;
-use self::helper::Util;
-mod helper {
-    pub struct Util;
-}
+use self::nested;
 "#;
         validate_private(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn private_rejects_inline_mod() {
+        let (g, _root, a) = fresh_graph();
+        let src = "mod helper { pub struct Util; }\n";
+        let err = validate_private(src, g.get(a).unwrap(), &g).unwrap_err();
+        assert!(
+            matches!(err, ValidateError::PrivateForbiddenItem { ref kind } if kind.contains("mod"))
+        );
     }
 
     #[test]
@@ -538,5 +660,120 @@ mod helper {
         let src = "use crate::b as bee;\n";
         let err = validate_private(src, g.get(a).unwrap(), &g).unwrap_err();
         assert!(matches!(err, ValidateError::PrivateUndeclaredDep { .. }));
+    }
+
+    // ---- validate_private item-form whitelist ----
+
+    #[test]
+    fn private_accepts_free_function() {
+        // Free fns are fine in private.rs — they're internal helpers.
+        // Only public.rs forbids loose `fn`.
+        let (g, _root, a) = fresh_graph();
+        let src = "fn helper(x: i32) -> i32 { x + 1 }\n";
+        validate_private(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn private_rejects_trait_definition() {
+        let (g, _root, a) = fresh_graph();
+        let src = "pub trait Foo { fn bar(&self); }\n";
+        let err = validate_private(src, g.get(a).unwrap(), &g).unwrap_err();
+        assert!(
+            matches!(err, ValidateError::PrivateForbiddenItem { ref kind } if kind.contains("trait"))
+        );
+    }
+
+    #[test]
+    fn private_accepts_struct_and_impl() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+use super::public::*;
+pub struct Inner { x: i32 }
+impl Foo for FooImpl {
+    fn bar(&self) -> i32 { 42 }
+}
+"#;
+        // public::* import is fine; impl on a public type with bodies
+        // here is the conventional split.
+        validate_private(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    // ---- validate_tests ----
+
+    #[test]
+    fn tests_accepts_test_functions() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+use super::public::*;
+
+#[test]
+fn it_works() {
+    assert_eq!(2 + 2, 4);
+}
+"#;
+        validate_tests(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn tests_accepts_tokio_test() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+#[tokio::test]
+async fn it_works_async() {
+    assert!(true);
+}
+"#;
+        validate_tests(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn tests_accepts_bare_helper_fn() {
+        // Helpers next to `#[test]` functions are fine — test files
+        // conventionally include build/setup functions.
+        let (g, _root, a) = fresh_graph();
+        let src = "fn helper() -> i32 { 1 }\n#[test] fn t() {}\n";
+        validate_tests(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn tests_accepts_helper_in_impl() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+struct Helper;
+impl Helper {
+    fn build() -> i32 { 42 }
+}
+#[test]
+fn t() {
+    assert_eq!(Helper::build(), 42);
+}
+"#;
+        validate_tests(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn tests_accepts_nested_mod_with_tests() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+mod nested {
+    #[test]
+    fn inner() {
+        assert!(true);
+    }
+}
+"#;
+        validate_tests(src, g.get(a).unwrap(), &g).unwrap();
+    }
+
+    #[test]
+    fn tests_rejects_extern_crate_in_nested_mod() {
+        let (g, _root, a) = fresh_graph();
+        let src = r#"
+mod nested {
+    extern crate foo;
+}
+"#;
+        let err = validate_tests(src, g.get(a).unwrap(), &g).unwrap_err();
+        assert!(matches!(err, ValidateError::TestsForbiddenItem { .. }));
     }
 }

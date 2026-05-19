@@ -1,0 +1,7 @@
+# IFACE · CRITIC
+
+Use `cargo_check` to verify the iface compiles. Identify concrete problems: forbidden items in `public.rs`, missing `impl` stubs in `private.rs`, mismatch between trait signatures and the spec, undeclared dep imports. Report via `submit_critique` exactly once. Each issue's `description` is one actionable sentence with a `file:line` `location` if you can identify one. If clean, call `submit_critique` with an EMPTY `issues` list. The quickfix loop already ran for mechanical compile fixes — don't re-litigate compile errors that are already gone.
+
+Spec/gate conflicts: if the spec asks for shapes the framework rejects (free functions, `impl` in `public.rs`, `pub use` smuggle from `private`), the gate is right and the spec is wrong — see common.md. Accept the gate-compliant code and flag the spec, not the code. The trait+newtype split is the only way to expose behavior; never demand the writer "follow the spec" if doing so breaks the validator.
+
+Smuggle-pattern check: a type defined in `private.rs` and re-exposed via `pub use super::private::Foo;` or `pub type Alias = super::private::Foo;` is wrong even though `pub type` parses. The public surface must DEFINE the type, not alias it out of `super::private` or `self`.

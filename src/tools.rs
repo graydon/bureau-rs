@@ -749,12 +749,9 @@ impl SubmitSlot {
         -> Result<(), ValidateError>
     {
         match self {
-            // public.rs has its own narrow validator (forbids impl blocks etc.);
-            // private and tests share the import-scope validator.
             SubmitSlot::Public => node_validate::validate_public(content),
-            SubmitSlot::Private | SubmitSlot::Tests => {
-                node_validate::validate_private(content, node, g)
-            }
+            SubmitSlot::Private => node_validate::validate_private(content, node, g),
+            SubmitSlot::Tests => node_validate::validate_tests(content, node, g),
         }
     }
 
@@ -2478,23 +2475,31 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
 
         "submit_private" => format!(
             "Author `private.rs` — the node's hidden implementation. \
+            ALLOWED: `use` imports, type definitions (struct/enum/type/union), \
+            `impl` blocks (trait impls for the public types, plus inherent impls on \
+            private types), free `fn` helpers, `const`/`static`, doc comments. \
+            FORBIDDEN: `trait` (traits live in public.rs); inline `mod` blocks \
+            (children are framework-managed nodes); `extern crate`; free-form macros. \
             Module-path rules: \
-            - `use super::public::*;` to reference your OWN public types (NEVER \
-              `use crate::TypeName`). \
+            - `use super::public::*;` for OWN public types (NEVER `use crate::TypeName`). \
             - `use crate::<dep_name>::...` for declared deps in single-crate mode; \
               `use <dep_crate>::...` for cross-crate deps in workspace mode. The \
               `import as` line in each Dependency context section is authoritative. \
-            - The first segment after `crate::` MUST resolve to a declared dep, an \
-              ancestor, an own child, or this node itself; otherwise the framework \
-              rejects the submission before invoking cargo. \
+            - First segment after `crate::` MUST resolve to a declared dep, an ancestor, \
+              an own child, or this node itself. \
             Hard cap: {max_file} lines."
         ),
 
         "submit_tests" => format!(
-            "Author `tests.rs` — `#[test]` functions exercising this node's public \
-            surface. Use `use super::public::*;` to import the surface (NOT \
-            `use crate::TypeName`). Same `use crate::<X>::...` rule as `submit_private`: \
-            X must be a declared dep / ancestor / own child. Hard cap: {max_file} lines."
+            "Author `tests.rs` — `#[test]` functions (or `#[tokio::test]` etc.) \
+            exercising this node's public surface, plus any helper code they need. \
+            ALLOWED: `use` imports, free `fn` (both `#[test]`-attributed and bare \
+            helpers), type definitions, traits, `impl` blocks, `const`/`static`, \
+            inner `mod` blocks of the same shape, doc comments. \
+            FORBIDDEN: `extern crate`; free-form macro invocations. \
+            Imports: `use super::public::*;` for own types (NOT `use crate::TypeName`); \
+            same `use crate::<X>::...` rule as `submit_private`. \
+            Hard cap: {max_file} lines."
         ),
 
         "submit_verdict" => "Record the judge's verdict. Pass `satisfactory: true` if the reviser \
