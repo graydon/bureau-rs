@@ -2,13 +2,21 @@
 //! style.md?}`.
 //!
 //! The model field hierarchy: every (stage, role) call resolves through
-//!   1. stage-specific override (e.g. `architect = "..."`)
-//!   2. role-specific override (e.g. `critic = "..."`)
-//!   3. `default` (required)
+//!   1. **`escalated`** when this is a retry attempt (`attempt > 1`)
+//!      and `escalated` is set — wins over everything else
+//!   2. stage-specific override (e.g. `architect = "..."`)
+//!   3. role-specific override (e.g. `critic = "..."`)
+//!   4. `default` (required)
 //!
 //! Stage overrides win over role overrides — stage is the more specific
 //! axis (architect needs a smarter model; reviser-of-anything tends to
 //! match its writer).
+//!
+//! `escalated` overrides stage / role / default on retry attempts.
+//! Rationale: if a (cheap, fast) default model is hitting a wall on a
+//! specific (node, stage), retrying with the same model rarely helps;
+//! swapping to a more capable model is often the difference between
+//! getting unstuck and burning budget on identical re-failures.
 //!
 //! `style.md` is optional. If present, its contents are inlined into
 //! every prompt context as a "Style guide" section so the user can
@@ -24,6 +32,15 @@ pub struct ModelConfig {
     /// Default model used for any (stage, role) not overridden by the
     /// fields below. REQUIRED.
     pub default: String,
+
+    /// Escalation model used on retry attempts (`attempt > 1` in the
+    /// stage-level retry loop). When set, this overrides `default` /
+    /// stage / role for *all* roles in the retried stage. Leave unset
+    /// to keep using whatever the normal hierarchy resolves to. Pick a
+    /// capable model — escalation is meant for "default got stuck;
+    /// throw something smarter at it before giving up".
+    #[serde(default)]
+    pub escalated: Option<String>,
 
     // ---- Per-stage overrides (apply across all roles in that stage) ----
     #[serde(default)]
@@ -69,9 +86,23 @@ fn default_max_turns() -> usize {
 }
 
 impl ModelConfig {
-    /// Resolve the model name for a given (stage, role): stage-specific
-    /// override wins, then role-specific, then `default`.
-    pub fn for_stage_role(&self, stage: crate::graph::Stage, role: crate::tools::Role) -> &str {
+    /// Resolve the model name for a given (stage, role, attempt).
+    ///
+    /// `attempt` is 1-indexed (1 = first try, 2+ = retry). On retry,
+    /// `escalated` wins over everything else if set; otherwise the
+    /// normal hierarchy applies (stage override → role override →
+    /// default).
+    pub fn for_stage_role(
+        &self,
+        stage: crate::graph::Stage,
+        role: crate::tools::Role,
+        attempt: u32,
+    ) -> &str {
+        if attempt > 1 {
+            if let Some(esc) = self.escalated.as_deref() {
+                return esc;
+            }
+        }
         let stage_override = match stage {
             crate::graph::Stage::Architect => &self.architect,
             crate::graph::Stage::Spec => &self.spec,
@@ -317,5 +348,86 @@ impl Config {
 
     pub fn layout(&self) -> Layout {
         self.toml.layout.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Stage;
+    use crate::tools::Role;
+
+    fn cfg_minimal() -> ModelConfig {
+        ModelConfig {
+            default: "default-model".into(),
+            escalated: None,
+            architect: None,
+            spec: None,
+            iface: None,
+            tests: None,
+            impl_: None,
+            debug: None,
+            writer: None,
+            critic: None,
+            reviser: None,
+            judge: None,
+            max_tokens: default_max_tokens(),
+            temperature: default_temperature(),
+            max_turns: default_max_turns(),
+        }
+    }
+
+    #[test]
+    fn first_attempt_uses_default_when_no_overrides() {
+        let c = cfg_minimal();
+        assert_eq!(c.for_stage_role(Stage::Spec, Role::Writer, 1), "default-model");
+    }
+
+    #[test]
+    fn first_attempt_uses_stage_override() {
+        let mut c = cfg_minimal();
+        c.architect = Some("smart-model".into());
+        assert_eq!(c.for_stage_role(Stage::Architect, Role::Writer, 1), "smart-model");
+        // Other stages still use default.
+        assert_eq!(c.for_stage_role(Stage::Spec, Role::Writer, 1), "default-model");
+    }
+
+    #[test]
+    fn retry_uses_escalated_overriding_default() {
+        let mut c = cfg_minimal();
+        c.escalated = Some("escalated-model".into());
+        assert_eq!(c.for_stage_role(Stage::Spec, Role::Writer, 1), "default-model");
+        assert_eq!(c.for_stage_role(Stage::Spec, Role::Writer, 2), "escalated-model");
+        assert_eq!(c.for_stage_role(Stage::Spec, Role::Writer, 5), "escalated-model");
+    }
+
+    #[test]
+    fn retry_with_escalated_overrides_stage_specific() {
+        // The point of escalated is "you're stuck — try something
+        // smarter than whatever you'd normally use, including
+        // stage-pinned models".
+        let mut c = cfg_minimal();
+        c.architect = Some("normally-smart".into());
+        c.escalated = Some("even-smarter".into());
+        assert_eq!(c.for_stage_role(Stage::Architect, Role::Writer, 1), "normally-smart");
+        assert_eq!(c.for_stage_role(Stage::Architect, Role::Writer, 2), "even-smarter");
+    }
+
+    #[test]
+    fn retry_without_escalated_falls_through_to_normal_hierarchy() {
+        let mut c = cfg_minimal();
+        c.architect = Some("normally-smart".into());
+        // No `escalated` configured.
+        assert_eq!(c.for_stage_role(Stage::Architect, Role::Writer, 1), "normally-smart");
+        assert_eq!(c.for_stage_role(Stage::Architect, Role::Writer, 2), "normally-smart");
+    }
+
+    #[test]
+    fn escalated_applies_uniformly_across_roles() {
+        let mut c = cfg_minimal();
+        c.escalated = Some("smart".into());
+        for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge, Role::QuickFixer] {
+            assert_eq!(c.for_stage_role(Stage::Iface, role, 2), "smart", "role {role:?}");
+        }
     }
 }

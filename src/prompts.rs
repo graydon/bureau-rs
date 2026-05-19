@@ -189,16 +189,27 @@ pub(crate) fn quickfix_preamble(stage: Stage) -> String {
         &[("stage", stage.as_str()), ("gate", gate)],
     )
 }
-pub(crate) fn role_preamble(stage: Stage, role: Role, limits: PromptLimits) -> String {
+/// The universal preamble — stable across every call in the entire run.
+/// Used as the SYSTEM prompt so it caches across nodes, stages, and
+/// roles. The per-(stage,role) block lives in the user prompt instead,
+/// see `role_block()`.
+pub(crate) fn universal_preamble() -> &'static str {
+    include_str!("prompts/common.md")
+}
+
+/// The per-(stage,role) preamble block. Lives in the USER prompt, after
+/// the context document, so node-stable context bytes prefix this and
+/// the prompt cache survives across stages on the same node up to the
+/// point where this block starts to differ.
+pub(crate) fn role_block(stage: Stage, role: Role, limits: PromptLimits) -> String {
     let max_file = limits.max_file_lines.to_string();
     let max_spec = limits.max_spec_section_lines.to_string();
     let vars = &[
         ("max_file", max_file.as_str()),
         ("max_spec", max_spec.as_str()),
     ];
-    let common = include_str!("prompts/common.md");
 
-    let role_block = match (stage, role) {
+    match (stage, role) {
         // ---- ARCHITECT ----
         (Stage::Architect, Role::Writer) => {
             render(include_str!("prompts/architect_writer.md"), vars)
@@ -244,9 +255,7 @@ pub(crate) fn role_preamble(stage: Stage, role: Role, limits: PromptLimits) -> S
         // QuickFixer — same preamble for every stage; the specific gate
         // and the errors to address come from the cycle context block.
         (_, Role::QuickFixer) => quickfix_preamble(stage),
-    };
-
-    format!("{common}\n\n{role_block}")
+    }
 }
 
 #[cfg(test)]
@@ -293,21 +302,27 @@ mod tests {
 
     #[test]
     fn role_preamble_iface_actor_forbids_mod_and_directs_to_super_public() {
-        let p = role_preamble(Stage::Iface, Role::Writer, test_limits());
+        let block = role_block(Stage::Iface, Role::Writer, test_limits());
         assert!(
-            p.contains("`mod`") && p.to_lowercase().contains("forbidden"),
-            "iface actor preamble should mention `mod` is forbidden: {p}"
+            block.contains("`mod`") && block.to_lowercase().contains("forbidden"),
+            "iface actor block should mention `mod` is forbidden: {block}"
         );
-        assert!(p.contains("super::public"), "should direct to super::public");
         assert!(
-            p.contains("snake_case"),
-            "should remind about snake_case node names"
+            block.contains("super::public"),
+            "should direct to super::public"
+        );
+        // The snake_case reminder lives in the universal preamble (system
+        // prompt) rather than the per-(stage,role) block. After the
+        // cache-friendly split, those are two separate functions.
+        assert!(
+            universal_preamble().contains("snake_case"),
+            "universal preamble should remind about snake_case node names"
         );
     }
 
     #[test]
     fn role_preamble_spec_actor_pushes_decompose_for_large_missions() {
-        let p = role_preamble(Stage::Spec, Role::Writer, test_limits());
+        let p = role_block(Stage::Spec, Role::Writer, test_limits());
         assert!(
             p.contains("decompose"),
             "spec actor preamble must mention decompose"
@@ -324,12 +339,12 @@ mod tests {
             max_file_lines: 777,
             max_spec_section_lines: 999,
         };
-        let iface = role_preamble(Stage::Iface, Role::Writer, limits);
+        let iface = role_block(Stage::Iface, Role::Writer, limits);
         assert!(
             iface.contains("777"),
             "iface actor preamble should mention max_file_lines: {iface}"
         );
-        let spec = role_preamble(Stage::Spec, Role::Writer, limits);
+        let spec = role_block(Stage::Spec, Role::Writer, limits);
         assert!(
             spec.contains("999"),
             "spec actor preamble should mention max_spec_section_lines: {spec}"
@@ -338,7 +353,7 @@ mod tests {
 
     #[test]
     fn role_preamble_universal_rules_no_longer_dump_all_tool_names() {
-        let p = role_preamble(Stage::Impl, Role::Writer, test_limits());
+        let p = role_block(Stage::Impl, Role::Writer, test_limits());
         assert!(
             !p.contains("submit_spec_public") && !p.contains("submit_spec_private"),
             "impl writer should not see spec tools in its preamble: {p}"
@@ -351,7 +366,7 @@ mod tests {
 
     #[test]
     fn spec_reviser_warns_against_changelog_in_spec_body() {
-        let p = role_preamble(Stage::Spec, Role::Reviser, test_limits());
+        let p = role_block(Stage::Spec, Role::Reviser, test_limits());
         let lc = p.to_lowercase();
         assert!(
             lc.contains("changelog") || lc.contains("meta-narrative") || lc.contains("clean spec"),

@@ -54,6 +54,11 @@ pub struct Engine {
     pub cargo_lock: Arc<tokio::sync::Mutex<()>>,
     pub workspace: Arc<crate::worktree::Workspace>,
     pub worktrees: Arc<crate::worktree::WorktreePool>,
+    /// Live OpenRouter prices, fetched once at startup. Used by
+    /// `compute_total_cost` to bill each task at real rates rather than
+    /// hardcoded substring-matched approximations. Empty table means
+    /// the fetch failed and `pricing::fallback_price` will be used.
+    pub prices: Arc<crate::pricing::PriceTable>,
     /// If `Some(t)`, every in-flight LLM call sleeps until `t` before
     /// retrying. Set when ANY driver call surfaces a rate-limit error
     /// (HTTP 429, "insufficient credits", quota messages); cleared
@@ -74,6 +79,15 @@ impl Engine {
         state: StateHandle,
         driver: Arc<dyn LlmDriver>,
     ) -> Result<Self> {
+        Self::with_driver_and_prices(config, state, driver, crate::pricing::PriceTable::default())
+    }
+
+    pub fn with_driver_and_prices(
+        config: Arc<Config>,
+        state: StateHandle,
+        driver: Arc<dyn LlmDriver>,
+        prices: crate::pricing::PriceTable,
+    ) -> Result<Self> {
         let workdir = state.read(|s| s.workdir.clone());
         let layout = config.layout();
         let workspace = crate::worktree::Workspace::init(&workdir)?;
@@ -87,6 +101,7 @@ impl Engine {
             cargo_lock: Arc::new(tokio::sync::Mutex::new(())),
             workspace,
             worktrees,
+            prices: Arc::new(prices),
             rate_limit_until: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
@@ -100,6 +115,10 @@ impl Engine {
         });
 
         self.ensure_root_seeded()?;
+        // After ensure_root_seeded (which creates main if needed),
+        // sweep any leftover InProgress stages from a crashed prior
+        // run. See `reset_stale_inprogress` for the failure mode.
+        self.reset_stale_inprogress()?;
 
         let max_parallel = self.config.toml.limits.max_parallel_tasks.max(1);
         let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
@@ -206,7 +225,7 @@ impl Engine {
     }
 
     fn ensure_root_seeded(&self) -> Result<()> {
-        let mut g = graph::load(&self.workdir)?;
+        let mut g = graph::load(&self.workdir, self.layout)?;
         if g.root.is_some() {
             return Ok(());
         }
@@ -218,6 +237,79 @@ impl Engine {
         if let Err(e) = self.workspace.commit_main("scaffold: initial render") {
             tracing::warn!("scaffold commit: {e:#}");
         }
+        // The root just appeared; tell connected UIs to refetch the
+        // graph so the tree renders without waiting for the safety-net
+        // resync interval.
+        self.state.emit(UiEvent::GraphTopologyChanged);
+        Ok(())
+    }
+
+    /// On startup, any stage left at `InProgress` on disk belongs to a
+    /// task that crashed (no engine task is running it — we just
+    /// rebuilt `EngineState` from scratch). Reset those stages to
+    /// `NotStarted`, AND cascade-reset every later stage on the same
+    /// node, AND wipe the on-disk slot files for those cascaded stages
+    /// back to placeholders.
+    ///
+    /// Why cascade + wipe: a crash in (say) the Iface stage leaves
+    /// `tests.rs` on disk from a prior run. If we only reset Iface's
+    /// state, the next Iface run sees an authored `tests.rs` already on
+    /// disk; the cargo gate compiles those tests against the new
+    /// (incomplete) iface and the agent gets confused trying to fix
+    /// tests that shouldn't even exist yet. Wiping downstream slots
+    /// makes restart equivalent to a fresh start from the broken stage.
+    ///
+    /// Without this, restarted runs hang: the UI shows nodes "running"
+    /// (because the on-disk graph says so) but no task ever picks them
+    /// up because `stage_is_ready` requires `cur == NotStarted` and
+    /// `InProgress` fails that check.
+    fn reset_stale_inprogress(&self) -> Result<()> {
+        let mut g = graph::load(&self.workdir, self.layout)?;
+        // Per node, find the EARLIEST InProgress stage. The cascade
+        // helper handles everything from there forward, so we don't
+        // need a separate entry per stage on the same node.
+        let mut targets: Vec<(crate::graph::NodeId, Stage)> = Vec::new();
+        for (id, node) in &g.nodes {
+            for stage in Stage::ALL {
+                if node.stages.get(stage) == StageState::InProgress {
+                    targets.push((*id, stage));
+                    break;
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut summaries: Vec<String> = Vec::new();
+        for (id, from) in targets {
+            let name = g.get(id).map(|n| n.name.clone()).unwrap_or_default();
+            let node = g.get_mut(id).expect("target was just found in graph");
+            let changed = graph::reset_stage_and_cascade(node, from);
+            let stages_str = changed
+                .iter()
+                .map(|(s, _)| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            summaries.push(format!("{name}({stages_str})"));
+        }
+        graph::save(&self.workdir, &g)?;
+        // Re-render so cleared content slots become placeholder files
+        // on disk again — leaving the prior authored content there
+        // would defeat the whole point of the cascade-reset.
+        render::render_graph(&self.workdir, &g, self.layout)?;
+        let msg = format!(
+            "restart: reset {} stale InProgress node(s) and cascaded downstream: {}",
+            summaries.len(),
+            summaries.join(", ")
+        );
+        self.note(msg.clone());
+        if let Err(e) = self.workspace.commit_main(&msg) {
+            tracing::warn!("commit stale-inprogress reset: {e:#}");
+        }
+        // Stages and slot files changed — the UI's view of the
+        // tree (stage badges) is now stale. The topology itself
+        // didn't change but enough did to warrant a refetch.
+        self.state.emit(UiEvent::GraphTopologyChanged);
         Ok(())
     }
 
@@ -250,7 +342,7 @@ impl Engine {
         state: StageState,
     ) -> Result<()> {
         let _guard = self.worktrees.main_lock().lock().await;
-        let mut g = graph::load(&self.workdir)?;
+        let mut g = graph::load(&self.workdir, self.layout)?;
         let node_name = g.get(node_id).map(|n| n.name.clone()).unwrap_or_default();
         if let Some(n) = g.get_mut(node_id) {
             n.stages.set(stage, state);
@@ -273,7 +365,7 @@ impl Engine {
     /// are blocked and on WHAT. Otherwise the "scheduler stuck" message
     /// gives no useful information.
     fn diagnose_stuck(&self) -> String {
-        let g = match graph::load(&self.workdir) {
+        let g = match graph::load(&self.workdir, self.layout) {
             Ok(g) => g,
             Err(e) => return format!("  (could not load graph: {e:#})"),
         };
@@ -330,7 +422,7 @@ impl Engine {
     }
 
     fn pick_next_ready(&self) -> Option<(NodeId, Stage)> {
-        let g = graph::load(&self.workdir).ok()?;
+        let g = graph::load(&self.workdir, self.layout).ok()?;
         let order = g.topo_order()?;
         for stage in [
             Stage::Architect,
@@ -351,7 +443,7 @@ impl Engine {
     }
 
     fn all_done(&self) -> Result<bool> {
-        let g = graph::load(&self.workdir)?;
+        let g = graph::load(&self.workdir, self.layout)?;
         if let Some(rid) = g.root {
             if !g
                 .get(rid)
@@ -460,7 +552,7 @@ impl Engine {
             .config
             .toml
             .models
-            .for_stage_role(stage, Role::Writer)
+            .for_stage_role(stage, Role::Writer, attempt)
             .to_string();
         let task = EngineTask {
             id: task_id,
@@ -487,7 +579,7 @@ impl Engine {
         // 1. Writer turn.
         let actor = self
             .clone()
-            .run_role(task_id, node_id, stage, Role::Writer, None, &wt.path)
+            .run_role(task_id, node_id, stage, Role::Writer, None, &wt.path, attempt)
             .await?;
 
         // 2. Optional critique cycle (skip on architect — single-shot).
@@ -513,6 +605,7 @@ impl Engine {
                         ..Default::default()
                     }),
                     &wt.path,
+                    attempt,
                 )
                 .await?;
             let (critique_text, skip_rest) = match critic.critique {
@@ -547,6 +640,7 @@ impl Engine {
                         ..Default::default()
                     }),
                     &wt.path,
+                    attempt,
                 )
                 .await?;
             last_text = revision.text.clone();
@@ -566,6 +660,7 @@ impl Engine {
                         ..Default::default()
                     }),
                     &wt.path,
+                    attempt,
                 )
                 .await?;
             let v = self.state.read(|s| {
@@ -594,7 +689,7 @@ impl Engine {
         // 4. Spec stage produces no cargo content; just confirm it wrote
         //    spec_public_md.
         if stage == Stage::Spec {
-            let g = graph::load(&wt.path)?;
+            let g = graph::load(&wt.path, self.layout)?;
             let n = g.get(node_id).ok_or_else(|| anyhow!("node missing in wt graph"))?;
             if n.spec_public_md.is_none() {
                 let msg = format!("node `{node_name}` spec produced no public.md");
@@ -606,7 +701,7 @@ impl Engine {
         // 5. Pre-land gate + quickfix.
         if let Some(kind) = gate_kind {
             self.clone()
-                .gate_with_quickfix(task_id, node_id, stage, kind, &wt.path)
+                .gate_with_quickfix(task_id, node_id, stage, kind, &wt.path, attempt)
                 .await
                 .with_context(|| format!("pre-land gate failed for {node_name} {stage}"))?;
         }
@@ -623,12 +718,12 @@ impl Engine {
         if let Some(kind) = gate_kind {
             // After rebase: the worktree now sees other tasks' landed
             // content too. Re-render from the (now merged) graph + gate.
-            let g = graph::load(&wt.path)?;
+            let g = graph::load(&wt.path, self.layout)?;
             render::render_graph(&wt.path, &g, self.layout)?;
             self.worktrees
                 .commit_in_worktree(wt, &format!("rerender after rebase: {node_name} {stage}"))?;
             self.clone()
-                .gate_with_quickfix(task_id, node_id, stage, kind, &wt.path)
+                .gate_with_quickfix(task_id, node_id, stage, kind, &wt.path, attempt)
                 .await
                 .with_context(|| {
                     format!("post-rebase gate failed for {node_name} {stage}")
@@ -673,7 +768,7 @@ impl Engine {
     }
 
     fn node_name(&self, node_id: NodeId) -> Option<String> {
-        let g = graph::load(&self.workdir).ok()?;
+        let g = graph::load(&self.workdir, self.layout).ok()?;
         g.get(node_id).map(|n| n.name.clone())
     }
 
@@ -687,6 +782,7 @@ impl Engine {
         stage: Stage,
         kind: GateKind,
         wt_path: &Path,
+        attempt: u32,
     ) -> Result<()> {
         let max_iters = self.config.toml.limits.max_quickfix_iters;
         for iter in 0..=max_iters {
@@ -728,6 +824,7 @@ impl Engine {
                         ..Default::default()
                     }),
                     wt_path,
+                    attempt,
                 )
                 .await?;
         }
@@ -820,48 +917,117 @@ impl Engine {
         role: Role,
         extras: Option<CycleExtras>,
         wt_path: &Path,
+        attempt: u32,
     ) -> Result<RoleOutcome> {
         let model = self
             .config
             .toml
             .models
-            .for_stage_role(stage, role)
+            .for_stage_role(stage, role, attempt)
             .to_string();
 
         // Build prompt context from the worktree's graph state.
-        let g_for_ctx = graph::load(wt_path).unwrap_or_default();
+        // Project mission + style guide are NOT pushed into the user
+        // prompt bundle anymore — they're truly project-stable (same
+        // bytes for every call across the whole run) so they live in
+        // the system prompt below for maximum cache reuse.
+        let g_for_ctx = graph::load(wt_path, self.layout).unwrap_or_default();
         let mut bundle = node_context::ContextBundle::new();
-        bundle.push("Project mission", self.config.problem.trim().to_string());
-        if let Some(style) = &self.config.style {
-            bundle.push("Style guide", style.clone());
-        }
         let inner = node_context::build_for_stage(
             &g_for_ctx,
             node_id,
             stage,
             self.config.toml.limits.max_nodes,
             self.config.toml.limits.max_node_depth,
+            self.layout,
         );
         bundle.extend_from(inner);
-        if let Some(ex) = &extras {
-            bundle.push("Critique cycle context", build_cycle_context(ex, self.config.toml.limits.args_display_cap));
-        }
+        // Cycle context (retry failures, previous critic+reviser output)
+        // is NOT pushed into the bundle anymore — it's the most volatile
+        // piece of state (changes per retry) and we append it at the
+        // very end of the user prompt below, so the prefix through the
+        // role block + role instruction can still cache across retries.
+        let cycle_ctx = extras.as_ref().map(|ex| {
+            build_cycle_context(ex, self.config.toml.limits.args_display_cap)
+        });
         drop(g_for_ctx);
 
         let prompt_limits = crate::tools::PromptLimits {
             max_file_lines: self.config.toml.limits.max_file_lines,
             max_spec_section_lines: self.config.toml.limits.max_spec_section_lines,
         };
-        let preamble = prompts::role_preamble(stage, role, prompt_limits);
+        // Cache-friendly prompt layout, nested-stable to volatile:
+        //
+        //   system prompt =
+        //     universal_preamble()       // framework-wide rules
+        //     Project mission            // project-stable (same bytes
+        //                                // for every call across the
+        //                                // whole run)
+        //     Style guide (if any)       // project-stable
+        //     (Truly stable: every call in the entire run uses this
+        //     exact byte string. Cache hit across nodes, stages, roles.)
+        //
+        //   user prompt =
+        //     <context_doc>            // node-stable bits (ancestor chain,
+        //                              // siblings, this node, own slots —
+        //                              // same across stages on this node
+        //                              // up to first stage divergence)
+        //     <role_block>             // per-(stage,role) instructions
+        //                              // (cache breaks here across stages
+        //                              // or roles, but everything before
+        //                              // it remains shared)
+        //     <role_instruction>       // tiny per-(stage,role) imperative
+        //     <cycle context if any>   // per-retry; appended last so
+        //                              // retries still share prefix up
+        //                              // through role_instruction
+        //
+        // Previously the role preamble lived in the system prompt and
+        // the role instruction sat at position 0 of the user prompt.
+        // Both diverge per stage → no cross-stage cache reuse on the
+        // same node, even though the context is otherwise identical.
+        let system_prompt = {
+            let mut s = String::from(prompts::universal_preamble());
+            // Trim trailing newlines on the preamble before appending so
+            // we get exactly one blank line between sections regardless
+            // of how the .md files end.
+            while s.ends_with('\n') {
+                s.pop();
+            }
+            s.push_str("\n\n# Project mission\n\n");
+            s.push_str(self.config.problem.trim());
+            if let Some(style) = &self.config.style {
+                s.push_str("\n\n# Style guide\n\n");
+                s.push_str(style.trim());
+            }
+            s.push('\n');
+            s
+        };
         let context_doc = bundle.to_markdown();
-        let user_prompt = prompts::role_user_prompt(stage, role);
-        let combined_preamble = format!("{preamble}\n\n{context_doc}");
+        let role_block_str = prompts::role_block(stage, role, prompt_limits);
+        let role_instruction = prompts::role_user_prompt(stage, role);
+        // The provider sees the same tool list at every (stage, role)
+        // call (see `tools::unified_tool_names`) — that keeps the
+        // tool-schemas portion of the request byte-stable so the prompt
+        // cache survives across stages. But not every tool *works* at
+        // every (stage, role): the framework's `require_stage` checks
+        // reject inappropriate calls at runtime. This block tells the
+        // model exactly which subset is live this turn so it doesn't
+        // burn turns on tools that will be rejected.
+        let tools_block = build_tools_eligibility(stage, role);
+        let user_prompt = match &cycle_ctx {
+            Some(c) => format!(
+                "{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}\n\n# Critique cycle context\n\n{c}",
+            ),
+            None => format!(
+                "{context_doc}\n---\n\n{role_block_str}\n\n{tools_block}\n\n{role_instruction}",
+            ),
+        };
 
         // Record system + tool defs + user prompt entries.
         let now = Utc::now();
         let tool_defs = crate::tools::tool_definitions_for(stage, role, prompt_limits);
         let mut entries: Vec<(TranscriptKind, String)> = Vec::new();
-        entries.push((TranscriptKind::System, combined_preamble.clone()));
+        entries.push((TranscriptKind::System, system_prompt.clone()));
         if !tool_defs.is_empty() {
             entries.push((
                 TranscriptKind::ToolDefinitions {
@@ -893,23 +1059,31 @@ impl Engine {
         // fresh from the worktree's `.bureau/` on each call. Rig
         // serializes tool dispatch (concurrency=1) so two tool calls
         // in the same turn can't race on the on-disk state.
-        let ctx = Arc::new(TaskCtx::new(
-            task_id,
-            node_id,
-            stage,
-            role,
-            wt_path.to_path_buf(),
-            self.layout,
-            self.config.toml.limits.max_file_lines,
-            self.config.toml.limits.max_spec_section_lines,
-            self.config.toml.limits.max_nodes,
-            self.config.toml.limits.max_node_depth,
-            self.cargo_lock.clone(),
-        ));
+        let ctx = Arc::new(
+            TaskCtx::new(
+                task_id,
+                node_id,
+                stage,
+                role,
+                wt_path.to_path_buf(),
+                self.layout,
+                self.config.toml.limits.max_file_lines,
+                self.config.toml.limits.max_spec_section_lines,
+                self.config.toml.limits.max_nodes,
+                self.config.toml.limits.max_node_depth,
+                self.cargo_lock.clone(),
+            )
+            // Wire the live state handle: tools live-write tool_call /
+            // tool_result entries into canonical state + broadcast over
+            // SSE; the streaming LLM driver pushes AssistantChunk text
+            // deltas. Without this, the UI sees nothing during the
+            // multi-minute LLM call.
+            .with_state(self.state.clone()),
+        );
 
         let params = DriveParams {
             model: model.clone(),
-            preamble: combined_preamble.clone(),
+            preamble: system_prompt.clone(),
             user_prompt: user_prompt.clone(),
             stage,
             role,
@@ -1010,26 +1184,38 @@ impl Engine {
         let critique = ctx.take_critique();
         let fs_events: Vec<PathBuf> = ctx.drain_fs_events();
 
+        // Tool entries already live-appended to t.transcript by the
+        // tools themselves (see `TaskCtx::live_append_transcript`) and
+        // already broadcast over SSE. We only push the assistant_text
+        // entry here (it's the final aggregated text and isn't
+        // associated with any individual tool call). ctx_entries was
+        // drained earlier just to feed `collect_failed_tool_calls`;
+        // do NOT extend t.transcript with it — that would duplicate
+        // everything the tools already wrote.
+        //
+        // For cost: the streaming driver already applied `usage` to
+        // state per-turn via `live_apply_partial_cost`. Only add it
+        // here if the driver returned `applied_via_streaming = false`
+        // (mock driver in tests). Adding twice would double-count.
         let transcript_cap = self.config.toml.limits.task_transcript_cap;
+        let applied_via_streaming = resp.applied_via_streaming;
         self.state.write(|s| {
             if let Some(t) = s.tasks.get_mut(&task_id) {
-                t.transcript.extend(ctx_entries.iter().cloned());
                 t.transcript.push(final_entry.clone());
-                t.cost.add(&usage);
+                if !applied_via_streaming {
+                    t.cost.add(&usage);
+                }
                 if matches!(role, Role::Judge) {
                     t.final_verdict = verdict.clone();
                 }
                 crate::state::cap_transcript(t, transcript_cap);
-                s.total_cost.add(&usage);
-                s.estimated_cost_usd = compute_total_cost(s);
+                if !applied_via_streaming {
+                    s.total_cost.add(&usage);
+                }
+                s.estimated_cost_usd = compute_total_cost(s, &self.prices);
             }
         });
-        for entry in ctx_entries {
-            self.state.emit(UiEvent::TranscriptAppended {
-                task_id,
-                entry,
-            });
-        }
+        let _ = ctx_entries; // already used for failed-tool detection
         self.state.emit(UiEvent::TranscriptAppended {
             task_id,
             entry: final_entry,
@@ -1073,6 +1259,56 @@ struct CycleExtras {
     prior_failed_tools: Vec<(String, String, String)>,
     quickfix_gate_output: Option<String>,
     quickfix_iter: Option<(u32, u32)>,
+}
+
+/// Render the "Tools eligible at this turn" block — the model sees the
+/// full unified tool list in the API request (for cache stability), but
+/// only a subset is actually valid at this (stage, role). This block
+/// tells it which subset. Format kept short and stable so it doesn't
+/// itself bust the prompt cache more than it has to.
+///
+/// QuickFixer is a separate mode with its own attached tool list (no
+/// unified catalog applies), so we render a simpler block there.
+fn build_tools_eligibility(stage: Stage, role: Role) -> String {
+    let accepted = crate::tools::tools_accepted_at(stage, role);
+    let accepted_str = accepted
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if matches!(role, Role::QuickFixer) {
+        // Quickfix has its own attached tool list — there's nothing to
+        // "reject" because the unified catalog isn't in play here.
+        return format!(
+            "# Tools eligible at this turn\n\n\
+             QUICKFIX mode for the **{stage}** stage. All attached tools \
+             are eligible: {accepted_str}\n"
+        );
+    }
+    let unified = crate::tools::unified_tool_names();
+    let rejected: Vec<&'static str> = unified
+        .iter()
+        .copied()
+        .filter(|n| !accepted.contains(n))
+        .collect();
+    let rejected_str = if rejected.is_empty() {
+        "(none — every tool in the list is eligible this turn)".to_string()
+    } else {
+        rejected
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "# Tools eligible at this turn\n\n\
+         The tool schemas you see attached include every tool the framework \
+         knows about. Only the subset below will actually do anything at this \
+         **{stage}** stage / **{role:?}** role — the rest will be rejected by \
+         the framework's stage/role gate.\n\n\
+         **Eligible (call these):** {accepted_str}\n\n\
+         **Rejected if called (don't bother):** {rejected_str}\n"
+    )
 }
 
 fn build_cycle_context(ex: &CycleExtras, args_cap: usize) -> String {
@@ -1125,7 +1361,18 @@ fn build_cycle_context(ex: &CycleExtras, args_cap: usize) -> String {
 
 fn gate_kind_for(stage: Stage) -> Option<GateKind> {
     match stage {
-        Stage::Architect | Stage::Spec => None,
+        // Architect commits the whole rendered tree; Spec can call
+        // decompose which re-renders ancestor mod.rs / Cargo.toml and
+        // writes placeholder Rust files for newly-added children.
+        // Either can produce a tree that fails to compile (bad
+        // architect tree, malformed Cargo.toml entry, duplicate
+        // member names, etc.). Without a gate here, the broken state
+        // lands on main and every downstream stage's critic sees
+        // "pre-existing errors" it has to ignore. `Check` is cheap
+        // when nothing changed (cargo's incremental compile is a
+        // no-op on a clean tree) and triggers the quickfix loop when
+        // it isn't.
+        Stage::Architect | Stage::Spec => Some(GateKind::Check),
         Stage::Iface => Some(GateKind::Check),
         Stage::Tests => Some(GateKind::TestNoRun),
         Stage::Impl | Stage::Debug => Some(GateKind::Test),
@@ -1224,72 +1471,33 @@ fn is_transient(msg: &str) -> bool {
         || msg.contains("ECONNRESET")
 }
 
-fn compute_total_cost(state: &EngineState) -> f64 {
-    let p_in_default = 1.0;
-    let p_out_default = 3.0;
+/// Compute the total dollar cost spent so far across every task.
+/// Uses live OpenRouter prices when available, falling back to
+/// `pricing::fallback_price` for any model the live table doesn't know
+/// about. Cache-read and cache-write tokens are billed at the model's
+/// own cache rates (no more hardcoded Claude-specific 0.1x/1.25x).
+fn compute_total_cost(state: &EngineState, prices: &crate::pricing::PriceTable) -> f64 {
     let mut total = 0.0;
     for t in state.tasks.values() {
-        let model = &t.model;
-        let p_in = price_in(model).unwrap_or(p_in_default);
-        let p_out = price_out(model).unwrap_or(p_out_default);
-        let billable_in = t.cost.input_tokens.saturating_sub(t.cost.cached_input_tokens) as f64
-            + t.cost.cache_creation_input_tokens as f64 * 1.25;
-        let cached = t.cost.cached_input_tokens as f64 * 0.1;
-        let inp = (billable_in + cached) * p_in / 1_000_000.0;
-        let out = t.cost.output_tokens as f64 * p_out / 1_000_000.0;
-        total += inp + out;
+        let p = prices
+            .get(&t.model)
+            .unwrap_or_else(|| crate::pricing::fallback_price(&t.model));
+        // input_tokens is the FULL prompt token count; cached + cache-creation
+        // are subsets of it. The non-cached residue is billed at full input rate.
+        let cached = t.cost.cached_input_tokens;
+        let creation = t.cost.cache_creation_input_tokens;
+        let uncached = t
+            .cost
+            .input_tokens
+            .saturating_sub(cached)
+            .saturating_sub(creation);
+        let dollars_in = uncached as f64 * p.input
+            + cached as f64 * p.cache_read
+            + creation as f64 * p.cache_write;
+        let dollars_out = t.cost.output_tokens as f64 * p.output;
+        total += (dollars_in + dollars_out) / 1_000_000.0;
     }
     total
-}
-
-fn price_in(model: &str) -> Option<f64> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("opus") {
-        Some(15.0)
-    } else if m.contains("sonnet") {
-        Some(3.0)
-    } else if m.contains("haiku") {
-        Some(1.0)
-    } else if m.contains("gpt-4o-mini") || m.contains("4o-mini") {
-        Some(0.15)
-    } else if m.contains("gpt-4o") {
-        Some(2.5)
-    } else if m.contains("gpt-5-mini") {
-        Some(0.25)
-    } else if m.contains("qwen3-coder") {
-        Some(0.2)
-    } else if m.contains("nemotron") {
-        Some(0.4)
-    } else if m.contains("deepseek") {
-        Some(0.3)
-    } else {
-        None
-    }
-}
-
-fn price_out(model: &str) -> Option<f64> {
-    let m = model.to_ascii_lowercase();
-    if m.contains("opus") {
-        Some(75.0)
-    } else if m.contains("sonnet") {
-        Some(15.0)
-    } else if m.contains("haiku") {
-        Some(5.0)
-    } else if m.contains("gpt-4o-mini") || m.contains("4o-mini") {
-        Some(0.6)
-    } else if m.contains("gpt-4o") {
-        Some(10.0)
-    } else if m.contains("gpt-5-mini") {
-        Some(2.0)
-    } else if m.contains("qwen3-coder") {
-        Some(0.8)
-    } else if m.contains("nemotron") {
-        Some(1.6)
-    } else if m.contains("deepseek") {
-        Some(1.2)
-    } else {
-        None
-    }
 }
 
 /// Stage readiness check: a (node, stage) is ready iff its preconditions

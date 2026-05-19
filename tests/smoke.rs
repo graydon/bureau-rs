@@ -116,7 +116,7 @@ fn context_for_iface_inlines_dep_public_rs() {
     let errs_id = g.add_child(root, errs).unwrap();
     let user_id = g.add_child(root, Node::new("user", "uses errors")).unwrap();
     g.add_dep(user_id, errs_id).unwrap();
-    let bundle = node_context::build_for_iface(&g, user_id);
+    let bundle = node_context::build_for_iface(&g, user_id, bureau_rs::render::Layout::SingleCrate);
     let md = bundle.to_markdown();
     assert!(md.contains("Dependency `errors`"));
     assert!(md.contains("pub enum Err"));

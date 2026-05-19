@@ -148,9 +148,13 @@ pub struct MockLlmDriver {
     /// reply. If the queue is empty, the driver returns an empty response
     /// (which for an actor stage is typically a failure).
     scripts: Mutex<HashMap<(Stage, Role), Vec<ScriptedReply>>>,
-    /// Every (stage, role, preamble) seen by `drive`, in order. Lets tests
-    /// assert on what the engine sent to the model.
-    pub received: Mutex<Vec<(Stage, Role, String)>>,
+    /// Every (stage, role, preamble, user_prompt) seen by `drive`, in
+    /// order. The 3-tuple shape used to be (stage, role, preamble) —
+    /// project context lived in the preamble. After the cache-friendly
+    /// prompt restructure context_doc moved into `user_prompt`, so
+    /// tests that want to assert on it need both. The legacy tuple
+    /// shape is preserved via `received_legacy()` for old call sites.
+    pub received: Mutex<Vec<(Stage, Role, String, String)>>,
 }
 
 impl MockLlmDriver {
@@ -215,9 +219,12 @@ impl LlmDriver for MockLlmDriver {
         params: DriveParams,
         ctx: Arc<TaskCtx>,
     ) -> Result<DriveResponse> {
-        self.received
-            .lock()
-            .push((params.stage, params.role, params.preamble.clone()));
+        self.received.lock().push((
+            params.stage,
+            params.role,
+            params.preamble.clone(),
+            params.user_prompt.clone(),
+        ));
         let reply = {
             let mut scripts = self.scripts.lock();
             let queue = scripts.get_mut(&(params.stage, params.role));
@@ -237,6 +244,10 @@ impl LlmDriver for MockLlmDriver {
         Ok(DriveResponse {
             output: reply.assistant_text,
             usage: reply.usage,
+            // Mock doesn't stream → the engine must add `usage` to
+            // state at end of `run_role` since we didn't apply it
+            // incrementally during the call.
+            applied_via_streaming: false,
         })
     }
 }

@@ -19,7 +19,11 @@ layout = "workspace"
 # These are OpenRouter model IDs — substitute whatever you have access to.
 
 # Default model for everything not overridden below.
-default = "deepseek/deepseek-v4-flash"
+# default = "deepseek/deepseek-v4-flash"
+# default = "nvidia/nemotron-3-super-120b-a12b:free"
+# default = "qwen/qwen3.5-flash-02-23"
+# default = "tencent/hy3-preview"
+default = "deepseek/deepseek-v4-pro"
 
 # Architect lays out the entire project tree in ONE call — it deserves
 # the strongest model you have. Suggested alternatives:
@@ -27,6 +31,12 @@ default = "deepseek/deepseek-v4-flash"
 #   architect = "openai/gpt-5.5"
 #   architect = "google/google/gemini-3.1-pro-preview"
 architect = "openai/gpt-5.5"
+
+# Used on RETRY (attempt > 1) at the stage-retry layer, overriding every
+# other field. Rationale: if the cheap default got stuck on a (node,
+# stage), retrying with the same model usually re-fails the same way;
+# swapping to something smarter is often what unsticks it.
+escalated = "anthropic/claude-opus-4.7"
 
 # Per-stage examples (commented out; uncomment + edit as desired):
 # spec  = "openai/gpt-5.5              # smarter for spec writing

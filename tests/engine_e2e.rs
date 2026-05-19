@@ -19,6 +19,7 @@ fn make_config(workdir: std::path::PathBuf, project_name: &str) -> Arc<Config> {
         toml: ConfigToml {
             models: ModelConfig {
                 default: "mock".into(),
+                escalated: None,
                 architect: None,
                 spec: None,
                 iface: None,
@@ -95,21 +96,24 @@ async fn engine_injects_project_mission_into_root_node_preamble() {
     // The first call should be (Architect, Writer) on the root.
     let received = driver.received.lock().clone();
     assert!(!received.is_empty(), "engine should drive at least once");
-    let (stage, role, preamble) = &received[0];
+    let (stage, role, preamble, _user_prompt) = &received[0];
     assert_eq!(*stage, Stage::Architect);
     assert_eq!(*role, Role::Writer);
+    // Project mission lives in the SYSTEM prompt now (top-tier cache
+    // stability: every call across every (node, stage, role) sees the
+    // same bytes, so providers can reuse the cached prefix project-wide).
     assert!(
         preamble.contains("Project mission"),
-        "preamble must include the Project mission section: {preamble}"
+        "system preamble must include the Project mission section: {preamble}"
     );
     assert!(
         preamble.contains("SMB/CIFS"),
-        "preamble must contain the actual problem.md content: {preamble}"
+        "system preamble must contain the actual problem.md content: {preamble}"
     );
 
     // Root node's description should also be derived from problem.md, not
     // the placeholder "Project root."
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     let root = g.root.unwrap();
     let desc = &g.get(root).unwrap().description;
     assert_ne!(desc, "Project root.", "root description should be derived from problem.md");
@@ -175,15 +179,15 @@ async fn unresolved_tool_failure_triggers_forced_retry_until_resolved() {
 
     // Two spec-writer invocations should have happened (initial + retry).
     let received = driver.received.lock().clone();
-    let spec_writer_drives: Vec<&(Stage, Role, String)> = received
+    let spec_writer_drives: Vec<&(Stage, Role, String, String)> = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Writer)
         .collect();
     assert!(
         spec_writer_drives.len() >= 2,
         "expected ≥2 spec writer drives (initial + forced retry); got {}: {:?}",
         spec_writer_drives.len(),
-        received.iter().map(|(s, r, _)| (s, r)).collect::<Vec<_>>()
+        received.iter().map(|(s, r, _, _)| (s, r)).collect::<Vec<_>>()
     );
     // The second spec-writer drive should be the focused RETRY one.
     let retry_preamble = &spec_writer_drives[1].2;
@@ -241,9 +245,9 @@ async fn retry_preamble_truncates_long_args() {
 
     // Find the spec-stage retry preamble (architect ran first).
     let received = driver.received.lock().clone();
-    let spec_drives: Vec<&(Stage, Role, String)> = received
+    let spec_drives: Vec<&(Stage, Role, String, String)> = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Writer)
         .collect();
     assert!(spec_drives.len() >= 2, "should have retried spec");
     let retry_preamble = &spec_drives[1].2;
@@ -298,9 +302,9 @@ async fn args_display_cap_is_configurable_and_respected() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver.clone()).unwrap());
     let _ = engine.run().await;
     let received = driver.received.lock().clone();
-    let spec_drives: Vec<&(Stage, Role, String)> = received
+    let spec_drives: Vec<&(Stage, Role, String, String)> = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Writer)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Writer)
         .collect();
     let retry_preamble = &spec_drives[1].2;
     let count_lorem = retry_preamble.matches("lorem ipsum").count();
@@ -367,17 +371,20 @@ async fn failed_decompose_in_actor_turn_surfaces_to_critic_and_reviser() {
     // Find the critic's preamble — the next role after the actor.
     let critic = received
         .iter()
-        .find(|(s, r, _)| *s == Stage::Spec && *r == Role::Critic)
+        .find(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Critic)
         .expect("critic should have run");
+    // Failed-tool context now lives in the user prompt (context_doc),
+    // not the preamble (system prompt) — see the cache-friendly prompt
+    // layout in engine.rs.
     assert!(
-        critic.2.contains("Prior turn had failed tool calls"),
-        "critic preamble must surface the failed submit_spec call: {}",
-        critic.2
+        critic.3.contains("Prior turn had failed tool calls"),
+        "critic user prompt must surface the failed submit_spec call: {}",
+        critic.3
     );
     assert!(
-        critic.2.contains("submit_spec"),
+        critic.3.contains("submit_spec"),
         "critic should see which tool failed: {}",
-        critic.2
+        critic.3
     );
 }
 
@@ -424,7 +431,7 @@ async fn engine_advances_root_through_spec_stage() {
     // we test full pipelines elsewhere.
     let _ = engine.run().await;
 
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     let root = g.root.unwrap();
     assert_eq!(g.get(root).unwrap().stages.spec, StageState::Done);
     assert_eq!(
@@ -511,7 +518,7 @@ use super::public::*;
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
     let snap = state.snapshot();
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     let root = g.root.unwrap();
     let n = g.get(root).unwrap();
 
@@ -645,7 +652,7 @@ async fn engine_decomposes_root_then_advances_children() {
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
     let snap = state.snapshot();
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     if !result.is_ok() {
         eprintln!("---- decompose-test diagnostic ----");
         for n in g.iter() {
@@ -769,7 +776,7 @@ async fn engine_runs_two_independent_nodes_in_parallel() {
 
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     assert_eq!(g.len(), 3);
     for n in g.iter() {
         assert_eq!(n.stages.spec, StageState::Done, "node `{}` spec", n.name);
@@ -818,7 +825,7 @@ async fn engine_halts_on_unsatisfactory_judge_verdict() {
 
     let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
     let result = engine.run().await;
-    let g = bureau_rs::graph::load(&workdir).unwrap();
+    let g = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
     let root = g.root.unwrap();
     let n = g.get(root).unwrap();
     // Spec stage should be Failed because judge rejected every attempt.
@@ -880,11 +887,11 @@ async fn critic_clean_skips_reviser_and_judge() {
     let received = driver.received.lock();
     let spec_reviser = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Reviser)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Reviser)
         .count();
     let spec_judge = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Judge)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Judge)
         .count();
     assert_eq!(spec_reviser, 0, "reviser should not run when critic is clean");
     assert_eq!(spec_judge, 0, "judge should not run when critic is clean");
@@ -944,12 +951,66 @@ async fn critic_with_issues_runs_full_cycle() {
     let received = driver.received.lock();
     let spec_reviser = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Reviser)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Reviser)
         .count();
     let spec_judge = received
         .iter()
-        .filter(|(s, r, _)| *s == Stage::Spec && *r == Role::Judge)
+        .filter(|(s, r, _, _)| *s == Stage::Spec && *r == Role::Judge)
         .count();
     assert_eq!(spec_reviser, 1, "reviser should run when critic has issues");
     assert_eq!(spec_judge, 1, "judge should run when critic has issues");
+}
+
+#[tokio::test]
+async fn restart_resets_stale_inprogress_stages() {
+    // Simulates a restart in a workdir where a prior run crashed
+    // mid-task: the on-disk graph has stages stuck at InProgress.
+    // Without the reset sweep, `stage_is_ready` filters them out
+    // forever and the pipeline hangs.
+    use bureau_rs::graph::{self, NodeGraph, Node, StageState};
+    use bureau_rs::worktree::Workspace;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workdir = tmp.path().to_path_buf();
+    // Seed a graph with the root's Architect stuck at InProgress on disk.
+    let ws = Workspace::init(&workdir).unwrap();
+    let mut g = NodeGraph::new();
+    let mut root = Node::new("tiny", "");
+    root.crate_boundary = true;
+    root.stages.architect = StageState::InProgress;
+    g.insert_root(root).unwrap();
+    graph::save(&workdir, &g).unwrap();
+    ws.commit_main("seed: stale inprogress").unwrap();
+
+    let config = make_config(workdir.clone(), "tiny");
+    let state = StateHandle::new(EngineState::new(
+        workdir.clone(),
+        workdir.clone(),
+        "tiny".into(),
+    ));
+
+    let driver = Arc::new(MockLlmDriver::new());
+    driver.script(
+        Stage::Architect,
+        Role::Writer,
+        vec![ScriptedCall::submit_architecture_simple(&[])],
+    );
+    driver.script(
+        Stage::Spec,
+        Role::Writer,
+        vec![ScriptedCall::submit_spec("# tiny\n\nbody\n")],
+    );
+    driver.auto_approve_judges();
+
+    let engine = Arc::new(Engine::with_driver(config, state.clone(), driver).unwrap());
+    let _ = engine.run().await;
+
+    // Architect should have been re-run (not stuck at InProgress).
+    let g2 = bureau_rs::graph::load(&workdir, bureau_rs::render::Layout::SingleCrate).unwrap();
+    let root = g2.root.unwrap();
+    assert_eq!(
+        g2.get(root).unwrap().stages.architect,
+        StageState::Done,
+        "architect should have been re-driven after the stale InProgress was reset"
+    );
 }

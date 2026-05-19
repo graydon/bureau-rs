@@ -113,6 +113,14 @@ pub struct TaskCtx {
     /// Held for the duration of any cargo invocation so parallel tasks
     /// don't trample each other's `target/` dir / lock files.
     pub cargo_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Optional handle to the engine's live `StateHandle`. When set,
+    /// tools push transcript entries into the canonical
+    /// `s.tasks[task_id].transcript` **and** broadcast a
+    /// [`UiEvent::TranscriptAppended`] in the same operation — see
+    /// [`Self::live_append_transcript`]. The streaming LLM driver also
+    /// uses it to push [`UiEvent::AssistantChunk`] deltas. `None` for
+    /// mock-driver tests that don't have a `StateHandle` available.
+    live: Option<crate::state::StateHandle>,
 }
 
 /// All mutable accumulator state for a `TaskCtx`. Lives behind a single
@@ -229,7 +237,98 @@ impl TaskCtx {
             max_node_depth,
             state: Mutex::new(TaskCtxState::default()),
             cargo_lock,
+            live: None,
         }
+    }
+
+    /// Attach the engine's `StateHandle`. With this set:
+    /// - tools live-write transcript entries to the canonical
+    ///   `s.tasks[task_id].transcript` AND broadcast over SSE
+    ///   (see [`Self::live_append_transcript`])
+    /// - the streaming LLM driver pushes [`UiEvent::AssistantChunk`]
+    ///   text deltas
+    ///
+    /// Without it, tools still record entries into `ctx`'s internal
+    /// transcript buffer (for the engine to drain at end-of-call), but
+    /// nothing reaches the UI mid-stage — used by unit tests and the
+    /// mock driver.
+    pub fn with_state(mut self, handle: crate::state::StateHandle) -> Self {
+        self.live = Some(handle);
+        self
+    }
+
+    /// Push a UI event onto the live broadcast channel. Dropped (no
+    /// receivers) and disconnected (channel closed) errors are both
+    /// silently ignored — emit is best-effort. Most code should prefer
+    /// [`Self::live_append_transcript`] for transcript entries so that
+    /// `/api/task_transcript` reflects the same view as live SSE.
+    pub fn emit(&self, ev: crate::state::UiEvent) {
+        if let Some(h) = &self.live {
+            h.emit(ev);
+        }
+    }
+
+    /// Live-append a transcript entry. Writes the entry into
+    /// `s.tasks[task_id].transcript` (so `/api/task_transcript` is
+    /// always current) AND broadcasts a [`UiEvent::TranscriptAppended`]
+    /// (so connected SSE clients with the task selected see it
+    /// instantly). This is the way tool calls / tool results / etc.
+    /// reach the UI mid-stage — without it they'd buffer in
+    /// `ctx.state.transcript` until the engine drains at end-of-call.
+    pub fn live_append_transcript(&self, entry: TranscriptEntry) {
+        let task_id = self.task_id;
+        if let Some(h) = &self.live {
+            let cloned = entry.clone();
+            h.write(|s| {
+                if let Some(t) = s.tasks.get_mut(&task_id) {
+                    t.transcript.push(cloned);
+                }
+            });
+            h.emit(crate::state::UiEvent::TranscriptAppended { task_id, entry });
+        }
+    }
+
+    /// Apply a per-turn token usage delta to canonical state AND emit
+    /// a [`UiEvent::TaskCost`] event. The streaming LLM driver calls
+    /// this after each turn's `Final` marker so the token counter
+    /// ticks live during a long multi-turn call.
+    ///
+    /// We mutate state (not just emit a view) so that:
+    /// 1. The periodic `/api/state` poll picks up the running total
+    ///    instead of resetting the UI to the engine's stale "at last
+    ///    completed call" value.
+    /// 2. Other engine code reading `s.total_cost` (e.g. the cost
+    ///    cap) sees the latest figure mid-stage instead of being
+    ///    blind to in-flight burn.
+    ///
+    /// To avoid double-counting at end of `run_role`, the engine no
+    /// longer adds `DriveResponse.usage` to state — see the comment
+    /// at the end of `run_role`. The streaming driver returns
+    /// `DriveResponse.usage = 0` because all of it was applied
+    /// incrementally. (The mock driver doesn't stream, so for tests
+    /// the engine still applies its returned usage; this is gated on
+    /// `DriveResponse.applied_via_streaming`.)
+    pub fn live_apply_partial_cost(&self, delta: &crate::state::TokenUsage) {
+        let Some(h) = &self.live else { return };
+        let task_id = self.task_id;
+        let (task_cost, total, estimated_usd) = h.write(|s| {
+            if let Some(t) = s.tasks.get_mut(&task_id) {
+                t.cost.add(delta);
+            }
+            s.total_cost.add(delta);
+            let task_cost = s
+                .tasks
+                .get(&task_id)
+                .map(|t| t.cost.clone())
+                .unwrap_or_default();
+            (task_cost, s.total_cost.clone(), s.estimated_cost_usd)
+        });
+        h.emit(crate::state::UiEvent::TaskCost {
+            task_id,
+            cost: task_cost,
+            total,
+            estimated_usd,
+        });
     }
 
     /// Inspectors for the orchestrator. These run between tool calls (with
@@ -281,7 +380,7 @@ impl TaskCtx {
     /// they need to read or mutate the graph; on mutation they then
     /// call `render_after_write_with(&graph)` to persist + re-render.
     fn load_graph(&self) -> Result<NodeGraph, ToolFailure> {
-        crate::graph::load(&self.workdir)
+        crate::graph::load(&self.workdir, self.layout)
             .map_err(|e| ToolFailure::Other(format!("load graph: {e}")))
     }
 
@@ -299,6 +398,16 @@ impl TaskCtx {
             content: s.clone(),
             role: Some(self.role),
         };
+        // Live-append to canonical state + broadcast. Doing it here
+        // (before pushing into ctx.state.transcript) means:
+        //   1. `/api/task_transcript` sees this entry immediately
+        //      (otherwise a mid-stage click would return a transcript
+        //      missing all the in-flight tool calls).
+        //   2. Connected SSE clients receive a TranscriptAppended
+        //      event right now — no waiting for the engine to drain
+        //      ctx.state.transcript at end-of-run_role.
+        tracing::debug!(task_id = %self.task_id, tool = %name, "tool_call live emit");
+        self.live_append_transcript(entry.clone());
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
         s.hash(&mut hasher);
@@ -353,6 +462,15 @@ impl TaskCtx {
                 role: Some(self.role),
             },
         };
+        // Live-append to canonical state + broadcast. See
+        // record_call_check_loop for the rationale.
+        tracing::debug!(
+            task_id = %self.task_id,
+            tool = %name,
+            ok = r.is_ok(),
+            "tool_result live emit"
+        );
+        self.live_append_transcript(entry.clone());
         self.state.lock().transcript.push(entry);
         r
     }
@@ -372,10 +490,30 @@ impl TaskCtx {
     /// inside `render_graph`) and tracking which files changed for the
     /// SSE event stream. Tools that mutate the graph in memory call
     /// this with the mutated graph; tools that only read don't.
+    ///
+    /// Does NOT emit [`UiEvent::GraphTopologyChanged`] — that signal
+    /// is reserved for the small set of tools that actually mutate
+    /// topology (architect, decompose, root seed). Firing it on every
+    /// content-only `submit_*` would have the client refetching
+    /// `/api/graph` dozens of times per second under normal write
+    /// load, which was overwhelming the BroadcastStream consumer.
     fn render_after_write(&self, graph: &NodeGraph) -> Result<(), ToolFailure> {
         let report = render::render_graph(&self.workdir, graph, self.layout)
             .map_err(|e| ToolFailure::Other(format!("re-render failed: {e}")))?;
         self.state.lock().fs_events.extend(report.files_written);
+        Ok(())
+    }
+
+    /// Like [`Self::render_after_write`] but also fires
+    /// [`UiEvent::GraphTopologyChanged`]. Call this from tools that
+    /// added / removed nodes or dep edges (architect's
+    /// `submit_architecture`, decompose's child-add path) so the UI
+    /// refetches `/api/graph` and repaints the tree. The other
+    /// `submit_*` tools just fill slot content and use the plain
+    /// version.
+    fn render_after_topology_change(&self, graph: &NodeGraph) -> Result<(), ToolFailure> {
+        self.render_after_write(graph)?;
+        self.emit(crate::state::UiEvent::GraphTopologyChanged);
         Ok(())
     }
 }
@@ -550,7 +688,14 @@ fn submit_spec_apply(
         });
     }
 
-    ctx.render_after_write(&g)?;
+    // Spec can both fill content (always) and add dep edges (sometimes).
+    // If deps were added, topology changed — fire the topology-changed
+    // signal so the UI refetches /api/graph. Otherwise just content.
+    if deps_added.is_empty() {
+        ctx.render_after_write(&g)?;
+    } else {
+        ctx.render_after_topology_change(&g)?;
+    }
     Ok(SubmitSpecOk {
         public_bytes,
         public_lines,
@@ -959,7 +1104,8 @@ fn submit_architecture_apply(
         g.get_mut(root_id).unwrap().external_crate_deps = args.external_deps;
     }
 
-    ctx.render_after_write(&g)?;
+    // Architect built the whole tree → topology definitively changed.
+    ctx.render_after_topology_change(&g)?;
     Ok(SubmitArchitectureOk {
         nodes_created,
         deps_added,
@@ -1640,13 +1786,31 @@ impl Tool for ReadFileTool {
                 if !is_readable_by_node(&g, self.ctx.node_id, &rel, self.ctx.layout) {
                     let hint = readable_paths_hint(&g, self.ctx.node_id, self.ctx.layout);
                     return Err(ToolFailure::Other(format!(
-                        "read_file: path '{}' is not readable from this node's scope. \
-                         Readable: own slots, any node's public surface (public.rs / \
-                         spec/<path>/public.md), ancestor specs, and framework files \
-                         (Cargo.toml, mod.rs, lib.rs).{hint}",
+                        "read_file: path '{}' is not in this node's read scope. Readable \
+                         paths are: this node's own slots; ancestor specs (public.md / \
+                         private.md); any node's public surface (public.rs / \
+                         spec/<path>/public.md). Framework files (mod.rs, lib.rs, \
+                         Cargo.toml) are NOT readable — they're auto-generated and carry \
+                         no design info.{hint}",
                         args.path
                     )));
                 }
+            }
+            if !abs.exists() {
+                // Policy-allowed but absent on disk. Most common cause:
+                // the model guessed a slot that hasn't been authored
+                // yet (e.g. asking for sibling's public.rs before that
+                // node finished its iface stage), or a path the
+                // framework doesn't render at all. Tell the model
+                // exactly that — the surrounding "Files you can read"
+                // context lists the paths that ARE present.
+                return Err(ToolFailure::Other(format!(
+                    "read_file: '{}' does not exist on disk yet. The path is policy-allowed \
+                     but the slot hasn't been authored (or the framework doesn't render this \
+                     file). Pick a path from the `Files you can read` context section that \
+                     names a real file.",
+                    args.path
+                )));
             }
             let content = std::fs::read_to_string(&abs).map_err(|e| {
                 ToolFailure::Other(format!("read {}: {e}", args.path))
@@ -2025,22 +2189,22 @@ fn readable_paths_hint(g: &NodeGraph, self_id: NodeId, layout: render::Layout) -
 ///     visible API
 ///   - ancestors: also their `private.md` (descendants benefit from
 ///     ancestor design context)
-///   - framework files (`Cargo.toml`, `mod.rs`, `lib.rs`): always
 /// Denied:
 ///   - other nodes' `private.rs`, `tests.rs`, `private.md`: these
 ///     are internals or test code that other nodes shouldn't reason
 ///     about
+///   - framework-rendered files (`mod.rs`, `lib.rs`, `Cargo.toml`):
+///     these carry no design info — just `pub mod foo;` lines the
+///     framework writes itself. Previously allowed; the model burned
+///     calls reading them and frequently hit "file does not exist"
+///     because not every crate layout produces lib.rs (we render
+///     `mod.rs` as the entry point).
 pub(crate) fn is_readable_by_node(
     g: &NodeGraph,
     self_id: NodeId,
     rel: &std::path::Path,
     layout: render::Layout,
 ) -> bool {
-    if let Some(fname) = rel.file_name().and_then(|s| s.to_str()) {
-        if matches!(fname, "Cargo.toml" | "mod.rs" | "lib.rs") {
-            return true;
-        }
-    }
     let Some((target_id, slot)) = render::resolve_path_to_slot(g, rel, layout) else {
         return false;
     };
@@ -2295,14 +2459,21 @@ pub fn tool_description(name: &str, limits: PromptLimits) -> String {
         ),
 
         "submit_public" => format!(
-            "Author `public.rs` — the node's public API surface. \
-            ALLOWED items: `pub trait Foo {{ fn bar(...) -> ...; }}` (signatures only, \
+            "Author `public.rs` — the node's public API surface. This file must \
+            DEFINE each public item; it must NOT re-export anything. \
+            ALLOWED: `pub trait Foo {{ fn bar(...) -> ...; }}` (signatures only, \
             NO method bodies, NO default impls); `pub struct/enum/type/const/static` \
-            declarations; `use super::private::ConcreteType` re-aliases; doc comments. \
-            FORBIDDEN: `mod` (the framework auto-generates the module scaffolding — do \
-            not write your own `mod` blocks); `impl` blocks of any kind; `fn` outside \
-            trait declarations; `extern crate`; macro invocations; `pub use crate::*` \
-            cross-node re-exports. Hard cap: {max_file} lines."
+            declarations defined here; non-pub `use super::private::Inner` to refer \
+            to a private type in a public type position (e.g. \
+            `pub struct Wrapper(super::private::Inner);`); doc comments. \
+            FORBIDDEN: ANY `pub use` — including `pub use super::private::Foo`, \
+            `pub use private::Foo`, `pub use self::*`, `pub use std::*`, and \
+            `pub use crate::other_node::Foo`. The smuggle pattern of defining a \
+            type in `private.rs` and re-exporting it here is rejected; move the \
+            DEFINITION into `public.rs`. Also forbidden: `mod` (the framework \
+            auto-generates module scaffolding); `impl` blocks; `fn` outside trait \
+            decls; `extern crate`; macro invocations. To rename a foreign type, \
+            use `pub type Alias = <foreign>;`. Hard cap: {max_file} lines."
         ),
 
         "submit_private" => format!(
@@ -2422,82 +2593,145 @@ pub fn tool_definitions_for(
         .collect()
 }
 
+/// Tool catalog for one (stage, role) invocation.
+///
+/// **For every non-quickfix call, this returns the same constant list.**
+/// The set is identical across all stages and roles so the tool-list
+/// portion of the LLM request — which providers include in the prompt
+/// cache key — is byte-identical across the entire run. That lets the
+/// cross-stage / cross-node / cross-role caching wins from #80, #84,
+/// #85 actually land at the provider side instead of being defeated by
+/// a per-stage tool list.
+///
+/// Per-stage runtime gating still works: each tool's `call()` does its
+/// own `require_stage` check and rejects inappropriate calls with a
+/// clear error. The user prompt's role block tells the model which
+/// tools to actually call at this (stage, role). The model occasionally
+/// picks a wrong one and burns one turn on the rejection — bounded
+/// cost, single cache hit on the tool list pays for itself many times
+/// over.
+///
+/// Quickfix is its own mode (different tools entirely — read/write/patch
+/// for direct file edits) and keeps a separate list.
 pub fn tool_names_for(stage: Stage, role: Role) -> Vec<&'static str> {
+    if matches!(role, Role::QuickFixer) {
+        return quickfix_tools_for(stage);
+    }
+    unified_tool_names()
+}
+
+/// The constant tool list every non-quickfix (stage, role) sees. The
+/// only deliberate omission is the quickfix-only set (write_file,
+/// write_file_range, apply_patch) — those bypass the submit_* validation
+/// pipeline and only make sense inside the quickfix inner loop.
+pub fn unified_tool_names() -> Vec<&'static str> {
+    vec![
+        ReadFileTool::NAME,
+        SubmitArchitectureTool::NAME,
+        SubmitSpecTool::NAME,
+        SubmitPublicTool::NAME,
+        SubmitPrivateTool::NAME,
+        SubmitTestsTool::NAME,
+        SubmitCritiqueTool::NAME,
+        SubmitVerdictTool::NAME,
+        CargoCheckTool::NAME,
+        CargoTestTool::NAME,
+        CargoTestNoRunTool::NAME,
+        CargoClippyTool::NAME,
+    ]
+}
+
+/// Which tools the framework will ACCEPT at the given (stage, role).
+/// Other tools in the unified catalog are listed but their `call()` will
+/// reject with a "wrong stage/role" error. Surfaced in the user prompt
+/// so the model knows what's actually going to work at this turn.
+///
+/// For QuickFixer, the tool list is already the quickfix-specific set
+/// (read/write/patch + the stage's gate tool) — every tool in it is
+/// eligible by construction, so we just return that list.
+pub fn tools_accepted_at(stage: Stage, role: Role) -> Vec<&'static str> {
     use Role::*;
     use Stage::*;
     if matches!(role, QuickFixer) {
         return quickfix_tools_for(stage);
     }
-    // ReadFileTool is registered on the base agent in `llm::run_rig_agent`
-    // for every (stage, role), so it's always in the catalog.
+    // read_file is universal — every non-quickfix role can inspect files.
     let mut v: Vec<&'static str> = vec![ReadFileTool::NAME];
-    let rest: Vec<&'static str> = match (stage, role) {
-        (Architect, Writer) => vec![SubmitArchitectureTool::NAME],
-        (Architect, _) => vec![],
+    match (stage, role) {
+        (Architect, Writer) => v.push(SubmitArchitectureTool::NAME),
+        (Architect, _) => {} // single-shot stage, non-writer roles produce nothing.
 
-        (Spec, Writer) | (Spec, Reviser) => vec![SubmitSpecTool::NAME],
-        (Spec, Critic) => vec![SubmitCritiqueTool::NAME],
-        (Spec, Judge) => vec![SubmitVerdictTool::NAME],
+        (Spec, Writer) | (Spec, Reviser) => v.push(SubmitSpecTool::NAME),
+        (Spec, Critic) => v.push(SubmitCritiqueTool::NAME),
+        (Spec, Judge) => v.push(SubmitVerdictTool::NAME),
 
-        (Iface, Writer) | (Iface, Reviser) => vec![
-            SubmitPublicTool::NAME,
-            SubmitPrivateTool::NAME,
-            CargoCheckTool::NAME,
-        ],
-        (Iface, Critic) => vec![CargoCheckTool::NAME, SubmitCritiqueTool::NAME],
-        (Iface, Judge) => vec![CargoCheckTool::NAME, SubmitVerdictTool::NAME],
+        (Iface, Writer) | (Iface, Reviser) => {
+            v.push(SubmitPublicTool::NAME);
+            v.push(SubmitPrivateTool::NAME);
+            v.push(CargoCheckTool::NAME);
+        }
+        (Iface, Critic) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(SubmitCritiqueTool::NAME);
+        }
+        (Iface, Judge) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(SubmitVerdictTool::NAME);
+        }
 
-        (Tests, Writer) | (Tests, Reviser) => vec![
-            SubmitTestsTool::NAME,
-            CargoCheckTool::NAME,
-            CargoTestNoRunTool::NAME,
-        ],
-        (Tests, Critic) => vec![
-            CargoCheckTool::NAME,
-            CargoTestNoRunTool::NAME,
-            SubmitCritiqueTool::NAME,
-        ],
-        (Tests, Judge) => vec![
-            CargoCheckTool::NAME,
-            CargoTestNoRunTool::NAME,
-            SubmitVerdictTool::NAME,
-        ],
+        (Tests, Writer) | (Tests, Reviser) => {
+            v.push(SubmitTestsTool::NAME);
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestNoRunTool::NAME);
+        }
+        (Tests, Critic) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestNoRunTool::NAME);
+            v.push(SubmitCritiqueTool::NAME);
+        }
+        (Tests, Judge) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestNoRunTool::NAME);
+            v.push(SubmitVerdictTool::NAME);
+        }
 
-        (Impl, Writer) | (Impl, Reviser) => vec![
-            SubmitPrivateTool::NAME,
-            CargoCheckTool::NAME,
-            CargoTestTool::NAME,
-            CargoClippyTool::NAME,
-        ],
-        (Impl, Critic) => vec![
-            CargoCheckTool::NAME,
-            CargoTestTool::NAME,
-            CargoClippyTool::NAME,
-            SubmitCritiqueTool::NAME,
-        ],
-        (Impl, Judge) => vec![
-            CargoCheckTool::NAME,
-            CargoTestTool::NAME,
-            SubmitVerdictTool::NAME,
-        ],
+        (Impl, Writer) | (Impl, Reviser) => {
+            v.push(SubmitPrivateTool::NAME);
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+            v.push(CargoClippyTool::NAME);
+        }
+        (Impl, Critic) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+            v.push(CargoClippyTool::NAME);
+            v.push(SubmitCritiqueTool::NAME);
+        }
+        (Impl, Judge) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+            v.push(SubmitVerdictTool::NAME);
+        }
 
-        (Debug, Writer) | (Debug, Reviser) => vec![
-            SubmitPrivateTool::NAME,
-            SubmitTestsTool::NAME,
-            CargoCheckTool::NAME,
-            CargoTestTool::NAME,
-            CargoClippyTool::NAME,
-        ],
-        (Debug, Critic) => vec![
-            CargoCheckTool::NAME,
-            CargoTestTool::NAME,
-            SubmitCritiqueTool::NAME,
-        ],
-        (Debug, Judge) => vec![CargoTestTool::NAME, SubmitVerdictTool::NAME],
+        (Debug, Writer) | (Debug, Reviser) => {
+            v.push(SubmitPrivateTool::NAME);
+            v.push(SubmitTestsTool::NAME);
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+            v.push(CargoClippyTool::NAME);
+        }
+        (Debug, Critic) => {
+            v.push(CargoCheckTool::NAME);
+            v.push(CargoTestTool::NAME);
+            v.push(SubmitCritiqueTool::NAME);
+        }
+        (Debug, Judge) => {
+            v.push(CargoTestTool::NAME);
+            v.push(SubmitVerdictTool::NAME);
+        }
 
-        (_, QuickFixer) => unreachable!(),
-    };
-    v.extend(rest);
+        (_, QuickFixer) => unreachable!("quickfix handled at top of fn"),
+    }
     v
 }
 
@@ -2614,6 +2848,122 @@ mod tests {
         (tmp, root, ctx)
     }
 
+    /// Build a fixture with the StateHandle wired up so live-emit
+    /// paths can be exercised. The state's task table has a single
+    /// task entry for the ctx's task_id so live_append_transcript has
+    /// somewhere to write to.
+    fn fixture_with_state(stage: Stage) -> (tempfile::TempDir, Arc<TaskCtx>, crate::state::StateHandle) {
+        use crate::state::{EngineState, StateHandle};
+        let (tmp, _root, ctx_no_state) = fixture(stage);
+        let task_id = ctx_no_state.task_id;
+        let workdir = ctx_no_state.workdir.clone();
+        let state = StateHandle::new(EngineState::new(
+            workdir.clone(),
+            workdir.clone(),
+            "app".into(),
+        ));
+        // Pre-create a task entry so live_append_transcript finds it.
+        state.write(|s| {
+            s.tasks.insert(
+                task_id,
+                crate::state::EngineTask {
+                    id: task_id,
+                    node_id: ctx_no_state.node_id,
+                    node_name: "app".into(),
+                    stage,
+                    status: crate::state::TaskStatus::Running,
+                    model: "mock".into(),
+                    transcript: Vec::new(),
+                    cost: crate::state::TokenUsage::default(),
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                    final_verdict: None,
+                    retries: 0,
+                },
+            );
+        });
+        let ctx = Arc::new(
+            TaskCtx::new(
+                task_id,
+                ctx_no_state.node_id,
+                stage,
+                Role::Writer,
+                workdir,
+                Layout::SingleCrate,
+                300,
+                500,
+                64,
+                5,
+                Arc::new(tokio::sync::Mutex::new(())),
+            )
+            .with_state(state.clone()),
+        );
+        (tmp, ctx, state)
+    }
+
+    #[tokio::test]
+    async fn tool_call_live_emits_event_and_appends_to_canonical_state() {
+        // The streaming-visibility contract: when a tool runs, the
+        // tool_call AND tool_result entries must be visible BEFORE
+        // the engine drains ctx at end-of-run_role. Without this, the
+        // UI sees a multi-minute blank gap during tool-heavy stages
+        // and `/api/task_transcript` returns a stale view if the user
+        // clicks the task mid-stage.
+        let (_tmp, ctx, state) = fixture_with_state(Stage::Spec);
+        let task_id = ctx.task_id;
+        let mut rx = state.subscribe();
+
+        let tool = SubmitSpecTool { ctx };
+        tool.call(SubmitSpecArgs {
+            public: "# Spec\n\nDoes the thing.".into(),
+            private: None,
+            deps: vec![],
+        })
+        .await
+        .unwrap();
+
+        // Canonical state has BOTH the tool_call AND tool_result
+        // entries — already, no engine drain needed.
+        let entries = state.read(|s| s.tasks.get(&task_id).unwrap().transcript.clone());
+        let kinds: Vec<_> = entries
+            .iter()
+            .map(|e| match &e.kind {
+                TranscriptKind::ToolCall { .. } => "tool_call",
+                TranscriptKind::ToolResult { .. } => "tool_result",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["tool_call", "tool_result"],
+            "expected tool_call followed by tool_result in canonical state"
+        );
+
+        // SSE subscribers see them as separate TranscriptAppended
+        // events (in the right order).
+        let mut got_kinds: Vec<&'static str> = Vec::new();
+        // Drain whatever's already queued — both events should be
+        // sitting there because `tool.call` is fully synchronous from
+        // our point of view (no awaits inside the lifecycle except
+        // ones rig might insert, which still complete before we get
+        // here).
+        loop {
+            match rx.try_recv() {
+                Ok(crate::state::UiEvent::TranscriptAppended { entry, .. }) => {
+                    got_kinds.push(match &entry.kind {
+                        TranscriptKind::ToolCall { .. } => "tool_call",
+                        TranscriptKind::ToolResult { .. } => "tool_result",
+                        _ => "other",
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got_kinds, vec!["tool_call", "tool_result"]);
+    }
+
     #[tokio::test]
     async fn submit_spec_public_persists_to_node_and_disk() {
         let (tmp, root, ctx) = fixture(Stage::Spec);
@@ -2628,7 +2978,7 @@ mod tests {
             .unwrap();
         assert!(r.public_lines >= 2);
         assert_eq!(
-            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().spec_public_md.as_deref(),
+            crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().spec_public_md.as_deref(),
             Some("# Spec\n\nDoes the thing.")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/public.md")).unwrap();
@@ -2647,7 +2997,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().spec_private_md.as_deref(),
+            crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().spec_private_md.as_deref(),
             Some("# Notes\n\nWhy I chose option B.")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("spec/app/private.md")).unwrap();
@@ -2718,7 +3068,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.deps_added.len(), 1);
-        let g = crate::graph::load(tmp.path()).unwrap();
+        let g = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap();
         // leaf's iface MUST stay Done — we don't mutate dependents.
         assert_eq!(g.get(leaf).unwrap().stages.iface, StageState::Done);
         assert_eq!(g.get(leaf).unwrap().stages.impl_, StageState::Done);
@@ -2780,7 +3130,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.nodes_created, 3); // util, core, engine
         assert_eq!(r.deps_added, 1); // core -> util
-        let g = crate::graph::load(tmp.path()).unwrap();
+        let g = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap();
         assert_eq!(g.len(), 4); // root + 3
         let core = g.find_by_name("core").unwrap();
         let util = g.find_by_name("util").unwrap();
@@ -2880,7 +3230,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.no_change);
-        assert!(crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.is_some());
+        assert!(crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().public_rs.is_some());
     }
 
     #[tokio::test]
@@ -2890,6 +3240,22 @@ mod tests {
         let err = tool
             .call(SubmitRustArgs {
                 content: "pub struct X; impl X { pub fn n() -> Self { X } }".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolFailure::Validate(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_public_rejects_private_smuggle() {
+        // `pub use super::private::Inner` defines the real type in private
+        // and re-exports it as the public surface. The validator rejects
+        // it so the smuggle pattern can never reach the cargo gate.
+        let (_tmp, _root, ctx) = fixture(Stage::Iface);
+        let tool = SubmitPublicTool { ctx };
+        let err = tool
+            .call(SubmitRustArgs {
+                content: "pub use super::private::Inner;\n".into(),
             })
             .await
             .unwrap_err();
@@ -2953,31 +3319,58 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalogs_per_stage_role() {
-        // Spot-check
-        assert!(tool_names_for(Stage::Spec, Role::Writer).contains(&"submit_spec"));
-        // The composite tool replaces the separate public/private/decompose
-        // trio — those names should NOT appear anywhere.
+    fn unified_tool_list_is_byte_identical_across_stages_and_roles() {
+        // The whole point of unification: every non-quickfix call sees
+        // the same tool catalog (so the API tool-schemas portion of the
+        // request is byte-stable for prompt caching). Per-stage gating
+        // happens at runtime via `require_stage` checks inside each
+        // tool's `call()`.
+        let baseline = tool_names_for(Stage::Spec, Role::Writer);
         for stage in Stage::ALL {
             for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge] {
-                let names = tool_names_for(stage, role);
-                assert!(!names.contains(&"submit_spec_public"));
-                assert!(!names.contains(&"submit_spec_private"));
-                assert!(!names.contains(&"decompose"));
+                assert_eq!(
+                    tool_names_for(stage, role),
+                    baseline,
+                    "tool list at ({stage}, {role:?}) must equal the spec/writer baseline",
+                );
             }
         }
-        assert!(tool_names_for(Stage::Iface, Role::Writer).contains(&"submit_public"));
-        assert!(tool_names_for(Stage::Tests, Role::Writer).contains(&"submit_tests"));
-        assert!(tool_names_for(Stage::Impl, Role::Writer).contains(&"submit_private"));
-        assert!(tool_names_for(Stage::Impl, Role::Judge).contains(&"submit_verdict"));
-        // Critic gets diagnostics in coding stages but no verdict tool.
-        assert!(!tool_names_for(Stage::Impl, Role::Critic).contains(&"submit_verdict"));
-        // Spec critic has submit_critique (plus the universal read_file).
-        assert_eq!(
-            tool_names_for(Stage::Spec, Role::Critic),
-            vec!["read_file", "submit_critique"]
-        );
-        // Every critic gets submit_critique.
+        // Quickfix is the exception — different mode, different tools.
+        assert_ne!(tool_names_for(Stage::Iface, Role::QuickFixer), baseline);
+        // The composite tool replaces the separate public/private/decompose
+        // trio — those legacy names must NOT appear anywhere.
+        assert!(!baseline.contains(&"submit_spec_public"));
+        assert!(!baseline.contains(&"submit_spec_private"));
+        assert!(!baseline.contains(&"decompose"));
+    }
+
+    #[test]
+    fn tools_accepted_at_filters_to_per_stage_role_subset() {
+        // The per-(stage, role) "accepted" list is what the prompt's
+        // Tools-eligibility block tells the model to call. It's a strict
+        // subset of the unified catalog.
+        let unified = unified_tool_names();
+        for stage in Stage::ALL {
+            for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge] {
+                let accepted = tools_accepted_at(stage, role);
+                for name in &accepted {
+                    assert!(
+                        unified.contains(name),
+                        "accepted tool {name} at ({stage}, {role:?}) not in unified catalog"
+                    );
+                }
+            }
+        }
+        // Spot-checks of the per-(stage, role) accepted sets.
+        assert!(tools_accepted_at(Stage::Spec, Role::Writer).contains(&"submit_spec"));
+        assert!(tools_accepted_at(Stage::Iface, Role::Writer).contains(&"submit_public"));
+        assert!(tools_accepted_at(Stage::Tests, Role::Writer).contains(&"submit_tests"));
+        assert!(tools_accepted_at(Stage::Impl, Role::Writer).contains(&"submit_private"));
+        assert!(tools_accepted_at(Stage::Impl, Role::Judge).contains(&"submit_verdict"));
+        // Critic doesn't get submit_verdict; judge doesn't get submit_critique.
+        assert!(!tools_accepted_at(Stage::Impl, Role::Critic).contains(&"submit_verdict"));
+        assert!(!tools_accepted_at(Stage::Impl, Role::Judge).contains(&"submit_critique"));
+        // Every critic in a content-producing stage gets submit_critique.
         for stage in [
             Stage::Spec,
             Stage::Iface,
@@ -2986,9 +3379,18 @@ mod tests {
             Stage::Debug,
         ] {
             assert!(
-                tool_names_for(stage, Role::Critic).contains(&"submit_critique"),
-                "stage {stage} critic missing submit_critique"
+                tools_accepted_at(stage, Role::Critic).contains(&"submit_critique"),
+                "stage {stage} critic should accept submit_critique"
             );
+        }
+        // read_file is universal — present at every (stage, role).
+        for stage in Stage::ALL {
+            for role in [Role::Writer, Role::Critic, Role::Reviser, Role::Judge] {
+                assert!(
+                    tools_accepted_at(stage, role).contains(&"read_file"),
+                    "read_file should be universally accepted: missing at ({stage}, {role:?})"
+                );
+            }
         }
     }
 
@@ -3130,7 +3532,7 @@ mod tests {
             .unwrap();
         assert!(!r.no_change);
         assert_eq!(
-            crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.as_deref(),
+            crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().public_rs.as_deref(),
             Some("pub trait Foo {}\n")
         );
         let on_disk = std::fs::read_to_string(tmp.path().join("src/public.rs")).unwrap();
@@ -3176,7 +3578,7 @@ mod tests {
     async fn write_file_rejects_other_nodes_slots() {
         // Add a sibling child whose public.rs belongs to it, not root.
         let (_tmp, _root, ctx) = fixture(Stage::Iface);
-        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        let mut g = crate::graph::load(&ctx.workdir, ctx.layout).unwrap();
         let _child = g
             .add_child(ctx.node_id, Node::new("helper", "helper"))
             .unwrap();
@@ -3236,7 +3638,7 @@ mod tests {
     async fn write_file_range_inserts_between_existing_lines() {
         let (tmp, root, ctx) = fixture(Stage::Iface);
         // Seed public.rs with three lines.
-        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        let mut g = crate::graph::load(&ctx.workdir, ctx.layout).unwrap();
         g.get_mut(root).unwrap().public_rs =
             Some("pub trait A {}\npub trait B {}\npub trait C {}\n".into());
         render::render_graph(&ctx.workdir, &g, Layout::SingleCrate).unwrap();
@@ -3250,7 +3652,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let final_content = crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.clone().unwrap();
+        let final_content = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().public_rs.clone().unwrap();
         assert_eq!(
             final_content,
             "pub trait A {}\npub trait B {}\npub trait B_inserted {}\npub trait C {}\n"
@@ -3260,7 +3662,7 @@ mod tests {
     #[tokio::test]
     async fn apply_patch_applies_unified_diff() {
         let (tmp, root, ctx) = fixture(Stage::Iface);
-        let mut g = crate::graph::load(&ctx.workdir).unwrap();
+        let mut g = crate::graph::load(&ctx.workdir, ctx.layout).unwrap();
         g.get_mut(root).unwrap().public_rs = Some("pub trait Old {}\n".into());
         render::render_graph(&ctx.workdir, &g, Layout::SingleCrate).unwrap();
         let patch = "--- a/src/public.rs\n+++ b/src/public.rs\n@@ -1 +1 @@\n-pub trait Old {}\n+pub trait New {}\n";
@@ -3272,7 +3674,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.files_changed, vec!["src/public.rs".to_string()]);
-        let after = crate::graph::load(tmp.path()).unwrap().get(root).unwrap().public_rs.clone().unwrap();
+        let after = crate::graph::load(tmp.path(), Layout::SingleCrate).unwrap().get(root).unwrap().public_rs.clone().unwrap();
         assert!(after.contains("New"));
         assert!(!after.contains("Old"));
     }

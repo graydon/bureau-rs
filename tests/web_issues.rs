@@ -34,6 +34,7 @@ async fn fetch_issues(workdir: std::path::PathBuf, tasks: Vec<EngineTask>) -> se
     let r = router(AppState {
         state,
         workdir,
+        layout: bureau_rs::render::Layout::SingleCrate,
         worktrees: None,
     });
     let resp = r

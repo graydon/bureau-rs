@@ -20,6 +20,7 @@
 //! the harness has already given the model what it needs.
 
 use crate::graph::{Node, NodeGraph, NodeId, Stage};
+use crate::render::Layout;
 
 /// One labeled chunk of the context document. Rendered as `# {title}\n\n{body}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,67 +115,111 @@ pub fn import_path(graph: &NodeGraph, from: NodeId, to: NodeId) -> String {
     }
 }
 
-/// Build the context for the **spec** stage: ancestor specs (so the design
-/// thread of "why we're decomposing this way" is visible), siblings'
-/// specs (for consistency with parallel decompositions), the current graph
-/// overview (for decompose reuse), and the node's existing spec if any.
+// ============================================================================
+// Builders are laid out for prompt-cache prefix reuse.
+//
+// Provider prompt caches match a common PREFIX of the request: every byte
+// shared with an earlier request is free; the first differing byte breaks
+// the cache. So the bundle order matters — stable content first, variable
+// content last. The "scope of stability" hierarchy:
+//
+//   tier 1: stable across the entire project (every node, every stage)
+//           — Project mission, Style guide — these live in the SYSTEM
+//           prompt now (see `engine.rs` system_prompt assembly), not
+//           in the user-prompt context bundle, so they're part of the
+//           truly stable prefix every provider caches.
+//   tier 2: stable across all descendants of an ancestor
+//           — ancestor chain, root-down
+//   tier 3: stable across this node's siblings (same parent)
+//           — parent's full public spec, parent's public.rs (iface)
+//           — sibling list (lex-ordered, INCLUDING self so every sibling
+//             sees the same content here)
+//   tier 4: stable across this node's stages and roles within a stage
+//           — graph overview (spec), this node's header
+//   tier 5: per-stage or per-node-content
+//           — dep ifaces, own spec, own already-authored slots
+//   tier 6: per-turn / most volatile
+//           — critique cycle context (engine appends last)
+//
+// Earlier code put node-specific stuff (the "Node" header, the node's own
+// spec) FIRST. Two sibling nodes' requests then diverged at byte zero of
+// the context_doc — no cache reuse across the tree. The order below puts
+// the broadly-shared content up front and pushes the node-specific bits
+// to the end.
+// ============================================================================
+
+/// Build the context for the **spec** stage.
 pub fn build_for_spec(
     graph: &NodeGraph,
     node_id: NodeId,
     max_nodes: usize,
     max_node_depth: usize,
+    layout: Layout,
 ) -> ContextBundle {
     let mut bundle = ContextBundle::new();
     let Some(node) = graph.get(node_id) else {
         return bundle;
     };
     let depth = graph.ancestors(node_id, true).len().saturating_sub(1);
-    bundle.push(
-        "Node",
-        format!(
-            "**name**: `{}`\n**module path**: `{}`\n**depth**: {} (cap {})\n**description**: {}\n",
-            node.name,
-            module_path(graph, node_id),
-            depth,
-            max_node_depth,
-            node.description
-        ),
-    );
+
+    // Tier 2: ancestor chain (root-down), stable across descendants.
+    push_ancestor_chain_brief(&mut bundle, graph, node_id);
+    push_parent_full_spec(&mut bundle, graph, node_id);
+
+    // Tier 3: sibling specs (lex-ordered, includes self).
+    push_siblings_lex(&mut bundle, graph, node_id);
+
+    // Tier 4: graph overview / decomposition budget (stable across this
+    // node's roles, varies slowly as the graph grows).
+    bundle.push("Existing graph", render_graph_overview(graph));
     bundle.push(
         "Decomposition budget",
         decomposition_budget_text(graph.len(), max_nodes, depth, max_node_depth),
     );
-    push_ancestor_specs(&mut bundle, graph, node_id);
-    push_sibling_specs(&mut bundle, graph, node_id);
+
+    // Tier 4 (this node identity) → Tier 5 (own content).
+    push_this_node_header(&mut bundle, graph, node, max_node_depth, depth);
+    push_readable_files(&mut bundle, graph, node, layout);
     push_own_spec(&mut bundle, node, "Existing spec for this node");
-    bundle.push("Existing graph", render_graph_overview(graph));
+
     bundle
 }
 
-/// Build the context for the **iface** stage: own spec, parent's iface
-/// (the API this node fits into), each dep's iface, and ancestor specs.
-pub fn build_for_iface(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
+/// Build the context for the **iface** stage.
+pub fn build_for_iface(graph: &NodeGraph, node_id: NodeId, layout: Layout) -> ContextBundle {
     let mut bundle = ContextBundle::new();
     let Some(node) = graph.get(node_id) else {
         return bundle;
     };
-    bundle.push("Node", node_header(graph, node));
-    push_own_spec(&mut bundle, node, "Spec for this node");
-    push_ancestor_specs(&mut bundle, graph, node_id);
+    let depth = graph.ancestors(node_id, true).len().saturating_sub(1);
+
+    push_ancestor_chain_brief(&mut bundle, graph, node_id);
+    push_parent_full_spec(&mut bundle, graph, node_id);
     push_parent_iface(&mut bundle, graph, node_id);
+    push_siblings_lex(&mut bundle, graph, node_id);
     push_dep_ifaces(&mut bundle, graph, node);
-    bundle.push("Module path", module_path(graph, node_id));
+
+    push_this_node_header(&mut bundle, graph, node, /*depth cap unused*/ 0, depth);
+    push_readable_files(&mut bundle, graph, node, layout);
+    push_own_spec(&mut bundle, node, "Spec for this node");
+
     bundle
 }
 
-/// Build the context for the **tests** stage: spec, own iface (the surface
-/// to test), deps' ifaces (test setup may need them), and ancestor context.
-pub fn build_for_tests(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
+/// Build the context for the **tests** stage.
+pub fn build_for_tests(graph: &NodeGraph, node_id: NodeId, layout: Layout) -> ContextBundle {
     let mut bundle = ContextBundle::new();
     let Some(node) = graph.get(node_id) else {
         return bundle;
     };
-    bundle.push("Node", node_header(graph, node));
+    let depth = graph.ancestors(node_id, true).len().saturating_sub(1);
+
+    push_ancestor_chain_brief(&mut bundle, graph, node_id);
+    push_siblings_lex(&mut bundle, graph, node_id);
+    push_dep_ifaces(&mut bundle, graph, node);
+
+    push_this_node_header(&mut bundle, graph, node, 0, depth);
+    push_readable_files(&mut bundle, graph, node, layout);
     push_own_spec(&mut bundle, node, "Spec for this node");
     if let Some(public_rs) = &node.public_rs {
         bundle.push(
@@ -182,19 +227,24 @@ pub fn build_for_tests(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
             wrap_rust(public_rs),
         );
     }
-    push_dep_ifaces(&mut bundle, graph, node);
-    push_ancestor_specs_brief(&mut bundle, graph, node_id);
+
     bundle
 }
 
-/// Build the context for the **impl** stage: spec, own iface, own tests
-/// (the goal — make these pass), deps' ifaces (the tools available).
-pub fn build_for_impl(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
+/// Build the context for the **impl** stage.
+pub fn build_for_impl(graph: &NodeGraph, node_id: NodeId, layout: Layout) -> ContextBundle {
     let mut bundle = ContextBundle::new();
     let Some(node) = graph.get(node_id) else {
         return bundle;
     };
-    bundle.push("Node", node_header(graph, node));
+    let depth = graph.ancestors(node_id, true).len().saturating_sub(1);
+
+    push_ancestor_chain_brief(&mut bundle, graph, node_id);
+    push_siblings_lex(&mut bundle, graph, node_id);
+    push_dep_ifaces(&mut bundle, graph, node);
+
+    push_this_node_header(&mut bundle, graph, node, 0, depth);
+    push_readable_files(&mut bundle, graph, node, layout);
     push_own_spec(&mut bundle, node, "Spec for this node");
     if let Some(public_rs) = &node.public_rs {
         bundle.push(
@@ -214,7 +264,7 @@ pub fn build_for_impl(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
             wrap_rust(private_rs),
         );
     }
-    push_dep_ifaces(&mut bundle, graph, node);
+
     bundle
 }
 
@@ -292,19 +342,17 @@ fn push_own_spec(bundle: &mut ContextBundle, node: &Node, base_title: &str) {
     }
 }
 
-/// Build the context for the **debug** stage: identical to `impl` plus the
-/// caller is responsible for appending the failing-test list / cargo errors.
-pub fn build_for_debug(graph: &NodeGraph, node_id: NodeId) -> ContextBundle {
-    let mut bundle = build_for_impl(graph, node_id);
-    bundle.sections.insert(
-        0,
-        ContextSection {
-            title: "Debug stage".to_string(),
-            body: "Tests didn't pass after `impl`. Look at the failing-test \
-                   list (appended below) and apply minimal fixes to make them \
-                   pass without changing the public interface."
-                .to_string(),
-        },
+/// Build the context for the **debug** stage: identical to `impl` plus a
+/// trailing "Debug stage" note. Note goes AFTER the impl-shaped context
+/// so the prefix matches impl's context up to that point (cousins
+/// transitioning impl→debug share the cache).
+pub fn build_for_debug(graph: &NodeGraph, node_id: NodeId, layout: Layout) -> ContextBundle {
+    let mut bundle = build_for_impl(graph, node_id, layout);
+    bundle.push(
+        "Debug stage",
+        "Tests didn't pass after `impl`. Look at the failing-test \
+         list (appended below) and apply minimal fixes to make them \
+         pass without changing the public interface.",
     );
     bundle
 }
@@ -318,24 +366,25 @@ pub fn build_for_stage(
     stage: Stage,
     max_nodes: usize,
     max_node_depth: usize,
+    layout: Layout,
 ) -> ContextBundle {
     match stage {
         // Architect runs on the root, before any per-node work. Its
         // context is just the project mission (already prepended by the
         // engine) plus a depth/cap budget — no ancestor specs etc.
         Stage::Architect => build_for_architect(graph, node_id, max_nodes, max_node_depth),
-        Stage::Spec => build_for_spec(graph, node_id, max_nodes, max_node_depth),
-        Stage::Iface => build_for_iface(graph, node_id),
-        Stage::Tests => build_for_tests(graph, node_id),
-        Stage::Impl => build_for_impl(graph, node_id),
-        Stage::Debug => build_for_debug(graph, node_id),
+        Stage::Spec => build_for_spec(graph, node_id, max_nodes, max_node_depth, layout),
+        Stage::Iface => build_for_iface(graph, node_id, layout),
+        Stage::Tests => build_for_tests(graph, node_id, layout),
+        Stage::Impl => build_for_impl(graph, node_id, layout),
+        Stage::Debug => build_for_debug(graph, node_id, layout),
     }
 }
 
 /// Build the architect-stage context bundle. Minimal — the architect
 /// just needs the budget (so it knows how many nodes/depth it has).
-/// The Project mission is prepended by the engine, so we don't add it
-/// here.
+/// The Project mission lives in the system prompt (see engine.rs),
+/// not in the user-prompt context bundle.
 pub fn build_for_architect(
     graph: &NodeGraph,
     node_id: NodeId,
@@ -372,61 +421,53 @@ pub fn build_for_architect(
 
 // ---- helpers ----
 
-fn node_header(graph: &NodeGraph, node: &Node) -> String {
-    format!(
-        "**name**: `{}`\n**module path**: `{}`\n**description**: {}\n",
+/// Header for THIS node: name, description, module path, depth (where
+/// applicable). Pushed LATE in the bundle — it's specific to this node
+/// so it would otherwise bust prefix caching across siblings.
+///
+/// `max_node_depth_or_zero` is the spec stage's depth cap (passed only
+/// from `build_for_spec`); other stages pass 0 and we omit the depth
+/// line.
+fn push_this_node_header(
+    bundle: &mut ContextBundle,
+    graph: &NodeGraph,
+    node: &Node,
+    max_node_depth_or_zero: usize,
+    depth: usize,
+) {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "**name**: `{}`\n**module path**: `{}`\n",
         node.name,
         module_path(graph, node.id),
-        node.description
-    )
+    ));
+    if max_node_depth_or_zero > 0 {
+        body.push_str(&format!(
+            "**depth**: {} (cap {})\n",
+            depth, max_node_depth_or_zero,
+        ));
+    }
+    body.push_str(&format!("**description**: {}\n", node.description));
+    bundle.push("This node", body);
 }
 
-/// Insert ancestor context. The IMMEDIATE parent gets its full public
-/// spec inlined (since it's the abstraction this node fits into and the
-/// API it must respect). All farther ancestors collapse to a single
-/// brief list — name + one-line summary — so the prompt stays focused
-/// on context this node actually needs to act on. The private parts of
-/// ancestors' specs are NEVER included; that's implementation chatter
-/// for the ancestor's own writer.
-fn push_ancestor_specs(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
-    let ancestors = graph.ancestors(node_id, false);
+/// Push the ancestor chain root-down as a single brief list. Stable
+/// across all descendants of the deepest ancestor in the list: a node
+/// and its cousin share the chain up to (and including) the lowest
+/// common ancestor.
+///
+/// We list ancestors only (self excluded). Each entry is a one-liner —
+/// the parent's FULL public spec is pushed separately by
+/// `push_parent_full_spec` so callers that don't want it (tests, impl,
+/// debug) can omit it without losing the prefix-friendly brief list.
+fn push_ancestor_chain_brief(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
+    // `graph.ancestors(node, false)` returns parent first, then grandparent,
+    // etc. We want root-down for the brief list.
+    let mut ancestors = graph.ancestors(node_id, false);
     if ancestors.is_empty() {
         return;
     }
-    // First: full public spec of the immediate parent (closest first).
-    let parent_id = ancestors[0];
-    if let Some(parent) = graph.get(parent_id) {
-        if let Some(pub_md) = &parent.spec_public_md {
-            bundle.push(
-                format!("Parent spec (public): `{}`", parent.name),
-                pub_md.clone(),
-            );
-        }
-    }
-    // Then: brief one-liner for each farther ancestor.
-    if ancestors.len() > 1 {
-        let mut s = String::new();
-        for anc_id in &ancestors[1..] {
-            let Some(anc) = graph.get(*anc_id) else {
-                continue;
-            };
-            let summary = ancestor_summary(anc);
-            s.push_str(&format!("- **`{}`**: {}\n", anc.name, summary));
-        }
-        if !s.is_empty() {
-            bundle.push("Farther ancestors (brief)", s);
-        }
-    }
-}
-
-/// Brief variant: just one-liners for every ancestor (no full parent
-/// spec inlined). Used in stages where the model already has the full
-/// own-spec + own-iface and doesn't need parent context too.
-fn push_ancestor_specs_brief(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
-    let ancestors = graph.ancestors(node_id, false);
-    if ancestors.is_empty() {
-        return;
-    }
+    ancestors.reverse(); // root first → parent last
     let mut s = String::new();
     for anc_id in ancestors {
         let Some(anc) = graph.get(anc_id) else {
@@ -435,7 +476,31 @@ fn push_ancestor_specs_brief(bundle: &mut ContextBundle, graph: &NodeGraph, node
         let summary = ancestor_summary(anc);
         s.push_str(&format!("- **`{}`**: {}\n", anc.name, summary));
     }
-    bundle.push("Ancestor context (brief)", s);
+    if !s.is_empty() {
+        bundle.push("Ancestor chain (root → parent, brief)", s);
+    }
+}
+
+/// Push the IMMEDIATE parent's full public spec. Stable across siblings
+/// of `node_id`. Called only by stages that need the parent's full
+/// design narrative (spec, iface) — not by tests/impl/debug, which work
+/// against this node's own iface + tests, not against the parent's spec.
+fn push_parent_full_spec(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
+    let Some(node) = graph.get(node_id) else {
+        return;
+    };
+    let Some(parent_id) = node.parent else {
+        return;
+    };
+    let Some(parent) = graph.get(parent_id) else {
+        return;
+    };
+    if let Some(pub_md) = &parent.spec_public_md {
+        bundle.push(
+            format!("Parent spec (public): `{}`", parent.name),
+            pub_md.clone(),
+        );
+    }
 }
 
 /// One-line summary of a node for the brief-ancestor / sibling list.
@@ -452,23 +517,31 @@ fn ancestor_summary(node: &Node) -> String {
     }
 }
 
-fn push_sibling_specs(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
+/// Push the parent's children as a lex-sorted list INCLUDING `node_id`
+/// itself. Including self is deliberate: every sibling's bundle has the
+/// same content here, so the prompt cache extends through this section
+/// across all siblings. The model can identify "which sibling am I" by
+/// matching the name in the `This node` header section that follows.
+fn push_siblings_lex(bundle: &mut ContextBundle, graph: &NodeGraph, node_id: NodeId) {
     let Some(node) = graph.get(node_id) else {
         return;
     };
     let Some(parent) = node.parent else {
         return;
     };
+    let mut sibs: Vec<&Node> = graph.children_of(parent);
+    if sibs.len() <= 1 {
+        // Only this node; nothing to share with siblings — skip the
+        // section so a singleton child doesn't carry a wasted "list of
+        // one" in its prompt.
+        return;
+    }
+    sibs.sort_by(|a, b| a.name.cmp(&b.name));
     let mut s = String::new();
-    for sib in graph.children_of(parent) {
-        if sib.id == node_id {
-            continue;
-        }
+    for sib in sibs {
         s.push_str(&format!("- **`{}`**: {}\n", sib.name, ancestor_summary(sib)));
     }
-    if !s.is_empty() {
-        bundle.push("Sibling specs (already decided)", s);
-    }
+    bundle.push("Siblings (this node's parent's children, lex-ordered)", s);
 }
 
 /// If the parent exists and has a `public.rs`, include it. This is the
@@ -526,6 +599,113 @@ fn push_dep_ifaces(bundle: &mut ContextBundle, graph: &NodeGraph, node: &Node) {
         }
         bundle.push(title, body);
     }
+}
+
+/// List the files the model is permitted to `read_file`. Mirrors the
+/// `is_readable_by_node` policy in `tools.rs` — listing them up front
+/// cuts down the storm of failed `read_file` calls the model otherwise
+/// makes while guessing paths.
+///
+/// Important: every path we list is a **real file the framework has
+/// already written**. We don't list slots that haven't been authored
+/// yet (e.g. a node's `private.md` is only written when the spec stage
+/// has authored private notes; listing it before then would lead to a
+/// "file does not exist" error on read).
+///
+/// We list:
+///   1. this node's own slots — public.rs / private.rs / tests.rs /
+///      public.md always exist after the first render; private.md
+///      only if private notes have been authored.
+///   2. ancestor specs (public.md always; private.md only if
+///      authored) — descendants have design-context read access.
+///   3. dep nodes' `public.rs` + `public.md`.
+///   4. a generic mention of "any node's `public.rs` / `public.md`".
+///
+/// Framework-rendered files (`Cargo.toml`, `mod.rs`, `lib.rs`) are
+/// EXCLUDED — they're auto-generated boilerplate the model never
+/// needs to inspect. Previously we allowed them and the model burned
+/// calls reading `lib.rs` files our render layout doesn't produce.
+fn push_readable_files(
+    bundle: &mut ContextBundle,
+    graph: &NodeGraph,
+    node: &Node,
+    layout: Layout,
+) {
+    let mut s = String::new();
+    s.push_str(
+        "`read_file` is restricted to the files listed below. Paths are \
+         **workspace-relative** (no leading `./`, no absolute paths) — \
+         use them verbatim as the tool's `path` argument. Any other path \
+         is rejected.\n\n",
+    );
+
+    // 1. This node's own slots — only those that the framework has
+    //    actually rendered.
+    let own_src = crate::render::node_src_dir(graph, node, layout);
+    let own_spec = crate::render::node_spec_dir(graph, node);
+    s.push_str("**This node's own slots:**\n");
+    // public/private/tests.rs and public.md are always rendered (with
+    // placeholders if not yet authored), so they always exist on disk.
+    for f in ["public.rs", "private.rs", "tests.rs"] {
+        s.push_str(&format!("- `{}/{}`\n", own_src.display(), f));
+    }
+    s.push_str(&format!("- `{}/public.md`\n", own_spec.display()));
+    if node.spec_private_md.is_some() {
+        s.push_str(&format!("- `{}/private.md`\n", own_spec.display()));
+    }
+    s.push('\n');
+
+    // 2. Ancestor specs (root-down). Only list private.md when the
+    //    ancestor actually authored private notes.
+    let mut ancestors = graph.ancestors(node.id, false);
+    ancestors.reverse(); // root first → parent last
+    if !ancestors.is_empty() {
+        s.push_str("**Ancestor spec docs (design context):**\n");
+        for anc_id in &ancestors {
+            if let Some(anc) = graph.get(*anc_id) {
+                let anc_spec = crate::render::node_spec_dir(graph, anc);
+                s.push_str(&format!("- `{}/public.md`\n", anc_spec.display()));
+                if anc.spec_private_md.is_some() {
+                    s.push_str(&format!("- `{}/private.md`\n", anc_spec.display()));
+                }
+            }
+        }
+        s.push('\n');
+    }
+
+    // 3. Dep public surfaces. public.rs is always rendered.
+    if !node.deps.is_empty() {
+        s.push_str("**Dep public surfaces (also inlined above; cite path for line-range reads):**\n");
+        for dep_id in &node.deps {
+            if let Some(dep) = graph.get(*dep_id) {
+                let dep_src = crate::render::node_src_dir(graph, dep, layout);
+                let dep_spec = crate::render::node_spec_dir(graph, dep);
+                s.push_str(&format!(
+                    "- `{}/public.rs`, `{}/public.md`\n",
+                    dep_src.display(),
+                    dep_spec.display()
+                ));
+            }
+        }
+        s.push('\n');
+    }
+
+    // 4. Generic patterns + explicit denylist.
+    s.push_str(
+        "**Generic patterns also allowed** (any node in the graph):\n\
+         - any node's `public.rs` and `spec/<path>/public.md`\n\
+         \n\
+         **NOT readable** (don't try):\n\
+         - another node's `private.rs`, `tests.rs`, or `spec/<path>/private.md` \
+         (your own private slots and ancestor private slots are accessible — \
+         see the lists above).\n\
+         - `mod.rs`, `lib.rs`, `Cargo.toml` — framework-rendered boilerplate \
+         (each crate's library entry point is `mod.rs`, not `lib.rs`). These \
+         carry no design info; the contents of all sibling/child modules are \
+         already inlined into your context as needed.\n",
+    );
+
+    bundle.push("Files you can read", s);
 }
 
 /// A short summary of every node currently in the graph. Used by the spec
@@ -600,7 +780,7 @@ mod tests {
     #[test]
     fn spec_context_includes_node_header_and_existing_graph() {
         let (g, root) = fresh();
-        let bundle = build_for_spec(&g, root, 64, 5);
+        let bundle = build_for_spec(&g, root, 64, 5, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("**name**: `app`"));
         assert!(md.contains("**module path**: `crate`"));
@@ -610,7 +790,7 @@ mod tests {
     #[test]
     fn spec_context_includes_decomposition_budget() {
         let (g, root) = fresh();
-        let bundle = build_for_spec(&g, root, 32, 4);
+        let bundle = build_for_spec(&g, root, 32, 4, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Decomposition budget"));
         assert!(md.contains("32"), "should mention max_nodes: {md}");
@@ -654,7 +834,7 @@ mod tests {
         let child = g
             .add_child(root_id, Node::new("router", "routes requests"))
             .unwrap();
-        let bundle = build_for_iface(&g, child);
+        let bundle = build_for_iface(&g, child, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Parent public interface: `app`"));
         assert!(md.contains("pub trait Routing"));
@@ -670,7 +850,7 @@ mod tests {
         let errs_id = g.add_child(root, errs).unwrap();
         let widget_id = g.add_child(root, Node::new("widget", "")).unwrap();
         g.add_dep(widget_id, errs_id).unwrap();
-        let bundle = build_for_iface(&g, widget_id);
+        let bundle = build_for_iface(&g, widget_id, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Dependency `errors`"));
         assert!(md.contains("import as `crate::errors`"));
@@ -681,7 +861,7 @@ mod tests {
     #[test]
     fn iface_context_omits_section_when_no_deps() {
         let (g, root) = fresh();
-        let bundle = build_for_iface(&g, root);
+        let bundle = build_for_iface(&g, root, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(!md.contains("Dependency `"));
     }
@@ -692,7 +872,7 @@ mod tests {
         let mut root = Node::new("app", "");
         root.public_rs = Some("pub trait App { fn run(&self); }\n".into());
         let id = g.insert_root(root).unwrap();
-        let bundle = build_for_tests(&g, id);
+        let bundle = build_for_tests(&g, id, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Public interface to test"));
         assert!(md.contains("pub trait App"));
@@ -706,7 +886,7 @@ mod tests {
         root.tests_rs = Some("#[test] fn ok() { /* asserts */ }\n".into());
         root.private_rs = Some("// scaffolding\n".into());
         let id = g.insert_root(root).unwrap();
-        let bundle = build_for_impl(&g, id);
+        let bundle = build_for_impl(&g, id, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Public interface"));
         assert!(md.contains("Tests to make pass"));
@@ -714,14 +894,19 @@ mod tests {
     }
 
     #[test]
-    fn debug_context_prepends_debug_section() {
+    fn debug_context_includes_debug_section() {
         let (g, root) = fresh();
-        let bundle = build_for_debug(&g, root);
-        assert_eq!(bundle.sections[0].title, "Debug stage");
+        let bundle = build_for_debug(&g, root, Layout::SingleCrate);
+        // After the cache-friendly reorder, the Debug stage note lives at
+        // the END of the bundle (so the prefix matches impl context).
+        assert!(
+            bundle.sections.iter().any(|s| s.title == "Debug stage"),
+            "Debug stage section should be present somewhere in the bundle"
+        );
     }
 
     #[test]
-    fn ancestor_context_inlines_parent_only_and_flattens_grandparents() {
+    fn ancestor_chain_lists_ancestors_root_down_and_omits_grandparent_details() {
         let mut g = NodeGraph::new();
         let mut root = Node::new("app", "");
         root.spec_public_md = Some(
@@ -737,40 +922,52 @@ mod tests {
         frontend.spec_public_md = Some("# Frontend\n\nThe frontend layer.\n".into());
         let f = g.add_child(root_id, frontend).unwrap();
         let r = g.add_child(f, Node::new("router", "")).unwrap();
-        let bundle = build_for_iface(&g, r);
+        let bundle = build_for_iface(&g, r, Layout::SingleCrate);
         let md = bundle.to_markdown();
-        // Immediate parent (frontend) gets its full public spec.
+        // Brief ancestor chain (root-down) must list both ancestors.
         assert!(
-            md.contains("Parent spec (public): `frontend`"),
-            "should inline parent's full public spec: {md}"
-        );
-        assert!(md.contains("The frontend layer."));
-        // Grandparent (app) collapses to a one-liner under "Farther ancestors".
-        assert!(
-            md.contains("Farther ancestors (brief)"),
-            "should have a brief section for grandparents: {md}"
+            md.contains("Ancestor chain"),
+            "should have a root-down brief ancestor chain section: {md}"
         );
         assert!(md.contains("**`app`**"));
-        // The grandparent's secondary sections must NOT be inlined.
+        assert!(md.contains("**`frontend`**"));
+        // Immediate parent's full spec is still inlined (separate section).
+        assert!(
+            md.contains("Parent spec (public): `frontend`"),
+            "parent's full public spec should still be inlined: {md}"
+        );
+        assert!(md.contains("The frontend layer."));
+        // Grandparent's secondary sections must NOT be inlined.
         assert!(
             !md.contains("Big section grandchildren should not see")
                 && !md.contains("Lots of details that would bloat"),
             "grandparent's full spec should NOT be inlined: {md}"
         );
+        // Root-down ordering: app must appear BEFORE frontend in the chain.
+        let app_pos = md.find("**`app`**").unwrap();
+        let frontend_pos = md.find("**`frontend`**").unwrap();
+        assert!(
+            app_pos < frontend_pos,
+            "ancestor chain should be root-down (app before frontend): {md}"
+        );
     }
 
     #[test]
-    fn sibling_specs_listed_for_consistency() {
+    fn siblings_listed_lex_ordered_including_self() {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         let mut a = Node::new("a", "node A");
         a.spec_public_md = Some("# A\n\nThe A subsystem.\n".into());
         g.add_child(root, a).unwrap();
         let b = g.add_child(root, Node::new("b", "node B")).unwrap();
-        let bundle = build_for_spec(&g, b, 64, 5);
+        let bundle = build_for_spec(&g, b, 64, 5, Layout::SingleCrate);
         let md = bundle.to_markdown();
-        assert!(md.contains("Sibling specs"));
+        assert!(md.contains("Siblings"));
+        // Self-inclusion: every sibling sees the SAME list, so the prefix
+        // cache survives across siblings. `b` should be present in `b`'s
+        // own bundle too.
         assert!(md.contains("**`a`**"));
+        assert!(md.contains("**`b`**"));
         assert!(md.contains("The A subsystem"));
     }
 
@@ -885,7 +1082,7 @@ mod tests {
     fn build_for_stage_dispatches_correctly() {
         let (g, root) = fresh();
         for stage in Stage::ALL {
-            let bundle = build_for_stage(&g, root, stage, 64, 5);
+            let bundle = build_for_stage(&g, root, stage, 64, 5, Layout::SingleCrate);
             assert!(!bundle.sections.is_empty(), "stage {stage} produced empty bundle");
         }
     }
@@ -893,7 +1090,7 @@ mod tests {
     #[test]
     fn missing_node_returns_empty_bundle() {
         let g = NodeGraph::new();
-        let bundle = build_for_iface(&g, NodeId::new());
+        let bundle = build_for_iface(&g, NodeId::new(), Layout::SingleCrate);
         assert!(bundle.sections.is_empty());
     }
 
@@ -904,7 +1101,7 @@ mod tests {
         let half_baked = g.add_child(root, Node::new("dep", "WIP")).unwrap();
         let user = g.add_child(root, Node::new("user", "")).unwrap();
         g.add_dep(user, half_baked).unwrap();
-        let bundle = build_for_iface(&g, user);
+        let bundle = build_for_iface(&g, user, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("not yet authored"));
     }
@@ -916,20 +1113,20 @@ mod tests {
         let mut g = NodeGraph::new();
         let root = g.insert_root(Node::new("app", "")).unwrap();
         let user = g.add_child(root, Node::new("user", "")).unwrap();
-        let small = build_for_iface(&g, user).approx_size();
+        let small = build_for_iface(&g, user, Layout::SingleCrate).approx_size();
         // Add a dep with a sizeable public.rs.
         let mut dep = Node::new("dep", "shared utility");
         dep.public_rs = Some("pub trait Big { ".to_string() + &"fn f(&self); ".repeat(50) + " }");
         let dep_id = g.add_child(root, dep).unwrap();
         g.add_dep(user, dep_id).unwrap();
-        let big = build_for_iface(&g, user).approx_size();
+        let big = build_for_iface(&g, user, Layout::SingleCrate).approx_size();
         assert!(big > small);
     }
 
     #[test]
     fn iface_context_for_root_omits_parent_section() {
         let (g, root) = fresh();
-        let bundle = build_for_iface(&g, root);
+        let bundle = build_for_iface(&g, root, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(!md.contains("Parent public interface"));
     }
@@ -947,7 +1144,7 @@ mod tests {
         let consumer_id = g.add_child(root, consumer).unwrap();
         g.add_dep(consumer_id, util_id).unwrap();
 
-        let bundle = build_for_impl(&g, consumer_id);
+        let bundle = build_for_impl(&g, consumer_id, Layout::SingleCrate);
         let md = bundle.to_markdown();
         assert!(md.contains("Dependency `util`"));
         assert!(md.contains("pub fn id"));

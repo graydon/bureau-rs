@@ -346,25 +346,28 @@ fn render_node(
 
     // public.rs / private.rs / tests.rs: write model content if any, else
     // a minimal placeholder (no items) so the module compiles incrementally.
+    // Placeholder strings are STATIC (no node-specific interpolation) so
+    // `graph::load` can detect them via exact-match and treat the slot as
+    // unauthored — see `placeholders.rs`.
     write_if_changed(
         &public_path,
         node.public_rs
             .as_deref()
-            .unwrap_or("// public surface — not yet authored\n"),
+            .unwrap_or(crate::placeholders::PUBLIC_RS),
         report,
     )?;
     write_if_changed(
         &private_path,
         node.private_rs
             .as_deref()
-            .unwrap_or("// private internals — not yet authored\n"),
+            .unwrap_or(crate::placeholders::PRIVATE_RS),
         report,
     )?;
     write_if_changed(
         &tests_path,
         node.tests_rs
             .as_deref()
-            .unwrap_or("// tests — not yet authored\n"),
+            .unwrap_or(crate::placeholders::TESTS_RS),
         report,
     )?;
 
@@ -380,15 +383,21 @@ fn render_node(
     // public.md (audience: dependents and downstream stages) and
     // private.md (audience: this node's own writer/reviser, for design
     // notes and rationale).
+    //
+    // public.md uses a static placeholder when un-authored (so load can
+    // detect it). The node's name + description live in the surrounding
+    // prompt context, not duplicated into a placeholder body.
     let spec_dir = workdir.join(node_spec_dir(graph, node));
     let public_md_path = spec_dir.join("public.md");
-    let public_md_content = node.spec_public_md.clone().unwrap_or_else(|| {
-        format!(
-            "# {}\n\n{}\n\n*public spec not yet authored*\n",
-            node.name, node.description
-        )
-    });
-    write_if_changed(&public_md_path, &public_md_content, report)?;
+    write_if_changed(
+        &public_md_path,
+        node.spec_public_md
+            .as_deref()
+            .unwrap_or(crate::placeholders::PUBLIC_MD),
+        report,
+    )?;
+    // private.md is written only when authored — its absence is the
+    // signal that no private notes exist for this node.
     if let Some(priv_md) = &node.spec_private_md {
         let private_md_path = spec_dir.join("private.md");
         write_if_changed(&private_md_path, priv_md, report)?;

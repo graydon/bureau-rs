@@ -2,7 +2,6 @@
 
 pub mod ui;
 
-use crate::checkpoint;
 use crate::graph::NodeId;
 use crate::state::{SchedulerState, StateHandle, TaskStatus, UiEvent};
 use anyhow::Result;
@@ -24,9 +23,13 @@ use uuid::Uuid;
 pub struct AppState {
     pub state: StateHandle,
     pub workdir: PathBuf,
+    /// Layout the engine is operating under (single-crate vs.
+    /// workspace). Required by /api/reset_node so it can call
+    /// `render_graph` to wipe cascaded slot files back to placeholders.
+    pub layout: crate::render::Layout,
     /// Worktree pool — used to surface in-progress work in the files
-    /// panel. None when the web UI is started without an engine (e.g.
-    /// pure-checkpoint browse mode).
+    /// panel. None when the web UI is started without an engine
+    /// (browse-only mode).
     pub worktrees: Option<std::sync::Arc<crate::worktree::WorktreePool>>,
 }
 
@@ -34,6 +37,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(ui_index))
         .route("/api/state", get(api_state))
+        .route("/api/graph", get(api_graph))
         .route("/api/events", get(api_events))
         .route("/api/files", get(api_files))
         .route("/api/file", get(api_file))
@@ -41,7 +45,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/gitlog", get(api_gitlog))
         .route("/api/task_transcript", get(api_task_transcript))
         .route("/api/issues", get(api_issues))
-        .route("/api/checkpoint", post(api_checkpoint))
         .route("/api/pause", post(api_pause))
         .route("/api/resume", post(api_resume))
         .route("/api/stop", post(api_stop))
@@ -79,7 +82,10 @@ async fn api_state(State(s): State<AppState>) -> Json<serde_json::Value> {
     // There is no in-memory graph projection to drift.
     let slim = s.state.snapshot_slim();
     let mut v = serde_json::to_value(&slim).unwrap_or(serde_json::Value::Null);
-    let g = crate::graph::load(&s.workdir).unwrap_or_default();
+    // Topology-only load — /api/state shows the tree and stage badges,
+    // never the slot content (content lives in rendered files which
+    // the UI fetches via /api/file on demand).
+    let g = crate::graph::load_topology(&s.workdir).unwrap_or_default();
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
             "graph".to_string(),
@@ -89,6 +95,15 @@ async fn api_state(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(v)
 }
 
+/// Returns just the topology of the graph (no state, no tasks). Used
+/// by the UI client after it receives a `GraphTopologyChanged` SSE
+/// event to refresh its view of the tree. Much smaller than
+/// `/api/state` and doesn't churn the in-memory tasks lock.
+async fn api_graph(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let g = crate::graph::load_topology(&s.workdir).unwrap_or_default();
+    Json(serde_json::to_value(&g).unwrap_or(serde_json::Value::Null))
+}
+
 async fn api_events(
     State(s): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -96,9 +111,21 @@ async fn api_events(
     let stream = BroadcastStream::new(rx).filter_map(|res| match res {
         Ok(ev) => match serde_json::to_string(&ev) {
             Ok(json) => Some(Ok(Event::default().data(json))),
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!("SSE: failed to serialize event: {e}");
+                None
+            }
         },
-        Err(_) => None,
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            // The slow-consumer signal: this subscriber missed `n`
+            // events because the broadcast buffer overwrote them. If
+            // you see this consistently, bump `StateHandle::new`'s
+            // capacity or batch high-frequency events upstream.
+            tracing::warn!(
+                "SSE consumer lagged by {n} events — they will not be redelivered"
+            );
+            None
+        }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -355,15 +382,6 @@ async fn api_issues(State(s): State<AppState>) -> Json<Vec<Issue>> {
     Json(out)
 }
 
-async fn api_checkpoint(State(s): State<AppState>) -> Response {
-    let dir = s.workdir.join(".bureau").join("checkpoints");
-    let snap = s.state.snapshot();
-    match checkpoint::save(&snap, &dir) {
-        Ok(p) => Json(serde_json::json!({"path": p.display().to_string()})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
-}
-
 async fn api_pause(State(s): State<AppState>) -> Response {
     s.state.write(|st| st.scheduler = SchedulerState::Paused);
     s.state.emit(UiEvent::SchedulerStateChanged {
@@ -399,14 +417,14 @@ struct ResetNodeOk {
 }
 
 async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBody>) -> Response {
-    use crate::graph::{Stage, StageState};
-    // Take `main_lock` for the whole load→mutate→save→commit cycle.
-    // Without it, this races the engine on two axes: (a) a concurrent
-    // `set_stage_on_main` can interleave between our load and save,
-    // and (b) a concurrent `ff-merge` can move HEAD between our save
-    // and our commit, leaving the mutation orphaned on disk (no
-    // commit) so the next worktree allocate (which checks out HEAD)
-    // reverts our reset entirely.
+    use crate::graph::Stage;
+    // Take `main_lock` for the whole load→mutate→save→render→commit
+    // cycle. Without it, this races the engine on two axes: (a) a
+    // concurrent `set_stage_on_main` can interleave between our load
+    // and save, and (b) a concurrent `ff-merge` can move HEAD between
+    // our save and our commit, leaving the mutation orphaned on disk
+    // (no commit) so the next worktree allocate (which checks out
+    // HEAD) reverts our reset entirely.
     let Some(pool) = s.worktrees.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -415,11 +433,14 @@ async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBod
             .into_response();
     };
     let _guard = pool.main_lock().lock().await;
-    let mut g = match crate::graph::load(&s.workdir) {
+    // Full load (with on-disk content): we need the content of NON-reset
+    // nodes preserved when `render_graph` runs at the end. Topology-only
+    // would leave every non-reset node's content as `None`, and the
+    // re-render would clobber the whole tree with placeholders.
+    let mut g = match crate::graph::load(&s.workdir, s.layout) {
         Ok(g) => g,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     };
-    let mut reset_names: Vec<String> = Vec::new();
     let mut targets: std::collections::HashSet<crate::graph::NodeId> =
         std::collections::HashSet::new();
     targets.insert(body.node_id);
@@ -431,15 +452,30 @@ async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBod
             }
         }
     }
+    // For each target node, cascade-reset from the earliest stage AND
+    // clear in-memory content slots that those stages first-write.
+    // `Stage::Architect` resets everything (it has no first-written
+    // slot itself but it's the earliest stage; the cascade walks
+    // forward from there). The render pass below re-writes cleared
+    // slots as placeholders on disk, so the next worktree allocate
+    // sees a clean baseline — without that, the next stage to run
+    // would compile against orphan tests / iface from the prior run
+    // and the agent would get confused (same failure mode as the
+    // crashed-restart bug we fixed for the engine startup path).
+    let mut reset_names: Vec<String> = Vec::new();
     for id in &targets {
         if let Some(n) = g.get_mut(*id) {
-            for stage in Stage::ALL {
-                n.stages.set(stage, StageState::NotStarted);
-            }
+            crate::graph::reset_stage_and_cascade(n, Stage::Architect);
             reset_names.push(n.name.clone());
         }
     }
     if let Err(e) = crate::graph::save(&s.workdir, &g) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+    }
+    // Re-render: with the targets' content slots cleared, this writes
+    // placeholder files for them. Non-target nodes still have their
+    // content (loaded above) so their files don't get wiped.
+    if let Err(e) = crate::render::render_graph(&s.workdir, &g, s.layout) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
     }
     let msg = format!(
@@ -447,15 +483,17 @@ async fn api_reset_node(State(s): State<AppState>, Json(body): Json<ResetNodeBod
         reset_names.len(),
         reset_names.join(", ")
     );
-    // Commit the reset onto main so the next worktree allocate (which
-    // branches from HEAD) actually sees it. Without this commit the
-    // reset is stranded on disk and gets clobbered by the next ff-merge.
+    // Commit BOTH the .bureau/* state changes AND the placeholder file
+    // writes so the next worktree allocate (which branches from HEAD)
+    // sees the clean state. Without this commit the reset is stranded
+    // on disk and gets clobbered by the next ff-merge.
     if let Err(e) = pool.workspace.commit_main(&msg) {
         tracing::warn!("commit_main after reset: {e:#}");
     }
     s.state.write(|st| st.note(msg));
-    // `g` was committed to disk + main; the next /api/state poll picks
-    // it up via `graph::load`. No in-memory state copy to update.
+    // Stage badges across the reset nodes are now stale on connected
+    // clients — emit topology-changed so they refetch the graph.
+    s.state.emit(crate::state::UiEvent::GraphTopologyChanged);
     Json(ResetNodeOk { reset: reset_names }).into_response()
 }
 

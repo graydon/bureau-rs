@@ -1,7 +1,7 @@
 //! Runtime state shared between engine and web UI.
 
 use crate::graph::{NodeId, Stage};
-use crate::tools::{JudgeVerdict, TranscriptEntry};
+use crate::tools::{JudgeVerdict, Role, TranscriptEntry};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -189,6 +189,12 @@ pub enum UiEvent {
     NodeChanged {
         id: NodeId,
     },
+    /// Graph topology changed (node added/removed, dep edge added).
+    /// Fires after architect creates the tree and after each decompose
+    /// call. The client refetches `/api/graph` on this event — that's
+    /// the one piece of state SSE can't deliver incrementally without
+    /// bloating every event payload.
+    GraphTopologyChanged,
     TaskCreated {
         task: EngineTask,
     },
@@ -202,6 +208,18 @@ pub enum UiEvent {
     TranscriptAppended {
         task_id: Uuid,
         entry: TranscriptEntry,
+    },
+    /// Streaming assistant text chunk arriving DURING an in-flight LLM
+    /// call. Multiple of these arrive between the role's user-prompt
+    /// `TranscriptAppended` and the role's final assistant-text
+    /// `TranscriptAppended`. The UI accumulates `text` deltas into a
+    /// live preview keyed by (task_id, role); when the next role's
+    /// system-prompt `TranscriptAppended` or the assistant's own final
+    /// `TranscriptAppended` arrives, the preview can be flushed.
+    AssistantChunk {
+        task_id: Uuid,
+        role: Option<Role>,
+        text: String,
     },
     TaskCost {
         task_id: Uuid,
@@ -228,14 +246,17 @@ pub struct StateHandle {
 
 impl StateHandle {
     pub fn new(state: EngineState) -> Self {
-        // Capacity sized for short bursts under high concurrency, not for
-        // long-running slow consumers. The broadcast channel is
-        // drop-oldest-on-overflow; under sustained backpressure a slow
-        // consumer will see gaps but each gap costs the consumer one
-        // re-fetch, not unbounded memory. Larger capacities here cost
-        // every slow consumer N × sizeof(UiEvent), which gets expensive
-        // because transcript_appended events can carry multi-KB entries.
-        let (tx, _rx) = broadcast::channel(1024);
+        // Capacity sized to absorb live tool-call events + streaming
+        // text chunks + parallel-task event interleaving without
+        // dropping anything mid-stage on slow SSE consumers. The
+        // broadcast channel is drop-oldest-on-overflow: when capacity
+        // is exceeded the slow subscriber gets `RecvError::Lagged(n)`
+        // and we'd silently miss `n` events on its end. At 16k slots
+        // × ~1KB average event size we sit at ~16MB worst-case memory
+        // per StateHandle, which is fine for an in-memory UI bus, and
+        // it means the UI sees live transcript updates instead of a
+        // batch flush at end-of-stage.
+        let (tx, _rx) = broadcast::channel(16384);
         Self {
             inner: Arc::new(Mutex::new(state)),
             tx,
@@ -289,6 +310,14 @@ impl StateHandle {
 
     pub fn emit(&self, ev: UiEvent) {
         let _ = self.tx.send(ev);
+    }
+
+    /// Clone of the broadcast sender. Hand to subsystems (e.g. the LLM
+    /// driver) that need to push UI events DURING work — like
+    /// streaming assistant text chunks. The sender is `Clone` and
+    /// cheap to pass around; no special teardown required.
+    pub fn emitter(&self) -> broadcast::Sender<UiEvent> {
+        self.tx.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent> {

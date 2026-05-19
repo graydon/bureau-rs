@@ -254,7 +254,13 @@ async fn workspace_with_cross_crate_dep_compiles() {
         .await
         .unwrap();
     // Mark util's iface Done so core's iface can declare a dep on it.
-    let mut g = bureau_rs::graph::load(&workdir).unwrap();
+    // Load with the WORKSPACE layout — `graph::load` reads rendered
+    // slot files from disk to populate the in-memory content fields,
+    // and the paths it reads from depend on the layout. Loading with
+    // SingleCrate here would read `src/<path>/*.rs` (which don't
+    // exist) and silently drop util's authored content, which the
+    // subsequent `render_graph` would then overwrite with placeholders.
+    let mut g = bureau_rs::graph::load(&workdir, Layout::Workspace).unwrap();
     g.get_mut(util_id).unwrap().stages.iface = StageState::Done;
     render_graph(&workdir, &g, Layout::Workspace).unwrap();
     let core_ctx = ctx_for(

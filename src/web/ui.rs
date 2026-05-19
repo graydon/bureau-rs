@@ -15,7 +15,20 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
   }
   html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: var(--mono); font-size: 13px; }
-  #app { display: grid; grid-template-rows: 1fr auto; height: 100vh; min-height: 0; }
+  /* Three rows: [optional sched banner | panels | status bar]. The
+     banner is `auto`-sized so it stays a single line when visible and
+     collapses to zero (display: none) when hidden; panels take the
+     remaining space.
+     IMPORTANT: each child uses an explicit `grid-row` below. Without
+     it, when the banner is `display: none` (the common case), grid
+     auto-placement reassigns #panels into row 1 (auto, collapses) and
+     #status into row 2 (1fr, stretches) — leaving a huge gap of empty
+     space below #status. Explicit grid-row pins each child to its
+     intended track regardless of which siblings are hidden. */
+  #app { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; min-height: 0; }
+  #sched-banner { grid-row: 1; }
+  #panels { grid-row: 2; }
+  #status { grid-row: 3; }
   /* Resizable columns: a flex row of [panel | splitter | panel | splitter | panel].
      Splitters drag-resize the adjacent panels via JS. min-width: 0 lets each
      panel actually shrink below its content's natural width (long paths!). */
@@ -68,8 +81,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   /* Scheduler banner — sits at the top of the page when the
      scheduler isn't Running, drawing the eye to "why isn't anything
      happening". Hidden by default; the renderer toggles its class. */
-  #sched-banner { display: none; padding: 8px 12px; font-weight: 600;
-                  text-align: center; }
+  #sched-banner { display: none; padding: 4px 12px; font-weight: 600;
+                  text-align: center; line-height: 20px;
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #sched-banner.visible { display: block; }
   #sched-banner.stopped, #sched-banner.failed {
     background: #3a1f1f; color: #ffb0b0;
@@ -246,7 +260,6 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   <span class="muted">USD: <span id="cost">$0.00</span></span>
   <button onclick="schedAction('/api/pause','paused')">Pause</button>
   <button onclick="schedAction('/api/resume','running')">Resume</button>
-  <button onclick="api('/api/checkpoint','POST').then(r => alert('saved: '+(r.path||'')))">Checkpoint</button>
   <button onclick="schedAction('/api/stop','stopped')">Stop</button>
 </div>
 </div>
@@ -351,7 +364,27 @@ function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c 
 function formatJsonish(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } }
 
 async function load() {
+  // Used for initial page load AND SSE-reconnect recovery. We do
+  // markAllDirty() because everything in the slim snapshot is fresh
+  // and the on-screen DOM may be from before the disconnect — but
+  // the selected task's transcript stays since SSE is the source of
+  // truth for it.
+  const liveTranscript =
+    selectedTaskId && state && state.tasks?.[selectedTaskId]?.transcript;
+  const prevGraph = state ? state.graph : null;
   state = await api('/api/state');
+  if (liveTranscript && state && state.tasks?.[selectedTaskId]) {
+    state.tasks[selectedTaskId].transcript = liveTranscript;
+  }
+  // Defensive: /api/state loads the graph from disk via
+  // load_topology(...).unwrap_or_default(); a transient read failure
+  // (e.g. racing with graph::save) returns an empty NodeGraph and we
+  // shouldn't blow away the populated tree the user was viewing.
+  // Keep whichever has a root.
+  if (state && (!state.graph || state.graph.root == null) && prevGraph && prevGraph.root != null) {
+    state.graph = prevGraph;
+  }
+  markAllDirty();
   render();
   refreshFiles(); refreshGit(); refreshIssues();
 }
@@ -500,6 +533,7 @@ function renderNodeRecursive(parent, nodeId) {
     chev.onclick = (e) => {
       e.stopPropagation();
       nodeCollapsed[nodeId] = !nodeCollapsed[nodeId];
+      markDirty('graph');
       render();
     };
   }
@@ -591,6 +625,15 @@ function kindLabel(kind) {
 // initial fetch.
 async function selectTask(id, after) {
   selectedTaskId = id;
+  // Mark BOTH `tasks` (selected-row highlight) and `transcript` dirty.
+  // Without these flags, render() falls through both `if (dirty.X)`
+  // gates and the click visibly does nothing — that's exactly the bug
+  // the user hit ("clicking a task in the recent-tasks pane frequently
+  // doesn't change the transcript"). Used to be masked by the 2s
+  // markAllDirty() poll; with the poll gone, every callsite must
+  // declare what it dirtied.
+  markDirty('tasks');
+  markDirty('transcript');
   // Render once immediately so the selection highlight and task header
   // update without waiting on the fetch.
   render();
@@ -600,6 +643,7 @@ async function selectTask(id, after) {
       const t = state.tasks?.[id];
       if (t && Array.isArray(transcript)) {
         t.transcript = transcript;
+        markDirty('transcript');
         render();
       }
     } catch (e) {
@@ -655,9 +699,10 @@ function renderTranscript() {
         </div>`).join('');
     } else if (typeof e.content === 'string') body = e.content;
     const key = selectedTaskId + '-' + i;
-    const isCollapsed = collapsed[key] === undefined
-      ? (cls === 'system' || cls === 'tool_definitions')
-      : collapsed[key];
+    // Default: every entry starts collapsed so the user doesn't have
+    // to scroll past the same prefix repeatedly. They can expand the
+    // ones they care about; the chevron in `.h` toggles each entry.
+    const isCollapsed = collapsed[key] === undefined ? true : collapsed[key];
     div.className += isCollapsed ? ' collapsed' : '';
     const inner = bodyHtml
       ? `<div class="defs">${bodyHtml}</div>`
@@ -688,6 +733,26 @@ function renderTranscript() {
     };
     el.appendChild(div);
   });
+  // Live streaming chunk: while the LLM is mid-stream, accumulated
+  // assistant text deltas live on `t.pendingChunk`. Show them as a
+  // last "streaming…" pseudo-entry so the user can watch tokens
+  // arrive instead of staring at a stale transcript. Cleared whenever
+  // the canonical `transcript_appended` for this task arrives.
+  if (t.pendingChunk && t.pendingChunk.length > 0) {
+    const live = document.createElement('div');
+    live.className = 'entry assistant_text speaker-model';
+    const role = t.streamingRole || null;
+    let header = '<span class="speaker model">model</span>';
+    if (role) header += ` <span class="role">${role}</span>`;
+    header += ' <span class="muted">streaming…</span>';
+    live.innerHTML = `
+      <div class="h">
+        <span>${header}</span>
+        <span></span>
+      </div>
+      <pre>${escapeHtml(t.pendingChunk)}</pre>`;
+    el.appendChild(live);
+  }
   el.scrollTop = wasAtBottom ? el.scrollHeight : prevTop;
 }
 
@@ -842,12 +907,32 @@ function applyEvent(ev) {
       if (ev.task_id === selectedTaskId) {
         const t = state.tasks?.[ev.task_id];
         if (t) {
+          // Clear any in-flight streaming buffer: either the canonical
+          // assistant entry just arrived for this turn, or work has
+          // moved on to the next role's prompt — either way the live
+          // chunk preview should yield to the recorded entries below.
+          t.pendingChunk = '';
+          t.streamingRole = null;
           t.transcript = t.transcript || [];
           t.transcript.push(ev.entry);
           // Cap selected-task transcript: drop oldest half on overflow.
           if (t.transcript.length > CLIENT_TRANSCRIPT_CAP) {
             t.transcript.splice(0, t.transcript.length - CLIENT_TRANSCRIPT_CAP / 2);
           }
+          markDirty('transcript');
+        }
+      }
+      break;
+    case 'assistant_chunk':
+      // Streaming text delta from an in-flight LLM call. Append to a
+      // per-task scratch buffer that renderTranscript shows as a
+      // "streaming…" pseudo-entry at the tail. Cleared by the next
+      // `transcript_appended` for this task.
+      if (ev.task_id === selectedTaskId) {
+        const t = state.tasks?.[ev.task_id];
+        if (t) {
+          t.pendingChunk = (t.pendingChunk || '') + ev.text;
+          if (ev.role) t.streamingRole = ev.role;
           markDirty('transcript');
         }
       }
@@ -870,12 +955,47 @@ function applyEvent(ev) {
       scheduleRefresh();
       break;
     case 'node_changed':
-      // Graph nodes update on the periodic state poll; setting graph
-      // dirty here would just cause animation restarts without new
-      // info.
+      // The node's stage state moved; the SSE TaskUpdated /
+      // TaskStatusChanged events on the related task carry the
+      // visible badge changes. The graph topology itself didn't
+      // change here, so don't refetch /api/graph — just nudge the
+      // graph section for re-paint in case a stage pill color
+      // shifted (the in-memory `state.graph` already has the new
+      // stage state via TaskUpdated → derived view).
+      markDirty('graph');
+      break;
+    case 'graph_topology_changed':
+      // Node added/removed/dep edge added. Refetch /api/graph and
+      // merge it in without touching the rest of state. This is the
+      // ONE thing SSE can't deliver incrementally without bloating
+      // every event payload — we fire one fetch per topology change
+      // instead.
+      refreshGraph();
       break;
   }
   scheduleRender();
+}
+
+async function refreshGraph() {
+  try {
+    const g = await api('/api/graph');
+    if (!state) return;
+    // Defensive: never clobber a populated graph with an empty one.
+    // `/api/graph` calls `graph::load_topology(...).unwrap_or_default()`
+    // server-side, so a transient read failure or a brief race with a
+    // graph::save returns an EMPTY NodeGraph rather than the previous
+    // state. Without this check the UI would flicker to "Graph not
+    // yet bootstrapped." on every such race.
+    if (!g || g.root == null) {
+      console.warn('refreshGraph: server returned empty graph; ignoring');
+      return;
+    }
+    state.graph = g;
+    markDirty('graph');
+    scheduleRender();
+  } catch (e) {
+    console.error('refreshGraph failed', e);
+  }
 }
 
 // Coalesce render calls via requestAnimationFrame. With high engine
@@ -899,6 +1019,7 @@ function scheduleRefresh() {
 }
 
 let _es = null;
+let _sseEverOpened = false;
 function connectSse() {
   // Close any existing connection BEFORE creating a new one. Previously
   // the order was inverted (schedule reconnect, then close), so under
@@ -907,6 +1028,15 @@ function connectSse() {
   if (_es) { try { _es.close(); } catch (_) {} _es = null; }
   const es = new EventSource('/api/events');
   _es = es;
+  es.onopen = () => {
+    // On RECONNECT (not initial open), pull fresh state once so we
+    // recover whatever SSE events fired during the gap. The initial
+    // open is covered by the page-load `load()` call.
+    if (_sseEverOpened) {
+      load().catch(e => console.error('post-reconnect resync failed', e));
+    }
+    _sseEverOpened = true;
+  };
   es.onmessage = e => { try { applyEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
   es.onerror = () => {
     try { es.close(); } catch (_) {}
@@ -919,24 +1049,58 @@ initSections(); initSplitters(); load(); connectSse();
 setInterval(refreshFiles, 4000);
 setInterval(refreshGit, 5000);
 setInterval(refreshIssues, 4000);
-// Periodic state sync. /api/state ships a SLIM snapshot with each
-// task's transcript empty (the wire payload is dominated by transcripts
-// otherwise — see snapshot_slim in src/state.rs). Naively replacing
-// `state` would clobber the in-memory transcript of the selected task
-// on every poll; we preserve it here so the transcript view doesn't
-// flash empty every poll. 2s gives a snappy "click pause → see it
-// reflected" response without burning CPU at higher frequencies.
+// Safety-net state resync. The PRIMARY update path is SSE — events
+// for task lifecycle, transcript, cost, scheduler state, and graph
+// topology all flow through /api/events and the SSE handler patches
+// `state` incrementally. We do NOT poll every 2s anymore: that was a
+// full DOM rebuild every two seconds (markAllDirty + render()) AND
+// it clobbered SSE-driven state with the server's slim snapshot
+// (which strips transcripts), so the UI felt frozen between flushes.
+//
+// What this 30s safety-net does:
+// - Refetch the slim state (no transcripts) ONLY to catch any drift
+//   if SSE dropped events (broadcast channel overflow → Lagged → the
+//   server-side `BroadcastStreamRecvError::Lagged` warning fires).
+// - Merge non-destructively: the selected task's transcript is
+//   preserved (SSE has more recent data than the server's snapshot
+//   would carry here anyway, since /api/state is slim).
+// - DOM repaints are confined to the sections that actually changed
+//   (per-section dirty flags), not the whole page.
+//
+// 30s strikes a balance: rare enough not to compete with SSE for
+// responsiveness, frequent enough that a missed event resolves in
+// reasonable time. SSE reconnect (es.onerror → reconnect after 2s)
+// also forces a recovery fetch via `load()` so users don't have to
+// wait the full 30s after a network blip.
 setInterval(async () => {
-  const prev = selectedTaskId && state
-    ? state.tasks?.[selectedTaskId]?.transcript
-    : null;
-  state = await api('/api/state');
-  if (prev && selectedTaskId && state.tasks?.[selectedTaskId]) {
-    state.tasks[selectedTaskId].transcript = prev;
+  try {
+    const fresh = await api('/api/state');
+    if (!fresh) return;
+    // Preserve the live-tracked transcript of the selected task —
+    // SSE has been updating it incrementally and the slim snapshot
+    // doesn't carry it.
+    const liveTranscript =
+      selectedTaskId && state && state.tasks?.[selectedTaskId]?.transcript;
+    const prevGraph = state ? state.graph : null;
+    state = fresh;
+    if (liveTranscript && state.tasks?.[selectedTaskId]) {
+      state.tasks[selectedTaskId].transcript = liveTranscript;
+    }
+    // Same defensive carry as load() — never replace a populated
+    // graph with an empty one (transient read race).
+    if ((!state.graph || state.graph.root == null) && prevGraph && prevGraph.root != null) {
+      state.graph = prevGraph;
+    }
+    // Only mark sections dirty that this resync could meaningfully
+    // change. Transcript stays where SSE left it.
+    markDirty('header');
+    markDirty('graph');
+    markDirty('tasks');
+    scheduleRender();
+  } catch (e) {
+    console.error('safety-net resync failed', e);
   }
-  markAllDirty();
-  render();
-}, 2000);
+}, 30000);
 </script>
 </body>
 </html>

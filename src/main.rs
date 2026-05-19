@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bureau_rs::{
-    checkpoint, config::Config, engine::Engine, state::EngineState, state::StateHandle, web,
+    config::Config, engine::Engine, event_log, state::EngineState, state::StateHandle, web,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -12,13 +12,15 @@ struct Cli {
     /// Configuration directory containing problem.md and config.toml.
     config_dir: PathBuf,
     /// Working directory where the generated project is built.
+    ///
+    /// Restarting in an existing workdir resumes from on-disk state:
+    /// stages marked Done in `.bureau/graph.json` are skipped, in-flight
+    /// worktrees from a prior crashed run are pruned automatically, and
+    /// the cost/budget counter resets to zero.
     work_dir: PathBuf,
     /// Web UI port.
     #[arg(long, default_value_t = 8765)]
     port: u16,
-    /// Resume from a JSON checkpoint instead of starting fresh.
-    #[arg(long)]
-    resume: Option<PathBuf>,
     /// Don't start the web server.
     #[arg(long)]
     no_ui: bool,
@@ -44,20 +46,21 @@ async fn main() -> Result<()> {
     );
     std::fs::create_dir_all(&cli.work_dir).context("creating workdir")?;
 
-    let initial_state = if let Some(p) = &cli.resume {
-        checkpoint::load(p)?
-    } else {
-        EngineState::new(
-            cli.work_dir.clone(),
-            cli.config_dir.clone(),
-            config.toml.project_name.clone(),
-        )
-    };
-    let state = StateHandle::new(initial_state);
+    // EngineState is fresh on every start. The project's actual state
+    // (graph + authored files) lives in `.bureau/graph.json` + git on
+    // main, so restarting in an existing workdir naturally resumes from
+    // where the last run left off. The transient cost / scheduler /
+    // history fields reset to zero — `.bureau/log.jsonl` keeps the
+    // forensic record of prior sessions for anyone who needs it.
+    let state = StateHandle::new(EngineState::new(
+        cli.work_dir.clone(),
+        cli.config_dir.clone(),
+        config.toml.project_name.clone(),
+    ));
 
     // Append-only event log.
     let log_path = cli.work_dir.join(".bureau").join("log.jsonl");
-    let logger_handle = match checkpoint::spawn_event_logger(&state, log_path.clone()) {
+    let logger_handle = match event_log::spawn(&state, log_path.clone()) {
         Ok(h) => {
             tracing::info!("event log: {}", log_path.display());
             Some(h)
@@ -68,15 +71,28 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Fetch live OpenRouter prices once at startup. If the call fails
+    // (offline, network blip, etc.) we fall through with an empty table
+    // and `compute_total_cost` falls back to built-in approximations.
+    let prices = bureau_rs::pricing::fetch(config.toml.provider.base_url.as_deref()).await;
+
     // Construct the engine first so we can share its graph mutex with the
     // web UI (the web's reset_node mutates the engine's authoritative
     // graph directly).
-    let engine = Arc::new(Engine::new(config.clone(), state.clone())?);
+    let driver: Arc<dyn bureau_rs::engine::LlmDriver> =
+        Arc::new(bureau_rs::engine::OpenRouterDriver::from_config(&config)?);
+    let engine = Arc::new(Engine::with_driver_and_prices(
+        config.clone(),
+        state.clone(),
+        driver,
+        prices,
+    )?);
 
     let ui_handle = if !cli.no_ui {
         let app = web::AppState {
             state: state.clone(),
             workdir: cli.work_dir.clone(),
+            layout: config.layout(),
             worktrees: Some(engine.worktrees.clone()),
         };
         let port = cli.port;
@@ -90,16 +106,6 @@ async fn main() -> Result<()> {
     };
 
     let result = engine.clone().run().await;
-
-    // Final checkpoint.
-    let ckpt_dir = cli.work_dir.join(".bureau").join("checkpoints");
-    let snap = state.snapshot();
-    if let Ok(p) = checkpoint::save(&snap, &ckpt_dir) {
-        tracing::info!("final checkpoint: {}", p.display());
-    }
-    if let Err(e) = checkpoint::save_latest(&snap, &ckpt_dir) {
-        tracing::warn!("save_latest checkpoint failed: {e:#}");
-    }
 
     match &result {
         Ok(_) => tracing::info!("pipeline complete"),

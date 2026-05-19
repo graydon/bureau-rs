@@ -3,12 +3,16 @@
 //! Two distinct validators:
 //!
 //! - [`validate_public`] — for `public.rs`. Enforces that the file contains
-//!   only declarations: `pub trait`, `pub struct/enum/type`, `pub use`
-//!   from `super::private` (allowed for re-exporting concrete impl types
-//!   declared in private), doc comments, module-level attributes. **No
-//!   `impl` blocks. No `fn` definitions outside trait declarations. No
-//!   `pub use crate::*` cross-node re-exports.** This makes the public
-//!   file genuinely a public-surface declaration.
+//!   only DECLARATIONS: `pub trait`, `pub struct/enum/type`, `pub const`,
+//!   `pub static`, doc comments, module-level attributes, and non-pub
+//!   `use` of `super::private::*` (used in type positions like struct
+//!   field types). **No `impl` blocks. No `fn` outside trait decls. No
+//!   `pub use` of any kind** — items must be defined here, not re-exported
+//!   from anywhere (including the sibling `private` module). The smuggle
+//!   pattern of defining a type in private.rs and re-exporting it via
+//!   `pub use super::private::Foo;` is explicitly forbidden because it
+//!   makes the public surface deceptive: the model has to look in private
+//!   to learn the real shape of the type.
 //!
 //! - [`validate_private`] — for `private.rs`. The file must compile by
 //!   itself (we don't actually run `cargo check` here — that's the gate).
@@ -39,8 +43,11 @@ pub enum ValidateError {
     )]
     PublicTraitDefaultBody { trait_: String, method: String },
     #[error(
-        "public.rs: cross-node `pub use` of '{path}' is not allowed; declare items directly or \
-         use a `pub type Alias = crate::other::Type` rename"
+        "public.rs: `pub use` of '{path}' is not allowed. public.rs must DEFINE the items \
+         that make up this node's public surface; it must not re-export them from elsewhere. \
+         If you defined the real type in private.rs and re-exported it here, MOVE the \
+         definition into public.rs. To rename a foreign type, use `pub type Alias = <path>` \
+         instead of `pub use`."
     )]
     PublicForbiddenPubUse { path: String },
     #[error(
@@ -85,13 +92,11 @@ fn check_public_item(item: &syn::Item) -> Result<(), ValidateError> {
         }
         Item::Struct(_) | Item::Enum(_) | Item::Type(_) => Ok(()),
         Item::Use(u) => {
-            // Allow `pub use super::private::X` and `use ...` re-exports
-            // that are intra-module (super::*). Disallow `pub use crate::*`
-            // cross-node re-exports, since they create implicit dep edges
-            // the framework can't see.
-            if matches!(u.vis, syn::Visibility::Public(_))
-                && pub_use_starts_with_crate(&u.tree)
-            {
+            // ANY `pub use` is forbidden — public.rs is for definitions,
+            // not re-exports. Non-pub `use super::private::Inner` is fine
+            // because it's just an internal reference for use in type
+            // positions (e.g. `pub struct Wrapper(super::private::Inner)`).
+            if matches!(u.vis, syn::Visibility::Public(_)) {
                 let path = render_use_tree(&u.tree);
                 return Err(ValidateError::PublicForbiddenPubUse { path });
             }
@@ -266,19 +271,6 @@ fn check_after_crate(tree: &syn::UseTree, allowed: &HashSet<String>) -> Result<(
     }
 }
 
-/// True if this UseTree's first segment is `crate`. Walks any wrapping
-/// `Group` so that `pub use {crate::a::Foo, crate::b::Bar}` is also caught.
-fn pub_use_starts_with_crate(tree: &syn::UseTree) -> bool {
-    use syn::UseTree;
-    match tree {
-        UseTree::Path(p) => p.ident == "crate",
-        UseTree::Name(n) => n.ident == "crate",
-        UseTree::Rename(r) => r.ident == "crate",
-        UseTree::Group(g) => g.items.iter().any(pub_use_starts_with_crate),
-        UseTree::Glob(_) => false,
-    }
-}
-
 fn render_use_tree(tree: &syn::UseTree) -> String {
     use quote::ToTokens;
     let mut tok = proc_macro2::TokenStream::new();
@@ -356,8 +348,39 @@ pub type Id = u64;
     }
 
     #[test]
+    fn public_rejects_pub_use_super_private() {
+        // The smuggle pattern: define the type in private, re-export from
+        // public. Forbidden — public.rs must DEFINE the type.
+        let src = "pub use super::private::Inner;";
+        let err = validate_public(src).unwrap_err();
+        assert!(matches!(err, ValidateError::PublicForbiddenPubUse { .. }));
+    }
+
+    #[test]
+    fn public_rejects_pub_use_self() {
+        let src = "pub use self::sub::Thing;";
+        let err = validate_public(src).unwrap_err();
+        assert!(matches!(err, ValidateError::PublicForbiddenPubUse { .. }));
+    }
+
+    #[test]
+    fn public_rejects_pub_use_external() {
+        let src = "pub use std::sync::Arc;";
+        let err = validate_public(src).unwrap_err();
+        assert!(matches!(err, ValidateError::PublicForbiddenPubUse { .. }));
+    }
+
+    #[test]
+    fn public_rejects_pub_use_grouped_smuggle() {
+        let src = "pub use super::private::{A, B};";
+        let err = validate_public(src).unwrap_err();
+        assert!(matches!(err, ValidateError::PublicForbiddenPubUse { .. }));
+    }
+
+    #[test]
     fn public_allows_use_super_private() {
-        // Internal re-export from the private sibling module.
+        // Internal (non-pub) reference to a private type, used in a type
+        // position. Allowed because the public item is still DEFINED here.
         let src = r#"
 use super::private;
 

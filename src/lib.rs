@@ -1,6 +1,6 @@
-pub mod checkpoint;
 pub mod config;
 pub mod engine;
+pub mod event_log;
 pub mod gate;
 pub mod graph;
 pub mod llm;
@@ -8,6 +8,8 @@ pub mod mock_driver;
 pub mod node_context;
 pub mod node_validate;
 pub mod paths;
+pub mod placeholders;
+pub mod pricing;
 pub mod prompts;
 pub mod render;
 pub mod state;

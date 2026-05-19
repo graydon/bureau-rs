@@ -161,6 +161,57 @@ impl NodeStages {
     }
 }
 
+/// Reset stage `from` on `node` to `NotStarted`, cascade-reset all later
+/// stages on the same node to `NotStarted`, and clear in-memory content
+/// slots that are *first-written* by any of the reset stages. The caller
+/// is expected to re-render after this so that cleared slots become
+/// placeholder files on disk again — otherwise the previously-authored
+/// downstream files would sit on disk while their producing stage is
+/// shown as `NotStarted`, causing the next run of the producing (or
+/// earlier) stage to see stale content (the iface-restart bug).
+///
+/// "First-written" slots per stage:
+/// - `Spec`     → `spec_public_md`, `spec_private_md`
+/// - `Iface`    → `public_rs`, `private_rs` (Iface authors stubs)
+/// - `Tests`    → `tests_rs`
+/// - `Impl`/`Debug` → none (both overwrite `private_rs`, which is
+///   first-written by `Iface`)
+///
+/// Returns the list of (stage, prior_state) entries that actually changed.
+pub fn reset_stage_and_cascade(node: &mut Node, from: Stage) -> Vec<(Stage, StageState)> {
+    let to_reset: Vec<Stage> = Stage::ALL
+        .iter()
+        .copied()
+        .skip_while(|s| *s != from)
+        .collect();
+    let mut changed = Vec::new();
+    for s in &to_reset {
+        let prev = node.stages.get(*s);
+        if prev != StageState::NotStarted {
+            node.stages.set(*s, StageState::NotStarted);
+            changed.push((*s, prev));
+        }
+    }
+    for s in &to_reset {
+        match s {
+            Stage::Architect => {}
+            Stage::Spec => {
+                node.spec_public_md = None;
+                node.spec_private_md = None;
+            }
+            Stage::Iface => {
+                node.public_rs = None;
+                node.private_rs = None;
+            }
+            Stage::Tests => {
+                node.tests_rs = None;
+            }
+            Stage::Impl | Stage::Debug => {}
+        }
+    }
+    changed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -183,10 +234,25 @@ pub struct Node {
     /// children — describes what the node does and exposes) and a
     /// private part (the writer's own implementation notes / rationale,
     /// not surfaced to other nodes).
+    ///
+    /// **Not persisted to JSON.** The authored content lives in the
+    /// rendered files on disk (`src/<path>/public.rs`, `spec/<path>/public.md`,
+    /// etc.) which are the source of truth and are committed to git.
+    /// `graph::load` reads those files and populates these fields after
+    /// loading the topology. Storing the content in both places (JSON +
+    /// rendered files) doubled disk usage and bloated every commit;
+    /// the `#[serde(skip_serializing)]` keeps JSON to topology + state.
+    /// `default` lets old JSON files (with content) still deserialize —
+    /// the in-memory content gets overwritten by what's on disk anyway.
+    #[serde(default, skip_serializing)]
     pub spec_public_md: Option<String>,
+    #[serde(default, skip_serializing)]
     pub spec_private_md: Option<String>,
+    #[serde(default, skip_serializing)]
     pub public_rs: Option<String>,
+    #[serde(default, skip_serializing)]
     pub private_rs: Option<String>,
+    #[serde(default, skip_serializing)]
     pub tests_rs: Option<String>,
 
     pub stages: NodeStages,
@@ -716,9 +782,13 @@ fn node_file_path(workdir: &Path, name: &str) -> PathBuf {
     nodes_dir(workdir).join(format!("{name}.json"))
 }
 
-/// Load the graph from disk. Returns an empty graph if `.bureau/graph.json`
-/// doesn't exist (fresh workdir).
-pub fn load(workdir: &Path) -> Result<NodeGraph> {
+/// Load the graph's TOPOLOGY only (no slot content). Cheaper than `load`
+/// when the caller only needs the node tree, dep edges, and stage
+/// states — e.g. for `/api/state` polling, or for `pick_next_ready`
+/// scheduling decisions. The Node content fields (`public_rs`, etc.)
+/// stay at `None` — they're not in the JSON anymore so deserialization
+/// produces None either way.
+pub fn load_topology(workdir: &Path) -> Result<NodeGraph> {
     let idx_path = index_path(workdir);
     if !idx_path.exists() {
         return Ok(NodeGraph::new());
@@ -740,10 +810,126 @@ pub fn load(workdir: &Path) -> Result<NodeGraph> {
     Ok(g)
 }
 
+/// Load the graph from disk. Returns an empty graph if `.bureau/graph.json`
+/// doesn't exist (fresh workdir).
+///
+/// Loads topology + stage state from `.bureau/{graph,nodes/<name>}.json`,
+/// then reads the rendered slot files (`src/<path>/public.rs`,
+/// `spec/<path>/public.md`, etc.) to populate the in-memory content
+/// fields. The rendered files are the source of truth for content; the
+/// JSON only carries topology and stage state.
+///
+/// `layout` is needed because it determines the on-disk path of each
+/// node's source directory (single-crate vs. workspace).
+pub fn load(workdir: &Path, layout: crate::render::Layout) -> Result<NodeGraph> {
+    let idx_path = index_path(workdir);
+    if !idx_path.exists() {
+        return Ok(NodeGraph::new());
+    }
+    let idx_raw = std::fs::read_to_string(&idx_path)
+        .with_context(|| format!("reading {}", idx_path.display()))?;
+    let idx: GraphIndex = serde_json::from_str(&idx_raw)
+        .with_context(|| format!("parsing {}", idx_path.display()))?;
+    let mut g = NodeGraph::new();
+    g.root = idx.root;
+    for fname in &idx.node_files {
+        let p = nodes_dir(workdir).join(fname);
+        let raw = std::fs::read_to_string(&p)
+            .with_context(|| format!("reading {}", p.display()))?;
+        // Old JSONs may carry content fields; `skip_serializing` only
+        // affects writes. Deserialization works either way; we'll
+        // overwrite the fields from disk below anyway.
+        let mut n: Node = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        // Clear any stale content from the JSON so the on-disk-derived
+        // values are authoritative.
+        n.spec_public_md = None;
+        n.spec_private_md = None;
+        n.public_rs = None;
+        n.private_rs = None;
+        n.tests_rs = None;
+        g.nodes.insert(n.id, n);
+    }
+    // Now populate content from rendered files. Done after all nodes
+    // are inserted because path computation walks the parent chain.
+    let ids: Vec<NodeId> = g.nodes.keys().copied().collect();
+    for id in ids {
+        populate_content_from_disk(workdir, &mut g, id, layout)?;
+    }
+    Ok(g)
+}
+
+/// Read the rendered slot files for one node and stuff their content
+/// (when not a placeholder) into the in-memory `Node`. Called from
+/// `load` after topology has been reconstructed.
+fn populate_content_from_disk(
+    workdir: &Path,
+    graph: &mut NodeGraph,
+    node_id: NodeId,
+    layout: crate::render::Layout,
+) -> Result<()> {
+    // Compute paths against the immutable graph view, then mutate.
+    let (src_dir, spec_dir) = {
+        let Some(node) = graph.get(node_id) else {
+            return Ok(());
+        };
+        (
+            workdir.join(crate::render::node_src_dir(graph, node, layout)),
+            workdir.join(crate::render::node_spec_dir(graph, node)),
+        )
+    };
+    let public_rs = read_authored(
+        &src_dir.join("public.rs"),
+        crate::placeholders::is_placeholder_public_rs,
+    );
+    let private_rs = read_authored(
+        &src_dir.join("private.rs"),
+        crate::placeholders::is_placeholder_private_rs,
+    );
+    let tests_rs = read_authored(
+        &src_dir.join("tests.rs"),
+        crate::placeholders::is_placeholder_tests_rs,
+    );
+    let spec_public_md = read_authored(
+        &spec_dir.join("public.md"),
+        crate::placeholders::is_placeholder_public_md,
+    );
+    // private.md is only written when authored; absence = None.
+    let spec_private_md = std::fs::read_to_string(spec_dir.join("private.md")).ok();
+    if let Some(node) = graph.get_mut(node_id) {
+        node.public_rs = public_rs;
+        node.private_rs = private_rs;
+        node.tests_rs = tests_rs;
+        node.spec_public_md = spec_public_md;
+        node.spec_private_md = spec_private_md;
+    }
+    Ok(())
+}
+
+/// Read a slot file. Returns `None` if the file is missing OR the
+/// content is the framework's placeholder (which means "not yet
+/// authored"). Returns `Some(content)` only when the model has
+/// actually written something.
+fn read_authored(path: &Path, is_placeholder: fn(&str) -> bool) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    if is_placeholder(&content) {
+        None
+    } else {
+        Some(content)
+    }
+}
+
 /// Save the graph to disk. Writes one JSON file per node into
 /// `.bureau/nodes/<name>.json` plus the topology index at
 /// `.bureau/graph.json`. Removes any stale per-node files (renamed or
 /// deleted nodes).
+///
+/// All file writes go through `write_atomic` (write to `<path>.tmp`,
+/// then rename). Without this, concurrent readers (`/api/state` and
+/// `/api/graph` load_topology) can race with an in-flight write and
+/// see a truncated / empty / partial file — load then unwraps to a
+/// default empty NodeGraph and the UI flips to "Graph not yet
+/// bootstrapped" mid-run.
 pub fn save(workdir: &Path, g: &NodeGraph) -> Result<()> {
     let nodes_d = nodes_dir(workdir);
     std::fs::create_dir_all(&nodes_d)
@@ -755,7 +941,7 @@ pub fn save(workdir: &Path, g: &NodeGraph) -> Result<()> {
         let p = node_file_path(workdir, &n.name);
         let raw = serde_json::to_string_pretty(n)
             .with_context(|| format!("serializing node {}", n.name))?;
-        std::fs::write(&p, raw.as_bytes())
+        write_atomic(&p, raw.as_bytes())
             .with_context(|| format!("writing {}", p.display()))?;
         node_files.push(fname.clone());
         keep.insert(fname);
@@ -776,14 +962,47 @@ pub fn save(workdir: &Path, g: &NodeGraph) -> Result<()> {
     };
     let idx_raw = serde_json::to_string_pretty(&idx).context("serializing graph index")?;
     let idx_path = index_path(workdir);
-    std::fs::write(&idx_path, idx_raw.as_bytes())
+    write_atomic(&idx_path, idx_raw.as_bytes())
         .with_context(|| format!("writing {}", idx_path.display()))?;
+    Ok(())
+}
+
+/// Write `contents` to `path` so that concurrent readers always see
+/// either the OLD contents or the FULL NEW contents — never a partial
+/// write. Implemented as write-to-`<path>.tmp` followed by atomic
+/// rename onto `path`. On most filesystems (ext4, apfs, ntfs, tmpfs)
+/// `rename` is atomic across an existing target; this gives us the
+/// snapshot semantics that callers like `/api/state` rely on.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // Tmp filename in the same directory as the target so the rename
+    // is intra-filesystem (cross-fs rename isn't atomic; it falls
+    // back to copy-then-unlink which has the same race we're fixing).
+    let mut tmp = path.to_path_buf();
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // pid + thread + nanos buys uniqueness if many writers fire on
+    // the same path simultaneously; without it two writers can
+    // clobber each other's .tmp file before either renames.
+    let tag = format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    tmp.set_file_name(format!("{fname}{tag}"));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::Layout;
 
     fn node(name: &str) -> Node {
         Node::new(name, format!("{name} description"))
@@ -1092,29 +1311,39 @@ mod tests {
 
     #[test]
     fn graph_serializes_and_round_trips_through_json() {
+        // JSON now carries topology and stage state only — content
+        // fields are skip_serialized, so they don't round-trip through
+        // pure serde (only through the disk-backed `load` / `render`).
+        // This test pins the topology + state aspect.
         let mut g = NodeGraph::new();
         let root = g.insert_root(node("app")).unwrap();
         let a = g.add_child(root, node("a")).unwrap();
         let b = g.add_child(root, node("b")).unwrap();
         g.add_dep(a, b).unwrap();
-        g.get_mut(root).unwrap().spec_public_md = Some("# spec".to_string());
+        g.get_mut(root).unwrap().stages.spec = StageState::Done;
         let json = serde_json::to_string(&g).unwrap();
         let g2: NodeGraph = serde_json::from_str(&json).unwrap();
         assert_eq!(g2.len(), 3);
-        assert_eq!(g2.get(root).unwrap().spec_public_md.as_deref(), Some("# spec"));
+        assert_eq!(g2.get(root).unwrap().stages.spec, StageState::Done);
         assert_eq!(g2.get(a).unwrap().deps, vec![b]);
     }
 
     #[test]
     fn load_on_empty_workdir_returns_empty_graph() {
         let tmp = tempfile::tempdir().unwrap();
-        let g = load(tmp.path()).unwrap();
+        let g = load(tmp.path(), Layout::SingleCrate).unwrap();
         assert_eq!(g.len(), 0);
         assert!(g.root.is_none());
     }
 
     #[test]
     fn save_then_load_round_trips() {
+        // `save` persists topology + stage state to JSON; content fields
+        // are no longer in JSON — they live in the rendered files on
+        // disk and `load` reads them from there. So this test goes
+        // through `render_graph` (which calls `save` internally and
+        // also writes the rendered files) to exercise the full
+        // round-trip.
         let tmp = tempfile::tempdir().unwrap();
         let mut g = NodeGraph::new();
         let root = g.insert_root(node("app")).unwrap();
@@ -1124,21 +1353,59 @@ mod tests {
         g.get_mut(a).unwrap().spec_public_md = Some("# alpha spec".into());
         g.get_mut(a).unwrap().stages.spec = StageState::Done;
 
-        save(tmp.path(), &g).unwrap();
-        // Per-node files exist.
+        crate::render::render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+        // Per-node JSON files exist (topology + state).
         assert!(tmp.path().join(".bureau/nodes/app.json").exists());
         assert!(tmp.path().join(".bureau/nodes/alpha.json").exists());
         assert!(tmp.path().join(".bureau/nodes/beta.json").exists());
         assert!(tmp.path().join(".bureau/graph.json").exists());
 
-        let g2 = load(tmp.path()).unwrap();
+        let g2 = load(tmp.path(), Layout::SingleCrate).unwrap();
         assert_eq!(g2.len(), 3);
         assert_eq!(g2.root, Some(root));
+        // Content round-trips through the rendered files on disk.
         assert_eq!(
             g2.get(a).unwrap().spec_public_md.as_deref(),
-            Some("# alpha spec")
+            Some("# alpha spec"),
+            "content should come back from the rendered spec/<alpha>/public.md"
         );
         assert_eq!(g2.get(a).unwrap().stages.spec, StageState::Done);
+    }
+
+    #[test]
+    fn load_treats_placeholders_as_unauthored() {
+        // A node whose iface stage hasn't run yet has placeholder files
+        // on disk. `load` should map those back to `None`, not the
+        // placeholder text.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut g = NodeGraph::new();
+        let _root = g.insert_root(node("app")).unwrap();
+        crate::render::render_graph(tmp.path(), &g, Layout::SingleCrate).unwrap();
+        let g2 = load(tmp.path(), Layout::SingleCrate).unwrap();
+        let root = g2.root.unwrap();
+        let n = g2.get(root).unwrap();
+        assert!(n.public_rs.is_none(), "placeholder public.rs should load as None");
+        assert!(n.private_rs.is_none());
+        assert!(n.tests_rs.is_none());
+        assert!(n.spec_public_md.is_none());
+        assert!(n.spec_private_md.is_none());
+    }
+
+    #[test]
+    fn save_does_not_write_content_into_json() {
+        // The node JSON file should contain topology + state, NOT the
+        // verbatim slot contents (which live in the rendered files).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut g = NodeGraph::new();
+        let root = g.insert_root(node("app")).unwrap();
+        g.get_mut(root).unwrap().spec_public_md = Some("# top secret\n".into());
+        g.get_mut(root).unwrap().public_rs = Some("pub trait Top {}\n".into());
+        save(tmp.path(), &g).unwrap();
+        let raw = std::fs::read_to_string(tmp.path().join(".bureau/nodes/app.json")).unwrap();
+        assert!(
+            !raw.contains("top secret") && !raw.contains("pub trait Top"),
+            "node JSON must NOT carry slot content: {raw}"
+        );
     }
 
     #[test]
@@ -1157,5 +1424,87 @@ mod tests {
         save(tmp.path(), &g2).unwrap();
         assert!(!tmp.path().join(".bureau/nodes/xx.json").exists());
         assert!(tmp.path().join(".bureau/nodes/app.json").exists());
+    }
+
+    #[test]
+    fn reset_cascade_from_iface_wipes_tests_and_iface_outputs() {
+        // The exact bug from the user's report: Iface gets reset on
+        // restart, but Tests is already authored. The cascade should
+        // also reset Tests + clear `tests_rs` (and `public_rs` /
+        // `private_rs` because Iface itself is being reset).
+        let mut n = node("foo");
+        n.stages.spec = StageState::Done;
+        n.stages.iface = StageState::InProgress;
+        n.stages.tests = StageState::Done;
+        n.stages.impl_ = StageState::NotStarted;
+        n.spec_public_md = Some("# spec\n".into());
+        n.public_rs = Some("pub trait T { fn f(&self); }\n".into());
+        n.private_rs = Some("impl T for X { fn f(&self) { todo!() } }\n".into());
+        n.tests_rs = Some("#[test] fn t() {}\n".into());
+
+        let changed = reset_stage_and_cascade(&mut n, Stage::Iface);
+
+        // Only previously-non-NotStarted stages count as changed.
+        let changed_stages: Vec<Stage> = changed.iter().map(|(s, _)| *s).collect();
+        assert_eq!(changed_stages, vec![Stage::Iface, Stage::Tests]);
+        assert_eq!(n.stages.iface, StageState::NotStarted);
+        assert_eq!(n.stages.tests, StageState::NotStarted);
+        assert_eq!(n.stages.impl_, StageState::NotStarted);
+        assert_eq!(n.stages.debug, StageState::NotStarted);
+        // Iface stage is being reset → its first-written slots cleared.
+        assert!(n.public_rs.is_none());
+        assert!(n.private_rs.is_none());
+        // Tests stage cascaded → tests_rs cleared.
+        assert!(n.tests_rs.is_none());
+        // Earlier stage's content is preserved.
+        assert!(n.spec_public_md.is_some());
+        // Spec stage stays Done — only stages >= `from` are touched.
+        assert_eq!(n.stages.spec, StageState::Done);
+    }
+
+    #[test]
+    fn reset_cascade_from_impl_keeps_iface_outputs() {
+        // Reset Impl: only Impl and Debug states change; private_rs is
+        // NOT cleared because its first-writer is Iface (which stays
+        // Done). The Iface stub remains so the workspace compiles
+        // while Impl is being re-authored.
+        let mut n = node("foo");
+        n.stages.iface = StageState::Done;
+        n.stages.tests = StageState::Done;
+        n.stages.impl_ = StageState::InProgress;
+        n.public_rs = Some("pub trait T { fn f(&self); }\n".into());
+        n.private_rs = Some("impl T for X { fn f(&self) { 42 } }\n".into());
+        n.tests_rs = Some("#[test] fn t() {}\n".into());
+
+        reset_stage_and_cascade(&mut n, Stage::Impl);
+
+        assert_eq!(n.stages.iface, StageState::Done);
+        assert_eq!(n.stages.tests, StageState::Done);
+        assert_eq!(n.stages.impl_, StageState::NotStarted);
+        assert!(n.public_rs.is_some(), "iface output preserved");
+        assert!(n.private_rs.is_some(), "iface stub preserved (Impl re-writes on next run)");
+        assert!(n.tests_rs.is_some(), "tests preserved");
+    }
+
+    #[test]
+    fn reset_cascade_from_spec_wipes_everything_downstream() {
+        let mut n = node("foo");
+        n.stages.spec = StageState::InProgress;
+        n.stages.iface = StageState::Done;
+        n.stages.tests = StageState::Done;
+        n.stages.impl_ = StageState::Done;
+        n.spec_public_md = Some("# spec\n".into());
+        n.spec_private_md = Some("# notes\n".into());
+        n.public_rs = Some("pub trait T { fn f(&self); }\n".into());
+        n.private_rs = Some("impl T for X { fn f(&self) { 42 } }\n".into());
+        n.tests_rs = Some("#[test] fn t() {}\n".into());
+
+        reset_stage_and_cascade(&mut n, Stage::Spec);
+
+        assert!(n.spec_public_md.is_none());
+        assert!(n.spec_private_md.is_none());
+        assert!(n.public_rs.is_none());
+        assert!(n.private_rs.is_none());
+        assert!(n.tests_rs.is_none());
     }
 }
