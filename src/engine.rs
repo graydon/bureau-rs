@@ -480,6 +480,7 @@ impl Engine {
     async fn advance_stage(self: Arc<Self>, node_id: NodeId, stage: Stage) -> Result<()> {
         let max_retries = self.config.toml.limits.max_stage_retries;
         let mut last_err: Option<anyhow::Error> = None;
+        let mut prior_failure: Option<String> = None;
         for attempt in 1..=(max_retries + 1) {
             let wt = match self.worktrees.allocate(Uuid::new_v4()).await {
                 Ok(wt) => wt,
@@ -490,7 +491,7 @@ impl Engine {
             };
             match self
                 .clone()
-                .run_attempt_in_worktree(node_id, stage, &wt, attempt)
+                .run_attempt_in_worktree(node_id, stage, &wt, attempt, prior_failure.clone())
                 .await
             {
                 Ok(()) => {
@@ -506,6 +507,11 @@ impl Engine {
                         attempt,
                         max_retries + 1
                     ));
+                    // Capture the failure text for the next attempt's
+                    // writer prompt — without this, the writer rerun is
+                    // blind to why the previous attempt failed and
+                    // tends to produce the same broken submission.
+                    prior_failure = Some(format!("{e:#}"));
                     // run_attempt_in_worktree owns wt cleanup on its err
                     // path; just record the error.
                     last_err = Some(e);
@@ -530,10 +536,11 @@ impl Engine {
         stage: Stage,
         wt: &crate::worktree::Worktree,
         attempt: u32,
+        prior_failure: Option<String>,
     ) -> Result<()> {
         let inner = self
             .clone()
-            .attempt_inner(node_id, stage, wt, attempt)
+            .attempt_inner(node_id, stage, wt, attempt, prior_failure)
             .await;
         if let Err(e) = inner {
             // Always abandon the worktree on failure so the next retry
@@ -554,6 +561,7 @@ impl Engine {
         stage: Stage,
         wt: &crate::worktree::Worktree,
         attempt: u32,
+        prior_failure: Option<String>,
     ) -> Result<()> {
         let task_id = Uuid::new_v4();
         let node_name = self
@@ -587,10 +595,18 @@ impl Engine {
 
         let gate_kind = gate_kind_for(stage);
 
-        // 1. Writer turn.
+        // 1. Writer turn. If a previous attempt of this stage failed,
+        //    surface its error to the writer so it can produce a
+        //    different submission this time (architect/spec rely on
+        //    this — they have no quickfix loop to make in-stage fixes).
+        let writer_extras = prior_failure.as_ref().map(|f| CycleExtras {
+            round: 0,
+            prior_attempt_failure: Some(f.clone()),
+            ..Default::default()
+        });
         let actor = self
             .clone()
-            .run_role(task_id, node_id, stage, Role::Writer, None, &wt.path, attempt)
+            .run_role(task_id, node_id, stage, Role::Writer, writer_extras, &wt.path, attempt)
             .await?;
 
         // 2. Optional critique cycle (skip on architect — single-shot).
@@ -795,7 +811,19 @@ impl Engine {
         wt_path: &Path,
         attempt: u32,
     ) -> Result<()> {
-        let max_iters = self.config.toml.limits.max_quickfix_iters;
+        // Architect and Spec stages get the gate ONE-SHOT — no
+        // quickfix loop. Their tool sets don't include slot-editing
+        // tools (`write_file`, etc. need a node to "own" the slot,
+        // which only iface/impl/debug do for the current node).
+        // Running quickfix at architect/spec just burns tokens on a
+        // role that can't make any edits. If the gate fails here, we
+        // surface the error so `advance_stage`'s retry loop reruns
+        // the writer — the writer CAN make changes (a new
+        // submit_architecture / submit_spec call).
+        let max_iters = match stage {
+            Stage::Architect | Stage::Spec => 0,
+            _ => self.config.toml.limits.max_quickfix_iters,
+        };
         for iter in 0..=max_iters {
             let outcome = {
                 let _g = self.cargo_lock.lock().await;
@@ -811,6 +839,13 @@ impl Engine {
             }
             if iter == max_iters {
                 let summary = summarize_errors(&outcome.errors, 8);
+                if max_iters == 0 {
+                    // No quickfix at this stage — the gate is one-shot.
+                    return Err(anyhow!(
+                        "cargo {} failed (quickfix not available at {stage} stage):\n{summary}",
+                        kind.label()
+                    ));
+                }
                 return Err(anyhow!(
                     "cargo {} still failing after {max_iters} quickfix iter(s):\n{summary}",
                     kind.label()
@@ -1299,6 +1334,11 @@ struct CycleExtras {
     prior_failed_tools: Vec<(String, String, String)>,
     quickfix_gate_output: Option<String>,
     quickfix_iter: Option<(u32, u32)>,
+    /// Set on attempt 2+ of a stage retry: the error message from the
+    /// previous attempt (typically a cargo-gate failure). Surfaces in
+    /// the writer's prompt so it can adjust the next submission instead
+    /// of producing the same broken output again.
+    prior_attempt_failure: Option<String>,
 }
 
 /// Render the "Tools eligible at this turn" block — the model sees the
@@ -1353,7 +1393,22 @@ fn build_tools_eligibility(stage: Stage, role: Role) -> String {
 
 fn build_cycle_context(ex: &CycleExtras, args_cap: usize) -> String {
     let mut cyc = String::new();
-    cyc.push_str(&format!("Round {}\n\n", ex.round));
+    if ex.round > 0 {
+        cyc.push_str(&format!("Round {}\n\n", ex.round));
+    }
+    if let Some(out) = &ex.prior_attempt_failure {
+        cyc.push_str(
+            "## ⚠ Previous attempt at this stage failed\n\n\
+             The previous run of this stage hit the error below. Use this \
+             information to produce a different, valid submission this time. \
+             If the error names files or symbols you didn't directly produce \
+             (e.g. workspace `Cargo.toml`, framework-rendered `mod.rs`), the \
+             root cause is usually in your tree shape — adjust child names, \
+             dep edges, or external crate declarations to fix it.\n\n```\n",
+        );
+        cyc.push_str(out);
+        cyc.push_str("\n```\n\n");
+    }
     if let Some((iter, remaining)) = ex.quickfix_iter {
         cyc.push_str(&format!(
             "## Quickfix iteration {iter} ({remaining} remaining)\n\n"
